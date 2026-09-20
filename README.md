@@ -46,6 +46,9 @@ agym personal -- -p "explain this repository"
 agym personal -p "explain this repository"
 
 agym list
+agym usage
+agym usage personal
+agym usage --json
 agym doctor
 agym doctor personal
 agym remove personal
@@ -53,6 +56,40 @@ agym remove work --yes
 ```
 
 `agym <profile>` launches Antigravity directly in the current terminal. On POSIX it replaces the wrapper process with `agy`, which preserves the native TTY, signals, colors, terminal resizing, alternate-screen behavior, current working directory, and `agy` exit semantics as closely as possible.
+
+### Quota and Usage Retrieval
+
+`agym usage` queries quota and usage across all configured profiles concurrently using Antigravity's `/usage` command:
+
+```bash
+# Query all profiles with a live progressive terminal UI
+agym usage
+
+# Filter specific profiles
+agym usage personal work
+
+# Machine-readable JSON output for scripting or automation
+agym usage --json
+
+# Custom per-profile timeout
+agym usage --timeout 45
+```
+
+- **Concurrent & Isolated**: Queries profiles in parallel (up to 8 concurrent processes) while maintaining strict environment isolation for each profile's credentials.
+- **Progressive Table UI**: In interactive terminals, renders an animated, compact table sized to fit in standard 80-column terminals. Displays 5-hour and weekly quota with colored progress bars (6+ ranks based on remaining capacity) and abbreviated reset durations (`6d+`, `3h+`, `45m`, `now`), separating only after the weekly row.
+- **JSON Output**: Returns structured quota groups, bucket IDs, windows (e.g. 5h, weekly), remaining percentages, fractions, and ISO reset timestamps.
+
+```text
+┌────────────┬─────────────────────────────┬─────────────────────────────┐
+│ Account    │           Gemini            │        Claude & GPT         │
+├────────────┼─────────────────────────────┼─────────────────────────────┤
+│ personal   │ 5h: [████████░░]  84%   3h+ │ 5h: [██████████] 100%   4h+ │
+│            │ Wk: [██████████]  99%   6d+ │ Wk: [██████████] 100%   6d+ │
+├────────────┼─────────────────────────────┼─────────────────────────────┤
+│ work       │ ✗ Failed: agy exited with status 1 (session expired)      │
+│            │                                                           │
+└────────────┴─────────────────────────────┴─────────────────────────────┘
+```
 
 ## Storage
 
@@ -90,6 +127,7 @@ Changing `HOME` can affect tools launched by Antigravity. `agym` preserves the e
 python -m unittest discover -s tests -v
 ```
 
-The unit tests cover profile validation, creation/duplicates/list/removal, environment construction, working-directory preservation, argument passthrough, host `agy` resolution before HOME changes, non-disclosure of credential contents, distinct profile auth/data paths, and host `.gemini` safety.
+The unit tests cover profile validation, creation/duplicates/list/removal, environment construction, working-directory preservation, argument passthrough, host `agy` resolution before HOME changes, non-disclosure of credential contents, distinct profile auth/data paths, host `.gemini` safety, quota response parsing, reset-time calculations, bounded concurrency, and progressive UI rendering.
 
 Real OAuth persistence and concurrency are covered by the manual integration procedure because they require the installed Antigravity build and interactive Google sign-in.
+

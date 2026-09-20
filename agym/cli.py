@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -14,11 +16,13 @@ from .profiles import (
     ProfileStore,
     validate_profile_name,
 )
+from .usage import run_usage
 
 USAGE = """usage:
   agym setup <profile>
   agym <profile> [--] [agy args...]
   agym list
+  agym usage [--json] [--timeout SECONDS] [profiles...]
   agym remove <profile> [--yes]
   agym doctor [profile]
 """
@@ -99,6 +103,44 @@ def _doctor(argv: list[str], store: ProfileStore) -> int:
     return 0
 
 
+def _usage(argv: list[str], store: ProfileStore) -> int:
+    parser = argparse.ArgumentParser(prog="agym usage", add_help=True)
+    parser.add_argument("--json", action="store_true", dest="json_mode", help="output in JSON format")
+    parser.add_argument("--timeout", type=float, default=30.0, help="per-profile timeout in seconds (default: 30)")
+    parser.add_argument("profiles", nargs="*", help="optional specific profiles to query")
+    ns = parser.parse_args(argv)
+
+    if ns.profiles:
+        profiles = []
+        for name in ns.profiles:
+            validate_profile_name(name)
+            profiles.append(store.get(name))
+    else:
+        profiles = store.list()
+
+    if not profiles and not ns.profiles:
+        if ns.json_mode:
+            print(json.dumps({"accounts": []}, indent=2))
+        else:
+            print("No profiles configured. Run 'agym setup <profile>' first.")
+        return 0
+
+    agy = resolve_agy()
+    try:
+        asyncio.run(
+            run_usage(
+                agy,
+                profiles,
+                json_mode=ns.json_mode,
+                timeout=ns.timeout,
+            )
+        )
+        return 0
+    except KeyboardInterrupt:
+        _print_err("interrupted")
+        return 130
+
+
 def _launch(profile_name: str, argv: list[str], store: ProfileStore) -> int:
     validate_profile_name(profile_name)
     # Resolve before environment construction so PATH lookup uses the host environment.
@@ -120,6 +162,8 @@ def main(argv: list[str] | None = None) -> int:
             return _setup(rest, store)
         if command == "list":
             return _list(rest, store)
+        if command == "usage":
+            return _usage(rest, store)
         if command == "remove":
             return _remove(rest, store)
         if command == "doctor":
