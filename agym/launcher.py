@@ -5,8 +5,10 @@ import platform
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from .profiles import Profile, ProfileError
 
@@ -161,6 +163,76 @@ def run_agy(
     )
 
 
+def build_stage1_prompt(user_prompt: str) -> str:
+    return (
+        "You are an expert software engineer and architect.\n"
+        "Create a well-structured, elaborate, and actionable implementation plan in plain text "
+        "for the following user request. Detail the exact file changes, design choices, and "
+        "step-by-step implementation instructions so that an AI coding agent can execute it right away.\n"
+        "Output ONLY the implementation plan in plain text. Do not execute tools or modify files yet.\n\n"
+        f"User Request:\n{user_prompt.strip()}"
+    )
+
+
+def build_stage2_prompt(plan: str) -> str:
+    return (
+        "Please implement the following plan right away. Follow the steps, make all necessary "
+        "file modifications or additions, run relevant tests to verify your changes, and summarize "
+        "what you did when finished so I can review and test:\n\n"
+        f"{plan.strip()}"
+    )
+
+
+class Spinner:
+    def __init__(self, message: str, stream: Any = None) -> None:
+        self.message = message
+        self.stream = stream if stream is not None else sys.stderr
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.is_tty = hasattr(self.stream, "isatty") and self.stream.isatty()
+
+    def _spin(self) -> None:
+        frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        idx = 0
+        start_time = time.time()
+        while not self._stop_event.is_set():
+            if self.is_tty:
+                elapsed = int(time.time() - start_time)
+                frame = frames[idx % len(frames)]
+                self.stream.write(f"\r\033[K{frame} {self.message}... ({elapsed}s)")
+                self.stream.flush()
+                idx += 1
+            self._stop_event.wait(0.08)
+
+    def start(self) -> None:
+        if not self.is_tty:
+            self.stream.write(f"agym: {self.message}...\n")
+            self.stream.flush()
+            return
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+
+    def stop(self, status: str | None = None) -> None:
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        if self.is_tty:
+            self.stream.write("\r\033[K")
+            if status:
+                self.stream.write(f"{status}\n")
+            self.stream.flush()
+        elif status:
+            self.stream.write(f"agym: {status}\n")
+            self.stream.flush()
+
+    def __enter__(self) -> Spinner:
+        self.start()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.stop()
+
+
 def run_auto_prompt(
     agy_path: Path,
     profile: Profile,
@@ -177,8 +249,16 @@ def run_auto_prompt(
         return 1
 
     env = build_profile_env(profile.home)
-    stage1_args = build_agy_args(profile, operation_args=["--prompt", user_prompt])
-    proc = run_agy_capture(agy_path=agy_path, env=env, args=stage1_args)
+    stage1_prompt = build_stage1_prompt(user_prompt)
+    stage1_args = build_agy_args(profile, operation_args=["--prompt", stage1_prompt])
+
+    spinner = Spinner(f"Generating implementation plan with profile '{profile.name}'")
+    spinner.start()
+    try:
+        proc = run_agy_capture(agy_path=agy_path, env=env, args=stage1_args)
+    finally:
+        spinner.stop()
+
     if proc.returncode != 0:
         if proc.stderr:
             sys.stderr.write(proc.stderr)
@@ -196,7 +276,15 @@ def run_auto_prompt(
         print("agym: agy --prompt returned empty response", file=sys.stderr)
         return 1
 
-    stage2_args = build_agy_args(profile, operation_args=["--prompt-interactive", raw_response])
+    if hasattr(sys.stderr, "isatty") and sys.stderr.isatty():
+        sys.stderr.write("✓ Plan generated. Opening interactive implementation session...\n\n")
+        sys.stderr.flush()
+    else:
+        sys.stderr.write("agym: Plan generated. Opening interactive implementation session...\n")
+        sys.stderr.flush()
+
+    stage2_prompt = build_stage2_prompt(raw_response)
+    stage2_args = build_agy_args(profile, operation_args=["--prompt-interactive", stage2_prompt])
     return exec_agy_interactive(
         agy_path=agy_path,
         env=env,

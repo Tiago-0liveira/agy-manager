@@ -47,7 +47,7 @@ class ProfileTests(unittest.TestCase):
                 validate_profile_name(bad)
 
     def test_create_duplicate_list_remove(self) -> None:
-        p = self.store.create("personal", "agy 1.2.7")
+        p = self.store.create("personal")
         self.assertTrue(p.home.is_dir())
         with self.assertRaises(ProfileExists):
             self.store.create("personal")
@@ -58,8 +58,13 @@ class ProfileTests(unittest.TestCase):
         with self.assertRaises(ProfileNotFound):
             self.store.get("personal")
 
+    def test_create_does_not_store_agy_version(self) -> None:
+        self.store.create("personal")
+        raw = json.loads(self.store.config_path.read_text(encoding="utf-8"))
+        self.assertNotIn("agy_version", raw["profiles"]["personal"])
+
     def test_metadata_contains_no_credential_material(self) -> None:
-        self.store.create("personal", "1.0")
+        self.store.create("personal")
         raw = self.store.config_path.read_text(encoding="utf-8")
         lowered = raw.lower()
         for forbidden in ["access_token", "refresh_token", "authorization_code", "password"]:

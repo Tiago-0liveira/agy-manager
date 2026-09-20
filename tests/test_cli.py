@@ -172,3 +172,23 @@ class CliTests(unittest.TestCase):
             self.assertIn("personal", text)
             self.assertIn("model=default", text)
             self.assertIn("permissions=normal", text)
+            self.assertNotIn("created with", text)
+
+    @mock.patch("agym.cli.ProfileStore")
+    def test_list_command_does_not_print_version_even_if_in_legacy_config(self, Store: mock.Mock) -> None:
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(Path(tmp) / "config", Path(tmp) / "data")
+            store.create("personal")
+            raw = store._load()
+            raw["profiles"]["personal"]["agy_version"] = "1.2.7"
+            store._save(raw)
+            Store.return_value = store
+
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = cli.main(["list"])
+            self.assertEqual(code, 0)
+            text = out.getvalue()
+            self.assertNotIn("created with", text)
+            self.assertNotIn("1.2.7", text)

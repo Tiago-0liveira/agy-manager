@@ -82,7 +82,6 @@ class Profile:
     name: str
     home: Path
     created_at: str
-    agy_version: str | None = None
     settings: ProfileSettings = field(default_factory=ProfileSettings)
 
 
@@ -171,7 +170,7 @@ class ProfileStore:
     def _save(self, data: dict[str, Any]) -> None:
         _write_json_private(self.config_path, data)
 
-    def create(self, name: str, agy_version: str | None = None) -> Profile:
+    def create(self, name: str) -> Profile:
         validate_profile_name(name)
         data = self._load()
         if name in data["profiles"]:
@@ -191,13 +190,11 @@ class ProfileStore:
             name=name,
             home=home.resolve(),
             created_at=datetime.now(timezone.utc).isoformat(),
-            agy_version=agy_version,
             settings=ProfileSettings(),
         )
         data["profiles"][name] = {
             "created_at": profile.created_at,
             "home": str(profile.home),
-            "agy_version": profile.agy_version,
             "settings": profile.settings.to_dict(),
         }
         try:
@@ -217,7 +214,6 @@ class ProfileStore:
             name=name,
             home=Path(raw["home"]),
             created_at=raw["created_at"],
-            agy_version=raw.get("agy_version"),
             settings=ProfileSettings.from_dict(raw.get("settings")),
         )
 
@@ -231,7 +227,6 @@ class ProfileStore:
                     name=name,
                     home=Path(raw["home"]),
                     created_at=raw["created_at"],
-                    agy_version=raw.get("agy_version"),
                     settings=ProfileSettings.from_dict(raw.get("settings")),
                 )
             )

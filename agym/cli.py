@@ -9,7 +9,6 @@ from pathlib import Path
 from .diagnostics import doctor_lines
 from .launcher import (
     AgyNotFound,
-    agy_version,
     persistent_profile_data_exists,
     resolve_agy,
     run_agy,
@@ -50,8 +49,7 @@ def _setup(argv: list[str], store: ProfileStore) -> int:
 
     # Resolve the host binary before constructing or using the isolated HOME.
     agy = resolve_agy()
-    version = agy_version(agy)
-    profile = store.create(ns.profile, agy_version=version)
+    profile = store.create(ns.profile)
 
     print(f"Launching Antigravity to set up profile '{profile.name}'.")
     print(f"Profile home: {profile.home}")
@@ -137,10 +135,9 @@ def _list(argv: list[str], store: ProfileStore) -> int:
         return 0
     for profile in profiles:
         state = "ready" if persistent_profile_data_exists(profile) else "no-state"
-        version = f"; created with {profile.agy_version}" if profile.agy_version else ""
         model_str = profile.settings.model or "default"
         perm_str = "skip" if profile.settings.dangerously_skip_permissions else "normal"
-        print(f"{profile.name}\t{state}\tmodel={model_str}\tpermissions={perm_str}{version}")
+        print(f"{profile.name}\t{state}\tmodel={model_str}\tpermissions={perm_str}")
     return 0
 
 

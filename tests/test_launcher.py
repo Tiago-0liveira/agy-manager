@@ -7,8 +7,11 @@ from pathlib import Path
 from unittest import mock
 
 from agym.launcher import (
+    Spinner,
     build_agy_args,
     build_profile_env,
+    build_stage1_prompt,
+    build_stage2_prompt,
     exec_agy_interactive,
     resolve_agy,
     run_agy,
@@ -178,7 +181,13 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(c_kwargs["agy_path"], agy_path)
         self.assertEqual(
             c_kwargs["args"],
-            ["--model", "test-model", "--dangerously-skip-permissions", "--prompt", user_prompt],
+            [
+                "--model",
+                "test-model",
+                "--dangerously-skip-permissions",
+                "--prompt",
+                build_stage1_prompt(user_prompt),
+            ],
         )
         self.assertEqual(c_kwargs["env"]["HOME"], str(self.home_a.resolve()))
 
@@ -193,7 +202,7 @@ class LauncherTests(unittest.TestCase):
                 "test-model",
                 "--dangerously-skip-permissions",
                 "--prompt-interactive",
-                "Mocked raw response",
+                build_stage2_prompt("Mocked raw response"),
             ],
         )
         self.assertEqual(i_kwargs["env"]["HOME"], str(self.home_a.resolve()))
@@ -225,10 +234,31 @@ class LauncherTests(unittest.TestCase):
 
         mock_interactive.assert_called_once()
         args = mock_interactive.call_args.kwargs["args"]
-        self.assertEqual(args, ["--prompt-interactive", complex_response])
+        expected_stage2_prompt = build_stage2_prompt(complex_response)
+        self.assertEqual(args, ["--prompt-interactive", expected_stage2_prompt])
         # Ensure it is passed as a single item in args list
         self.assertEqual(len(args), 2)
-        self.assertEqual(args[1], complex_response)
+        self.assertEqual(args[1], expected_stage2_prompt)
+
+    def test_prompt_builders(self) -> None:
+        raw_user = "refactor auth storage"
+        s1 = build_stage1_prompt(raw_user)
+        self.assertIn("refactor auth storage", s1)
+        self.assertIn("implementation plan", s1.lower())
+        self.assertIn("plain text", s1.lower())
+
+        plan = "1. Delete old storage\n2. Add new storage"
+        s2 = build_stage2_prompt(plan)
+        self.assertIn(plan, s2)
+        self.assertIn("implement", s2.lower())
+
+    def test_spinner_lifecycle(self) -> None:
+        import io
+        buf = io.StringIO()
+        spinner = Spinner("Testing spinner", stream=buf)
+        with spinner:
+            pass
+        self.assertIn("Testing spinner", buf.getvalue())
 
     @mock.patch("agym.launcher.exec_agy_interactive")
     @mock.patch("agym.launcher.run_agy_capture")
@@ -279,5 +309,5 @@ class LauncherTests(unittest.TestCase):
         mock_execve.assert_called_once()
         call_agy, call_argv, call_env = mock_execve.call_args.args
         self.assertEqual(call_agy, str(agy_path))
-        self.assertEqual(call_argv, [str(agy_path), "--prompt-interactive", "Ready"])
+        self.assertEqual(call_argv, [str(agy_path), "--prompt-interactive", build_stage2_prompt("Ready")])
         self.assertEqual(call_env["HOME"], str(self.home_a.resolve()))
