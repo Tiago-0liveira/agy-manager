@@ -1,0 +1,213 @@
+from __future__ import annotations
+
+import json
+import os
+import platform
+import re
+import shutil
+import stat
+import tempfile
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+class ProfileError(RuntimeError):
+    pass
+
+
+class InvalidProfileName(ProfileError):
+    pass
+
+
+class ProfileExists(ProfileError):
+    pass
+
+
+class ProfileNotFound(ProfileError):
+    pass
+
+
+@dataclass(frozen=True)
+class Profile:
+    name: str
+    home: Path
+    created_at: str
+    agy_version: str | None = None
+
+
+def validate_profile_name(name: str) -> str:
+    if name in {".", ".."} or not PROFILE_RE.fullmatch(name):
+        raise InvalidProfileName(
+            "profile names must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ "
+            "and may not be '.' or '..'"
+        )
+    return name
+
+
+def _default_config_root() -> Path:
+    override = os.environ.get("AGYM_CONFIG_HOME")
+    if override:
+        return Path(override).expanduser().resolve()
+    system = platform.system()
+    if system == "Windows":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "agym"
+    if system == "Darwin":
+        return Path.home() / "Library" / "Application Support" / "agym"
+    base = os.environ.get("XDG_CONFIG_HOME")
+    return (Path(base) if base else Path.home() / ".config") / "agym"
+
+
+def _default_data_root() -> Path:
+    override = os.environ.get("AGYM_DATA_HOME")
+    if override:
+        return Path(override).expanduser().resolve()
+    system = platform.system()
+    if system == "Windows":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "agym"
+    if system == "Darwin":
+        return Path.home() / "Library" / "Application Support" / "agym"
+    base = os.environ.get("XDG_DATA_HOME")
+    return (Path(base) if base else Path.home() / ".local" / "share") / "agym"
+
+
+def _chmod_private_dir(path: Path) -> None:
+    if os.name != "nt":
+        path.chmod(0o700)
+
+
+def _write_json_private(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _chmod_private_dir(path.parent)
+    fd, tmp_name = tempfile.mkstemp(prefix=".config.", suffix=".tmp", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        if os.name != "nt":
+            tmp.chmod(0o600)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+class ProfileStore:
+    def __init__(self, config_root: Path | None = None, data_root: Path | None = None) -> None:
+        self.config_root = Path(config_root) if config_root else _default_config_root()
+        self.data_root = Path(data_root) if data_root else _default_data_root()
+        self.config_path = self.config_root / "config.json"
+        self.profiles_root = self.data_root / "profiles"
+
+    def _load(self) -> dict[str, Any]:
+        if not self.config_path.exists():
+            return {"version": 1, "profiles": {}}
+        try:
+            with self.config_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ProfileError(f"cannot read {self.config_path}: {exc}") from exc
+        if data.get("version") != 1 or not isinstance(data.get("profiles"), dict):
+            raise ProfileError(f"unsupported or invalid config file: {self.config_path}")
+        return data
+
+    def _save(self, data: dict[str, Any]) -> None:
+        _write_json_private(self.config_path, data)
+
+    def create(self, name: str, agy_version: str | None = None) -> Profile:
+        validate_profile_name(name)
+        data = self._load()
+        if name in data["profiles"]:
+            raise ProfileExists(f"profile already exists: {name}")
+
+        self.profiles_root.mkdir(parents=True, exist_ok=True)
+        _chmod_private_dir(self.data_root)
+        _chmod_private_dir(self.profiles_root)
+
+        profile_dir = self.profiles_root / name
+        home = profile_dir / "home"
+        home.mkdir(parents=True, exist_ok=False)
+        _chmod_private_dir(profile_dir)
+        _chmod_private_dir(home)
+
+        profile = Profile(
+            name=name,
+            home=home.resolve(),
+            created_at=datetime.now(timezone.utc).isoformat(),
+            agy_version=agy_version,
+        )
+        data["profiles"][name] = {
+            "created_at": profile.created_at,
+            "home": str(profile.home),
+            "agy_version": profile.agy_version,
+        }
+        try:
+            self._save(data)
+        except Exception:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+            raise
+        return profile
+
+    def get(self, name: str) -> Profile:
+        validate_profile_name(name)
+        data = self._load()
+        raw = data["profiles"].get(name)
+        if raw is None:
+            raise ProfileNotFound(f"profile not found: {name}")
+        return Profile(
+            name=name,
+            home=Path(raw["home"]),
+            created_at=raw["created_at"],
+            agy_version=raw.get("agy_version"),
+        )
+
+    def list(self) -> list[Profile]:
+        data = self._load()
+        result: list[Profile] = []
+        for name in sorted(data["profiles"]):
+            raw = data["profiles"][name]
+            result.append(
+                Profile(
+                    name=name,
+                    home=Path(raw["home"]),
+                    created_at=raw["created_at"],
+                    agy_version=raw.get("agy_version"),
+                )
+            )
+        return result
+
+    def remove(self, name: str) -> Path:
+        profile = self.get(name)
+        data = self._load()
+        profile_dir = self.profiles_root / name
+
+        # Refuse to delete anything that does not resolve directly beneath our profiles root.
+        expected = profile_dir.resolve()
+        actual_parent = expected.parent
+        if actual_parent != self.profiles_root.resolve():
+            raise ProfileError(f"refusing unsafe profile path: {expected}")
+
+        if profile_dir.exists():
+            shutil.rmtree(profile_dir)
+        data["profiles"].pop(name, None)
+        self._save(data)
+        return expected
+
+    def profile_dir(self, name: str) -> Path:
+        validate_profile_name(name)
+        return self.profiles_root / name
+
+
+def unix_permissions_warning(path: Path) -> str | None:
+    if os.name == "nt" or not path.exists():
+        return None
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode & 0o077:
+        return f"WARNING: {path} permissions are {mode:04o}; expected no group/world access"
+    return None

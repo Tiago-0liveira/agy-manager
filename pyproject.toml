@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agym"
+version = "0.1.0"
+description = "Explicit isolated-profile launcher for Google Antigravity CLI"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "agym contributors"}]
+dependencies = []
+
+[project.scripts]
+agym = "agym.cli:main"
+
+[tool.setuptools]
+packages = ["agym"]
