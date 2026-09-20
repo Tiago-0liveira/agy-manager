@@ -10,6 +10,7 @@ from agym.profiles import (
     InvalidProfileName,
     ProfileExists,
     ProfileNotFound,
+    ProfileSettings,
     ProfileStore,
     validate_profile_name,
 )
@@ -27,7 +28,21 @@ class ProfileTests(unittest.TestCase):
     def test_profile_name_validation(self) -> None:
         for good in ["personal", "work", "client-a", "google2", "a.b_c-1"]:
             self.assertEqual(validate_profile_name(good), good)
-        for bad in ["../foo", "/foo", "foo/bar", ".", "..", "", " space", "x" * 65]:
+        for bad in [
+            "../foo",
+            "/foo",
+            "foo/bar",
+            ".",
+            "..",
+            "",
+            " space",
+            "x" * 65,
+            "setup",
+            "list",
+            "remove",
+            "doctor",
+            "config",
+        ]:
             with self.subTest(bad=bad), self.assertRaises(InvalidProfileName):
                 validate_profile_name(bad)
 
@@ -55,3 +70,77 @@ class ProfileTests(unittest.TestCase):
         p = self.store.create("personal")
         self.assertEqual(p.home.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self.store.profile_dir("personal").stat().st_mode & 0o777, 0o700)
+
+    def test_legacy_profile_metadata_loading(self) -> None:
+        legacy_data = {
+            "version": 1,
+            "profiles": {
+                "oldprof": {
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "home": str((Path(self.tmp.name) / "data" / "profiles" / "oldprof" / "home").resolve()),
+                    "agy_version": "1.0.0",
+                }
+            },
+        }
+        self.store.config_path.parent.mkdir(parents=True, exist_ok=True)
+        self.store.config_path.write_text(json.dumps(legacy_data), encoding="utf-8")
+
+        p = self.store.get("oldprof")
+        self.assertIsNone(p.settings.model)
+        self.assertFalse(p.settings.dangerously_skip_permissions)
+        self.assertEqual(p.settings.validation_errors, ())
+
+    def test_explicit_settings_loading(self) -> None:
+        data = {
+            "version": 1,
+            "profiles": {
+                "custom": {
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "home": str((Path(self.tmp.name) / "data" / "profiles" / "custom" / "home").resolve()),
+                    "agy_version": "1.0.0",
+                    "settings": {
+                        "model": "gemini-ultra",
+                        "dangerously_skip_permissions": True,
+                    },
+                }
+            },
+        }
+        self.store.config_path.parent.mkdir(parents=True, exist_ok=True)
+        self.store.config_path.write_text(json.dumps(data), encoding="utf-8")
+
+        p = self.store.get("custom")
+        self.assertEqual(p.settings.model, "gemini-ultra")
+        self.assertTrue(p.settings.dangerously_skip_permissions)
+        self.assertEqual(p.settings.validation_errors, ())
+
+    def test_malformed_settings_loading(self) -> None:
+        # Non-dict settings
+        s_bad_dict = ProfileSettings.from_dict("invalid")
+        self.assertIn("settings must be a dictionary", s_bad_dict.validation_errors)
+
+        # Invalid model type
+        s_bad_model = ProfileSettings.from_dict({"model": 12345, "dangerously_skip_permissions": False})
+        self.assertIn("model must be null or a string", s_bad_model.validation_errors)
+
+        # Invalid dangerously_skip_permissions type
+        s_bad_perm = ProfileSettings.from_dict({"model": "valid", "dangerously_skip_permissions": "yes"})
+        self.assertIn("dangerously_skip_permissions must be a boolean", s_bad_perm.validation_errors)
+
+    def test_update_settings_persistence(self) -> None:
+        p = self.store.create("personal")
+        self.assertIsNone(p.settings.model)
+        self.assertFalse(p.settings.dangerously_skip_permissions)
+
+        updated = self.store.update_settings(
+            "personal",
+            ProfileSettings(model="gemini-pro", dangerously_skip_permissions=True),
+        )
+        self.assertEqual(updated.settings.model, "gemini-pro")
+        self.assertTrue(updated.settings.dangerously_skip_permissions)
+
+        # Re-load from disk to verify persistence
+        reloaded = self.store.get("personal")
+        self.assertEqual(reloaded.settings.model, "gemini-pro")
+        self.assertTrue(reloaded.settings.dangerously_skip_permissions)
+        self.assertEqual(reloaded.home, p.home)
+        self.assertEqual(reloaded.created_at, p.created_at)

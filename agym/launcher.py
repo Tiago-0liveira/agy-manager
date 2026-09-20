@@ -4,10 +4,11 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from .profiles import Profile
+from .profiles import Profile, ProfileError
 
 
 class AgyNotFound(RuntimeError):
@@ -77,6 +78,68 @@ def _normalized_args(args: Sequence[str]) -> list[str]:
     return forwarded
 
 
+def build_agy_args(
+    profile: Profile,
+    operation_args: Sequence[str] = (),
+    passthrough_args: Sequence[str] = (),
+    *,
+    agy_path: Path | str | None = None,
+) -> list[str]:
+    norm_op = _normalized_args(operation_args)
+    norm_pass = _normalized_args(passthrough_args)
+    combined = list(norm_op) + list(norm_pass)
+
+    has_model = ("--model" in combined) or any(arg.startswith("--model=") for arg in combined)
+    has_danger = "--dangerously-skip-permissions" in combined
+
+    prefix_args: list[str] = []
+    if not has_model and profile.settings.model and profile.settings.model.strip():
+        prefix_args.extend(["--model", profile.settings.model.strip()])
+    if not has_danger and profile.settings.dangerously_skip_permissions:
+        prefix_args.append("--dangerously-skip-permissions")
+
+    final_args: list[str] = []
+    if agy_path is not None:
+        final_args.append(str(agy_path))
+    final_args.extend(prefix_args)
+    final_args.extend(norm_op)
+    final_args.extend(norm_pass)
+    return final_args
+
+
+def run_agy_capture(
+    agy_path: Path,
+    env: Mapping[str, str],
+    args: Sequence[str],
+) -> subprocess.CompletedProcess[str]:
+    argv = [str(agy_path), *_normalized_args(args)]
+    return subprocess.run(
+        argv,
+        env=dict(env),
+        cwd=None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+
+def exec_agy_interactive(
+    agy_path: Path,
+    env: Mapping[str, str],
+    args: Sequence[str],
+    *,
+    replace_process: bool = True,
+) -> int:
+    argv = [str(agy_path), *_normalized_args(args)]
+    if replace_process and os.name == "posix":
+        os.execve(str(agy_path), argv, dict(env))
+        return 0
+
+    completed = subprocess.run(argv, env=dict(env), cwd=None, check=False)
+    return completed.returncode
+
+
 def run_agy(
     agy_path: Path,
     profile: Profile,
@@ -84,17 +147,58 @@ def run_agy(
     *,
     replace_process: bool = False,
 ) -> int:
+    if profile.settings.validation_errors:
+        raise ProfileError(
+            f"invalid settings for profile '{profile.name}': {', '.join(profile.settings.validation_errors)}"
+        )
     env = build_profile_env(profile.home)
-    argv = [str(agy_path), "--dangerously-skip-permissions", *_normalized_args(args)]
+    cmd_args = build_agy_args(profile, passthrough_args=args)
+    return exec_agy_interactive(
+        agy_path=agy_path,
+        env=env,
+        args=cmd_args,
+        replace_process=replace_process,
+    )
 
-    # cwd=None deliberately preserves the caller's current working directory.
-    # No stdio streams are captured, so the native TTY/TUI is inherited.
-    if replace_process and os.name == "posix":
-        os.execve(str(agy_path), argv, env)
-        raise AssertionError("unreachable")
 
-    completed = subprocess.run(argv, env=env, cwd=None, check=False)
-    return completed.returncode
+def run_auto_prompt(
+    agy_path: Path,
+    profile: Profile,
+    user_prompt: str,
+    *,
+    replace_process: bool = True,
+) -> int:
+    if profile.settings.validation_errors:
+        raise ProfileError(
+            f"invalid settings for profile '{profile.name}': {', '.join(profile.settings.validation_errors)}"
+        )
+    if not user_prompt or not user_prompt.strip():
+        print("agym: --auto-prompt requires a non-empty prompt", file=sys.stderr)
+        return 1
+
+    env = build_profile_env(profile.home)
+    stage1_args = build_agy_args(profile, operation_args=["--prompt", user_prompt])
+    proc = run_agy_capture(agy_path=agy_path, env=env, args=stage1_args)
+    if proc.returncode != 0:
+        if proc.stderr:
+            sys.stderr.write(proc.stderr)
+            if not proc.stderr.endswith("\n"):
+                sys.stderr.write("\n")
+        print(f"agym: agy --prompt failed with exit code {proc.returncode}", file=sys.stderr)
+        return proc.returncode
+
+    raw_response = proc.stdout or ""
+    if not raw_response or not raw_response.strip():
+        print("agym: agy --prompt returned empty response", file=sys.stderr)
+        return 1
+
+    stage2_args = build_agy_args(profile, operation_args=["--prompt-interactive", raw_response])
+    return exec_agy_interactive(
+        agy_path=agy_path,
+        env=env,
+        args=stage2_args,
+        replace_process=replace_process,
+    )
 
 
 def persistent_profile_data_exists(profile: Profile) -> bool:

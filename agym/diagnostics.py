@@ -72,6 +72,14 @@ def doctor_lines(store: ProfileStore, selected: str | None = None) -> list[str]:
         lines.append(
             f"    credential state file: {'present' if _credential_state_present(profile) else 'not detected'}"
         )
+        for err in profile.settings.validation_errors:
+            lines.append(f"    invalid settings: {err}")
+        model_display = profile.settings.model if profile.settings.model else "default"
+        lines.append(f"    model: {model_display}")
+        danger_display = "true" if profile.settings.dangerously_skip_permissions else "false"
+        lines.append(f"    dangerously_skip_permissions: {danger_display}")
+        if profile.settings.dangerously_skip_permissions:
+            lines.append("    warning: --dangerously-skip-permissions is enabled for this profile")
         warning = unix_permissions_warning(store.profile_dir(profile.name))
         if warning:
             lines.append(f"    {warning}")

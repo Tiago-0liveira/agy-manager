@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+import io
 from unittest import mock
 
 from agym import cli
@@ -23,3 +24,151 @@ class CliTests(unittest.TestCase):
             self.assertEqual(cli.main(["personal", "-p", "hello"]), 0)
             resolve.assert_called_once_with()
             run.assert_called_once_with(Path("/real/agy"), profile, ["-p", "hello"], replace_process=True)
+
+    @mock.patch("agym.cli.ProfileStore")
+    def test_config_display_and_mutation(self, Store: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(Path(tmp) / "config", Path(tmp) / "data")
+            store.create("personal")
+            Store.return_value = store
+
+            # 1. Initial config display
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = cli.main(["config", "personal"])
+            self.assertEqual(code, 0)
+            text = out.getvalue()
+            self.assertIn("profile: personal", text)
+            self.assertIn("model: default", text)
+            self.assertIn("dangerously-skip-permissions: false", text)
+
+            # 2. Set model
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = cli.main(["config", "personal", "--model", "gemini-2.5-pro"])
+            self.assertEqual(code, 0)
+            self.assertIn("model: gemini-2.5-pro", out.getvalue())
+            self.assertEqual(store.get("personal").settings.model, "gemini-2.5-pro")
+
+            # 3. Enable dangerously-skip-permissions
+            out = io.StringIO()
+            err = io.StringIO()
+            with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+                code = cli.main(["config", "personal", "--dangerously-skip-permissions"])
+            self.assertEqual(code, 0)
+            self.assertIn("dangerously-skip-permissions: true", out.getvalue())
+            self.assertIn("warning: --dangerously-skip-permissions is enabled", out.getvalue())
+            self.assertTrue(store.get("personal").settings.dangerously_skip_permissions)
+
+            # 4. Disable dangerously-skip-permissions
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = cli.main(["config", "personal", "--no-dangerously-skip-permissions"])
+            self.assertEqual(code, 0)
+            self.assertIn("dangerously-skip-permissions: false", out.getvalue())
+            self.assertFalse(store.get("personal").settings.dangerously_skip_permissions)
+
+            # 5. Reset model with 'default'
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = cli.main(["config", "personal", "--model", "default"])
+            self.assertEqual(code, 0)
+            self.assertIn("model: default", out.getvalue())
+            self.assertIsNone(store.get("personal").settings.model)
+
+    @mock.patch("agym.cli.ProfileStore")
+    @mock.patch("agym.cli.resolve_agy")
+    @mock.patch("agym.cli.run_auto_prompt")
+    @mock.patch("agym.cli.run_agy")
+    def test_auto_prompt_dispatch(
+        self,
+        mock_run_agy: mock.Mock,
+        mock_run_auto_prompt: mock.Mock,
+        mock_resolve: mock.Mock,
+        Store: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(Path(tmp) / "config", Path(tmp) / "data")
+            profile = store.create("personal")
+            Store.return_value = store
+            mock_resolve.return_value = Path("/usr/bin/agy")
+            mock_run_auto_prompt.return_value = 0
+            mock_run_agy.return_value = 0
+
+            # 1. agym personal --auto-prompt "make a plan"
+            code = cli.main(["personal", "--auto-prompt", "make a plan"])
+            self.assertEqual(code, 0)
+            mock_run_auto_prompt.assert_called_once_with(
+                Path("/usr/bin/agy"), profile, "make a plan", replace_process=True
+            )
+            mock_run_agy.assert_not_called()
+
+            mock_run_auto_prompt.reset_mock()
+            mock_run_agy.reset_mock()
+
+            # 2. agym personal --auto-prompt="make a plan"
+            code = cli.main(["personal", "--auto-prompt=make a plan"])
+            self.assertEqual(code, 0)
+            mock_run_auto_prompt.assert_called_once_with(
+                Path("/usr/bin/agy"), profile, "make a plan", replace_process=True
+            )
+            mock_run_agy.assert_not_called()
+
+            mock_run_auto_prompt.reset_mock()
+            mock_run_agy.reset_mock()
+
+            # 3. Normal passthrough still routes to run_agy
+            code = cli.main(["personal", "-p", "review"])
+            self.assertEqual(code, 0)
+            mock_run_agy.assert_called_once_with(
+                Path("/usr/bin/agy"), profile, ["-p", "review"], replace_process=True
+            )
+            mock_run_auto_prompt.assert_not_called()
+
+            mock_run_auto_prompt.reset_mock()
+            mock_run_agy.reset_mock()
+
+            # 4. Explicit -- passthrough with --auto-prompt forwards to agy
+            code = cli.main(["personal", "--", "--auto-prompt", "something"])
+            self.assertEqual(code, 0)
+            mock_run_agy.assert_called_once_with(
+                Path("/usr/bin/agy"), profile, ["--", "--auto-prompt", "something"], replace_process=True
+            )
+            mock_run_auto_prompt.assert_not_called()
+
+    @mock.patch("agym.cli.ProfileStore")
+    def test_auto_prompt_errors(self, Store: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(Path(tmp) / "config", Path(tmp) / "data")
+            store.create("personal")
+            Store.return_value = store
+
+            # Missing argument for --auto-prompt
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                code = cli.main(["personal", "--auto-prompt"])
+            self.assertEqual(code, 2)
+            self.assertIn("--auto-prompt requires a prompt argument", err.getvalue())
+
+            # Unexpected trailing arguments
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                code = cli.main(["personal", "--auto-prompt", "plan", "extra"])
+            self.assertEqual(code, 2)
+            self.assertIn("unexpected arguments with --auto-prompt", err.getvalue())
+
+    @mock.patch("agym.cli.ProfileStore")
+    def test_list_command(self, Store: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(Path(tmp) / "config", Path(tmp) / "data")
+            store.create("personal")
+            Store.return_value = store
+
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = cli.main(["list"])
+            self.assertEqual(code, 0)
+            text = out.getvalue()
+            self.assertIn("personal", text)
+            self.assertIn("model=default", text)
+            self.assertIn("permissions=normal", text)

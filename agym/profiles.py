@@ -7,12 +7,13 @@ import re
 import shutil
 import stat
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+RESERVED_NAMES = {"setup", "list", "remove", "doctor", "config"}
 
 
 class ProfileError(RuntimeError):
@@ -32,14 +33,64 @@ class ProfileNotFound(ProfileError):
 
 
 @dataclass(frozen=True)
+class ProfileSettings:
+    model: str | None = None
+    dangerously_skip_permissions: bool = False
+    validation_errors: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model": self.model,
+            "dangerously_skip_permissions": self.dangerously_skip_permissions,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> ProfileSettings:
+        if data is None:
+            return cls(model=None, dangerously_skip_permissions=False, validation_errors=())
+        if not isinstance(data, dict):
+            return cls(
+                model=None,
+                dangerously_skip_permissions=False,
+                validation_errors=("settings must be a dictionary",),
+            )
+
+        errors: list[str] = []
+        raw_model = data.get("model")
+        if raw_model is not None and not isinstance(raw_model, str):
+            errors.append("model must be null or a string")
+            model = None
+        else:
+            model = raw_model
+
+        raw_danger = data.get("dangerously_skip_permissions", False)
+        if not isinstance(raw_danger, bool):
+            errors.append("dangerously_skip_permissions must be a boolean")
+            dangerously_skip_permissions = False
+        else:
+            dangerously_skip_permissions = raw_danger
+
+        return cls(
+            model=model,
+            dangerously_skip_permissions=dangerously_skip_permissions,
+            validation_errors=tuple(errors),
+        )
+
+
+@dataclass(frozen=True)
 class Profile:
     name: str
     home: Path
     created_at: str
     agy_version: str | None = None
+    settings: ProfileSettings = field(default_factory=ProfileSettings)
 
 
 def validate_profile_name(name: str) -> str:
+    if name in RESERVED_NAMES:
+        raise InvalidProfileName(
+            f"'{name}' is a reserved command name and cannot be used as a profile name"
+        )
     if name in {".", ".."} or not PROFILE_RE.fullmatch(name):
         raise InvalidProfileName(
             "profile names must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ "
@@ -141,11 +192,13 @@ class ProfileStore:
             home=home.resolve(),
             created_at=datetime.now(timezone.utc).isoformat(),
             agy_version=agy_version,
+            settings=ProfileSettings(),
         )
         data["profiles"][name] = {
             "created_at": profile.created_at,
             "home": str(profile.home),
             "agy_version": profile.agy_version,
+            "settings": profile.settings.to_dict(),
         }
         try:
             self._save(data)
@@ -165,6 +218,7 @@ class ProfileStore:
             home=Path(raw["home"]),
             created_at=raw["created_at"],
             agy_version=raw.get("agy_version"),
+            settings=ProfileSettings.from_dict(raw.get("settings")),
         )
 
     def list(self) -> list[Profile]:
@@ -178,9 +232,19 @@ class ProfileStore:
                     home=Path(raw["home"]),
                     created_at=raw["created_at"],
                     agy_version=raw.get("agy_version"),
+                    settings=ProfileSettings.from_dict(raw.get("settings")),
                 )
             )
         return result
+
+    def update_settings(self, name: str, settings: ProfileSettings) -> Profile:
+        validate_profile_name(name)
+        data = self._load()
+        if name not in data["profiles"]:
+            raise ProfileNotFound(f"profile not found: {name}")
+        data["profiles"][name]["settings"] = settings.to_dict()
+        self._save(data)
+        return self.get(name)
 
     def remove(self, name: str) -> Path:
         profile = self.get(name)

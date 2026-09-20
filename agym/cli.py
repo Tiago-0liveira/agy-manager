@@ -7,12 +7,20 @@ import sys
 from pathlib import Path
 
 from .diagnostics import doctor_lines
-from .launcher import AgyNotFound, agy_version, persistent_profile_data_exists, resolve_agy, run_agy
+from .launcher import (
+    AgyNotFound,
+    agy_version,
+    persistent_profile_data_exists,
+    resolve_agy,
+    run_agy,
+    run_auto_prompt,
+)
 from .profiles import (
     InvalidProfileName,
     ProfileError,
     ProfileExists,
     ProfileNotFound,
+    ProfileSettings,
     ProfileStore,
     validate_profile_name,
 )
@@ -21,6 +29,8 @@ from .usage import run_usage
 USAGE = """usage:
   agym setup <profile>
   agym <profile> [--] [agy args...]
+  agym <profile> --auto-prompt "<prompt>"
+  agym config <profile> [--model <model>|default] [--[no-]dangerously-skip-permissions]
   agym list
   agym usage [--json] [--timeout SECONDS] [profiles...]
   agym remove <profile> [--yes]
@@ -62,6 +72,62 @@ def _setup(argv: list[str], store: ProfileStore) -> int:
     return 0
 
 
+def _config(argv: list[str], store: ProfileStore) -> int:
+    parser = argparse.ArgumentParser(prog="agym config", add_help=True)
+    parser.add_argument("profile")
+    parser.add_argument("--model", dest="model", default=None)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--dangerously-skip-permissions",
+        dest="dangerously_skip_permissions",
+        action="store_true",
+        default=None,
+    )
+    group.add_argument(
+        "--no-dangerously-skip-permissions",
+        dest="dangerously_skip_permissions",
+        action="store_false",
+    )
+    ns = parser.parse_args(argv)
+    profile = store.get(ns.profile)
+
+    changed = False
+    new_model = profile.settings.model
+    new_danger = profile.settings.dangerously_skip_permissions
+
+    if ns.model is not None:
+        if ns.model == "default":
+            new_model = None
+        elif not ns.model.strip():
+            raise ProfileError("model name cannot be empty")
+        else:
+            new_model = ns.model.strip()
+        changed = True
+
+    if ns.dangerously_skip_permissions is not None:
+        new_danger = ns.dangerously_skip_permissions
+        changed = True
+
+    if changed:
+        new_settings = ProfileSettings(
+            model=new_model,
+            dangerously_skip_permissions=new_danger,
+        )
+        profile = store.update_settings(profile.name, new_settings)
+
+    model_display = profile.settings.model if profile.settings.model else "default"
+    danger_display = "true" if profile.settings.dangerously_skip_permissions else "false"
+
+    print(f"profile: {profile.name}")
+    print(f"model: {model_display}")
+    print(f"dangerously-skip-permissions: {danger_display}")
+
+    if profile.settings.dangerously_skip_permissions:
+        print("warning: --dangerously-skip-permissions is enabled for this profile")
+
+    return 0
+
+
 def _list(argv: list[str], store: ProfileStore) -> int:
     if argv:
         raise ProfileError("'agym list' takes no arguments")
@@ -72,7 +138,9 @@ def _list(argv: list[str], store: ProfileStore) -> int:
     for profile in profiles:
         state = "ready" if persistent_profile_data_exists(profile) else "no-state"
         version = f"; created with {profile.agy_version}" if profile.agy_version else ""
-        print(f"{profile.name}\t{state}{version}")
+        model_str = profile.settings.model or "default"
+        perm_str = "skip" if profile.settings.dangerously_skip_permissions else "normal"
+        print(f"{profile.name}\t{state}\tmodel={model_str}\tpermissions={perm_str}{version}")
     return 0
 
 
@@ -141,11 +209,37 @@ def _usage(argv: list[str], store: ProfileStore) -> int:
         return 130
 
 
+def _parse_auto_prompt(args: list[str]) -> tuple[str | None, list[str]]:
+    if not args:
+        return None, args
+    if args[0] == "--":
+        return None, args
+    for i, arg in enumerate(args):
+        if arg == "--auto-prompt":
+            if i + 1 >= len(args):
+                raise ProfileError("--auto-prompt requires a prompt argument")
+            prompt = args[i + 1]
+            rem = args[:i] + args[i + 2:]
+            return prompt, rem
+        if arg.startswith("--auto-prompt="):
+            prompt = arg.split("=", 1)[1]
+            rem = args[:i] + args[i + 1:]
+            return prompt, rem
+    return None, args
+
+
 def _launch(profile_name: str, argv: list[str], store: ProfileStore) -> int:
     validate_profile_name(profile_name)
     # Resolve before environment construction so PATH lookup uses the host environment.
     agy = resolve_agy()
     profile = store.get(profile_name)
+
+    auto_prompt, rest = _parse_auto_prompt(argv)
+    if auto_prompt is not None:
+        if rest:
+            raise ProfileError(f"unexpected arguments with --auto-prompt: {' '.join(rest)}")
+        return run_auto_prompt(agy, profile, auto_prompt, replace_process=True)
+
     return run_agy(agy, profile, argv, replace_process=True)
 
 
@@ -160,6 +254,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if command == "setup":
             return _setup(rest, store)
+        if command == "config":
+            return _config(rest, store)
         if command == "list":
             return _list(rest, store)
         if command == "usage":

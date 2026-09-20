@@ -6,8 +6,16 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agym.launcher import build_profile_env, resolve_agy, run_agy
-from agym.profiles import Profile
+from agym.launcher import (
+    build_agy_args,
+    build_profile_env,
+    exec_agy_interactive,
+    resolve_agy,
+    run_agy,
+    run_agy_capture,
+    run_auto_prompt,
+)
+from agym.profiles import Profile, ProfileSettings
 
 
 class LauncherTests(unittest.TestCase):
@@ -67,7 +75,8 @@ class LauncherTests(unittest.TestCase):
         result = run_agy(Path("/usr/bin/agy"), profile, ["--", "-p", "review this"], replace_process=False)
         self.assertEqual(result, 17)
         args, kwargs = sp_run.call_args
-        self.assertEqual(args[0], ["/usr/bin/agy", "--dangerously-skip-permissions", "-p", "review this"])
+        # Safe default: no --dangerously-skip-permissions
+        self.assertEqual(args[0], ["/usr/bin/agy", "-p", "review this"])
         self.assertIsNone(kwargs["cwd"])
         self.assertNotIn("stdin", kwargs)
         self.assertNotIn("stdout", kwargs)
@@ -78,4 +87,197 @@ class LauncherTests(unittest.TestCase):
         sp_run.return_value.returncode = 0
         profile = Profile("personal", self.home_a, "now")
         run_agy(Path("/usr/bin/agy"), profile, ["-p", "review this"], replace_process=False)
-        self.assertEqual(sp_run.call_args.args[0], ["/usr/bin/agy", "--dangerously-skip-permissions", "-p", "review this"])
+        self.assertEqual(sp_run.call_args.args[0], ["/usr/bin/agy", "-p", "review this"])
+
+    def test_build_agy_args_safe_defaults(self) -> None:
+        profile = Profile("personal", self.home_a, "now")
+        args = build_agy_args(profile, passthrough_args=["-p", "hello"])
+        self.assertEqual(args, ["-p", "hello"])
+        self.assertNotIn("--dangerously-skip-permissions", args)
+        self.assertNotIn("--model", args)
+
+    def test_build_agy_args_with_model(self) -> None:
+        profile = Profile(
+            "personal",
+            self.home_a,
+            "now",
+            settings=ProfileSettings(model="gemini-2.5-flash"),
+        )
+        args = build_agy_args(profile, passthrough_args=["-p", "hello"])
+        self.assertEqual(args, ["--model", "gemini-2.5-flash", "-p", "hello"])
+
+    def test_build_agy_args_model_precedence(self) -> None:
+        profile = Profile(
+            "personal",
+            self.home_a,
+            "now",
+            settings=ProfileSettings(model="profile-default-model"),
+        )
+        # Explicit invocation --model overrides profile default
+        args = build_agy_args(profile, passthrough_args=["--model", "explicit-model", "-p", "hello"])
+        self.assertEqual(args, ["--model", "explicit-model", "-p", "hello"])
+        self.assertEqual(args.count("--model"), 1)
+
+        # Explicit invocation --model=... overrides profile default
+        args2 = build_agy_args(profile, passthrough_args=["--model=explicit-model", "-p", "hello"])
+        self.assertEqual(args2, ["--model=explicit-model", "-p", "hello"])
+        self.assertNotIn("--model", args2)
+
+    def test_build_agy_args_dangerous_permissions(self) -> None:
+        profile = Profile(
+            "personal",
+            self.home_a,
+            "now",
+            settings=ProfileSettings(dangerously_skip_permissions=True),
+        )
+        args = build_agy_args(profile, passthrough_args=["-p", "hello"])
+        self.assertEqual(args, ["--dangerously-skip-permissions", "-p", "hello"])
+
+        # Do not duplicate if already passed in passthrough
+        args_dup = build_agy_args(
+            profile, passthrough_args=["--dangerously-skip-permissions", "-p", "hello"]
+        )
+        self.assertEqual(args_dup, ["--dangerously-skip-permissions", "-p", "hello"])
+        self.assertEqual(args_dup.count("--dangerously-skip-permissions"), 1)
+
+    def test_build_agy_args_with_agy_path(self) -> None:
+        profile = Profile(
+            "personal",
+            self.home_a,
+            "now",
+            settings=ProfileSettings(model="m", dangerously_skip_permissions=True),
+        )
+        args = build_agy_args(profile, passthrough_args=["-p", "hi"], agy_path=Path("/bin/agy"))
+        self.assertEqual(
+            args,
+            ["/bin/agy", "--model", "m", "--dangerously-skip-permissions", "-p", "hi"],
+        )
+
+    @mock.patch("agym.launcher.exec_agy_interactive")
+    @mock.patch("agym.launcher.run_agy_capture")
+    def test_auto_prompt_two_stages_and_arguments(
+        self, mock_capture: mock.Mock, mock_interactive: mock.Mock
+    ) -> None:
+        mock_capture.return_value = mock.Mock(returncode=0, stdout="Mocked raw response", stderr="")
+        mock_interactive.return_value = 0
+        profile = Profile(
+            "personal",
+            self.home_a,
+            "now",
+            settings=ProfileSettings(model="test-model", dangerously_skip_permissions=True),
+        )
+        agy_path = Path("/usr/bin/agy")
+        user_prompt = "Plan feature A to B"
+
+        code = run_auto_prompt(agy_path, profile, user_prompt, replace_process=False)
+        self.assertEqual(code, 0)
+
+        # Stage 1 verification
+        mock_capture.assert_called_once()
+        c_kwargs = mock_capture.call_args.kwargs
+        self.assertEqual(c_kwargs["agy_path"], agy_path)
+        self.assertEqual(
+            c_kwargs["args"],
+            ["--model", "test-model", "--dangerously-skip-permissions", "--prompt", user_prompt],
+        )
+        self.assertEqual(c_kwargs["env"]["HOME"], str(self.home_a.resolve()))
+
+        # Stage 2 verification
+        mock_interactive.assert_called_once()
+        i_kwargs = mock_interactive.call_args.kwargs
+        self.assertEqual(i_kwargs["agy_path"], agy_path)
+        self.assertEqual(
+            i_kwargs["args"],
+            [
+                "--model",
+                "test-model",
+                "--dangerously-skip-permissions",
+                "--prompt-interactive",
+                "Mocked raw response",
+            ],
+        )
+        self.assertEqual(i_kwargs["env"]["HOME"], str(self.home_a.resolve()))
+        self.assertFalse(i_kwargs["replace_process"])
+
+    @mock.patch("agym.launcher.exec_agy_interactive")
+    @mock.patch("agym.launcher.run_agy_capture")
+    def test_auto_prompt_complex_raw_response_handling(
+        self, mock_capture: mock.Mock, mock_interactive: mock.Mock
+    ) -> None:
+        complex_response = (
+            "# Implementation Plan\n\n"
+            "Step 1: Edit `main.py`\n"
+            "```python\n"
+            "import os\n"
+            "print('Quotes: \"double\" and \\'single\\'')\n"
+            "var = f\"$HOME and `backticks`\"\n"
+            "```\n"
+            "Shell test: ; && | > < $VAR\n"
+            "Unicode test: \u2705 \U0001f680 \u00e9\u00e0\u00fc\u4e16\u754c\n"
+        )
+        mock_capture.return_value = mock.Mock(returncode=0, stdout=complex_response, stderr="")
+        mock_interactive.return_value = 0
+        profile = Profile("personal", self.home_a, "now")
+        agy_path = Path("/usr/bin/agy")
+
+        code = run_auto_prompt(agy_path, profile, "prompt with special chars", replace_process=False)
+        self.assertEqual(code, 0)
+
+        mock_interactive.assert_called_once()
+        args = mock_interactive.call_args.kwargs["args"]
+        self.assertEqual(args, ["--prompt-interactive", complex_response])
+        # Ensure it is passed as a single item in args list
+        self.assertEqual(len(args), 2)
+        self.assertEqual(args[1], complex_response)
+
+    @mock.patch("agym.launcher.exec_agy_interactive")
+    @mock.patch("agym.launcher.run_agy_capture")
+    def test_auto_prompt_stage1_failure(
+        self, mock_capture: mock.Mock, mock_interactive: mock.Mock
+    ) -> None:
+        mock_capture.return_value = mock.Mock(
+            returncode=42, stdout="partial output", stderr="network error"
+        )
+        profile = Profile("personal", self.home_a, "now")
+        code = run_auto_prompt(Path("/usr/bin/agy"), profile, "test prompt")
+        self.assertEqual(code, 42)
+        mock_interactive.assert_not_called()
+
+    @mock.patch("agym.launcher.exec_agy_interactive")
+    @mock.patch("agym.launcher.run_agy_capture")
+    def test_auto_prompt_empty_stdout(
+        self, mock_capture: mock.Mock, mock_interactive: mock.Mock
+    ) -> None:
+        mock_capture.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+        profile = Profile("personal", self.home_a, "now")
+        code = run_auto_prompt(Path("/usr/bin/agy"), profile, "test prompt")
+        self.assertNotEqual(code, 0)
+        mock_interactive.assert_not_called()
+
+    @mock.patch("agym.launcher.exec_agy_interactive")
+    @mock.patch("agym.launcher.run_agy_capture")
+    def test_auto_prompt_whitespace_only_stdout(
+        self, mock_capture: mock.Mock, mock_interactive: mock.Mock
+    ) -> None:
+        mock_capture.return_value = mock.Mock(returncode=0, stdout="  \n\t  \n", stderr="")
+        profile = Profile("personal", self.home_a, "now")
+        code = run_auto_prompt(Path("/usr/bin/agy"), profile, "test prompt")
+        self.assertNotEqual(code, 0)
+        mock_interactive.assert_not_called()
+
+    @unittest.skipIf(os.name != "posix", "POSIX exec test")
+    @mock.patch("agym.launcher.os.execve")
+    @mock.patch("agym.launcher.run_agy_capture")
+    def test_auto_prompt_posix_exec(
+        self, mock_capture: mock.Mock, mock_execve: mock.Mock
+    ) -> None:
+        mock_capture.return_value = mock.Mock(returncode=0, stdout="Ready", stderr="")
+        profile = Profile("personal", self.home_a, "now")
+        agy_path = Path("/usr/bin/agy")
+        code = run_auto_prompt(agy_path, profile, "prompt", replace_process=True)
+        self.assertEqual(code, 0)
+        mock_execve.assert_called_once()
+        call_agy, call_argv, call_env = mock_execve.call_args.args
+        self.assertEqual(call_agy, str(agy_path))
+        self.assertEqual(call_argv, [str(agy_path), "--prompt-interactive", "Ready"])
+        self.assertEqual(call_env["HOME"], str(self.home_a.resolve()))

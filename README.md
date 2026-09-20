@@ -41,6 +41,16 @@ agym setup work
 agym personal
 agym work
 
+# Profile launch configuration
+agym config personal
+agym config personal --model gemini-2.5-flash
+agym config personal --model default
+agym config personal --dangerously-skip-permissions
+agym config personal --no-dangerously-skip-permissions
+
+# Auto-prompt workflow
+agym personal --auto-prompt "make me a plan to change feature A to B"
+
 agym personal -- -p "explain this repository"
 # The `--` is optional with agym's dispatcher:
 agym personal -p "explain this repository"
@@ -90,6 +100,29 @@ agym usage --timeout 45
 │            │                                                           │
 └────────────┴─────────────────────────────┴─────────────────────────────┘
 ```
+
+### Profile Launch Settings
+
+Each profile can be configured with default launch settings using `agym config <profile>`:
+
+- **Model selection**: Set a profile default model using `--model <model>` (e.g. `agym config personal --model gemini-2.5-flash`), or clear it back to the Antigravity default with `agym config personal --model default`.
+- **Permissions**: Automatic permission skipping (`--dangerously-skip-permissions`) is **OFF by default** for all profiles. It can be explicitly enabled for a specific profile with `agym config <profile> --dangerously-skip-permissions`, and disabled with `agym config <profile> --no-dangerously-skip-permissions`.
+
+Invocation arguments take precedence over profile defaults (e.g. an explicit `--model` flag on the command line overrides the profile's configured model).
+
+### Auto-Prompt
+
+The `--auto-prompt` feature runs a two-stage prompt workflow:
+
+```bash
+agym personal --auto-prompt "make me a plan to change feature A to B"
+```
+
+1. `agym` runs the selected profile non-interactively with `agy [profile defaults] --prompt "<USER PROMPT>"`.
+2. Captures the raw response output.
+3. Starts the same profile interactively using `agy [profile defaults] --prompt-interactive "<RAW RESPONSE>"`.
+
+The first stage is non-interactive while the second stage becomes the normal interactive terminal session in the current working directory using the exact same profile, environment, and defaults.
 
 ## Storage
 
