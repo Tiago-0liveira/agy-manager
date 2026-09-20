@@ -189,6 +189,10 @@ def run_auto_prompt(
 
     raw_response = proc.stdout or ""
     if not raw_response or not raw_response.strip():
+        if proc.stderr:
+            sys.stderr.write(proc.stderr)
+            if not proc.stderr.endswith("\n"):
+                sys.stderr.write("\n")
         print("agym: agy --prompt returned empty response", file=sys.stderr)
         return 1
 
