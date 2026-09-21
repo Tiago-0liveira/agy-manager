@@ -416,6 +416,32 @@ class InstallationAndSyncTests(unittest.TestCase):
             self.assertTrue(status_disabled["profiles"][p.name]["configured"])
             self.assertFalse(status_disabled["profiles"][p.name]["enabled"])
 
+    def test_windows_script_path_and_install(self) -> None:
+        with patch("sys.platform", "win32"):
+            script_path = get_statusline_script_path(self.data_root)
+            self.assertTrue(str(script_path).endswith("statusline.cmd"))
+            installed = install_statusline_script(self.data_root)
+            self.assertEqual(installed, script_path)
+            self.assertTrue(installed.is_file())
+            cmd_content = installed.read_text()
+            self.assertIn("statusline.py", cmd_content)
+
+            py_script = self.data_root / "bin" / "statusline.py"
+            self.assertTrue(py_script.is_file())
+            self.assertIn("from agym.statusline import main", py_script.read_text())
+
+    def test_detect_profile_escape_roots_windows(self) -> None:
+        from agym.profiles import _detect_profile_escape_roots
+        win_profile_home = r"C:\Users\testuser\AppData\Local\agym\profiles\myprof\home"
+        with patch.dict(os.environ, {"USERPROFILE": win_profile_home, "HOME": ""}, clear=True):
+            with patch("platform.system", return_value="Windows"):
+                cfg, data = _detect_profile_escape_roots()
+                self.assertIsNotNone(cfg)
+                self.assertIsNotNone(data)
+                self.assertEqual(cfg, data)
+                self.assertTrue(str(data).endswith("agym"))
+
+
 
 class CliStatuslineCommandTests(unittest.TestCase):
     def setUp(self) -> None:

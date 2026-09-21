@@ -129,18 +129,25 @@ def validate_profile_name(name: str) -> str:
 
 
 def _detect_profile_escape_roots() -> tuple[Path | None, Path | None]:
-    home_str = os.environ.get("HOME") or ""
-    if "/profiles/" in home_str and (home_str.endswith("/home") or home_str.endswith(os.sep + "home")):
-        try:
+    home_str = os.environ.get("HOME") or os.environ.get("USERPROFILE") or ""
+    if not home_str:
+        return None, None
+    try:
+        norm = home_str.replace("\\", "/")
+        parts = [part for part in norm.split("/") if part]
+        if len(parts) >= 3 and parts[-1] == "home" and parts[-3] == "profiles":
+            if platform.system() == "Windows" or os.name == "nt":
+                data_root_str = norm.rsplit("/profiles/", 1)[0]
+                data_root = Path(data_root_str)
+                return data_root, data_root
             p = Path(home_str).resolve()
-            if p.parent.parent.name == "profiles":
-                data_root = p.parent.parent.parent
-                if data_root.parent.name == "share" and data_root.parent.parent.name == ".local":
-                    host_home = data_root.parent.parent.parent
-                    return host_home / ".config" / "agym", data_root
-                return data_root / "config", data_root
-        except Exception:
-            pass
+            data_root = p.parent.parent.parent
+            if data_root.parent.name == "share" and data_root.parent.parent.name == ".local":
+                host_home = data_root.parent.parent.parent
+                return host_home / ".config" / "agym", data_root
+            return data_root / "config", data_root
+    except Exception:
+        pass
     return None, None
 
 
