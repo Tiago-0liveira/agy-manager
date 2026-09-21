@@ -28,7 +28,7 @@ class ProfileExists(ProfileError):
     pass
 
 
-RESERVED_NAMES = {"setup", "list", "remove", "doctor", "usage", "edit", "help", "config"}
+RESERVED_NAMES = {"setup", "list", "remove", "doctor", "usage", "token", "tokens", "token-usage", "edit", "help", "config"}
 
 
 class ProfileNotFound(ProfileError):

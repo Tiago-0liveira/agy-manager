@@ -6,6 +6,7 @@ import json
 import sys
 from pathlib import Path
 
+from .cache import CacheManager
 from .diagnostics import doctor_lines
 from .launcher import (
     ALL_PERMISSIONS_ALIASES,
@@ -31,6 +32,7 @@ from .subscription import (
     format_user_date,
     prompt_subscription_date,
 )
+from .tokens import run_tokens
 from .usage import run_usage
 
 USAGE = """agym — Explicit isolated-profile manager for Google Antigravity CLI
@@ -47,6 +49,7 @@ Commands:
   edit <profile>                      Edit profile settings (e.g. subscription renewal date)
   list                                List all configured profiles and subscription status
   usage [profiles...]                 Show live model quota usage and subscription health
+  tokens [profiles...]                Show token consumption graphs and fleet summary (aliases: token, token-usage)
   remove <profile>                    Delete a profile and its isolated data
   doctor [profile]                    Check environment, executable, permissions, and state
 
@@ -80,9 +83,15 @@ Command Options:
   agym edit <profile> [-s, --subscription-date DATE | --clear-subscription-date]
       -s, --subscription-date DATE    Set renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)
       --clear-subscription-date       Remove stored subscription date
-  agym usage [--json] [--timeout SECONDS] [profiles...]
+  agym usage [--json] [-f, --refresh] [--timeout SECONDS] [profiles...]
       --json                          Output quota and subscription data in JSON format
+      -f, --refresh                   Bypass cache and force live query
       --timeout SECONDS               Per-profile query timeout in seconds (default: 30)
+
+  agym tokens [--json] [-b, --breakdown] [-f, --refresh] [profiles...]
+      --json                          Output token metrics and summary in JSON format
+      -b, --breakdown                 Show detailed token composition breakdown table
+      -f, --refresh                   Bypass cache and re-scan conversation databases
 
   agym remove <profile> [-y, --yes]
       -y, --yes                       Delete without interactive confirmation prompt
@@ -94,6 +103,9 @@ Examples:
   agym personal -p "write tests"      Run non-interactive Antigravity command
   agym list                           Check status and renewal timeline of all profiles
   agym usage                          View live quota table and subscription health
+  agym tokens                         View token consumption and fleet statistics
+  agym tokens --breakdown             Show detailed token composition breakdown table
+  agym tokens --json                  Export token consumption metrics as JSON
   agym edit personal -s 01/06/2027    Update subscription date for an existing profile
   agym remove old-account --yes       Remove profile without prompting
 """
@@ -347,6 +359,14 @@ def _usage(argv: list[str], store: ProfileStore) -> int:
     )
     parser.add_argument("--json", action="store_true", dest="json_mode", help="Output in JSON format")
     parser.add_argument(
+        "--refresh",
+        "-f",
+        "--no-cache",
+        action="store_true",
+        dest="refresh",
+        help="Bypass cache and force live query",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=30.0,
@@ -372,15 +392,77 @@ def _usage(argv: list[str], store: ProfileStore) -> int:
         return 0
 
     agy = resolve_agy()
+    kwargs: dict[str, Any] = {
+        "json_mode": ns.json_mode,
+        "timeout": ns.timeout,
+    }
+    if ns.refresh:
+        kwargs["refresh"] = True
     try:
-        asyncio.run(
-            run_usage(
-                agy,
-                profiles,
-                json_mode=ns.json_mode,
-                timeout=ns.timeout,
-            )
-        )
+        asyncio.run(run_usage(agy, profiles, **kwargs))
+        return 0
+    except KeyboardInterrupt:
+        _print_err("interrupted")
+        return 130
+
+
+def _tokens(argv: list[str], store: ProfileStore) -> int:
+    parser = argparse.ArgumentParser(
+        prog="agym tokens",
+        description="Show token usage breakdowns, comparison charts, and fleet statistics.",
+        add_help=True,
+    )
+    parser.add_argument("--json", action="store_true", dest="json_mode", help="Output in JSON format")
+    parser.add_argument(
+        "--breakdown",
+        "-b",
+        action="store_true",
+        dest="breakdown",
+        help="Show detailed token composition breakdown table per profile",
+    )
+    parser.add_argument(
+        "--refresh",
+        "-f",
+        "--no-cache",
+        action="store_true",
+        dest="refresh",
+        help="Bypass cache and re-scan conversation databases",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="Per-profile timeout in seconds (default: 30)",
+    )
+    parser.add_argument("profiles", nargs="*", help="Optional specific profiles to query")
+    ns = parser.parse_args(argv)
+
+    if ns.profiles:
+        profiles = []
+        for name in ns.profiles:
+            validate_profile_name(name)
+            profiles.append(store.get(name))
+    else:
+        profiles = store.list()
+
+    if not profiles and not ns.profiles:
+        if ns.json_mode:
+            print(json.dumps({"summary": {}, "accounts": []}, indent=2))
+        else:
+            print("No profiles configured. Run 'agym setup <profile>' first.")
+        return 0
+
+    agy = resolve_agy()
+    kwargs = {
+        "json_mode": ns.json_mode,
+        "breakdown": ns.breakdown,
+        "timeout": ns.timeout,
+    }
+    if ns.refresh:
+        kwargs["refresh"] = True
+    try:
+        asyncio.run(run_tokens(agy, profiles, **kwargs))
         return 0
     except KeyboardInterrupt:
         _print_err("interrupted")
@@ -445,6 +527,8 @@ def main(argv: list[str] | None = None) -> int:
             return _list(rest, store)
         if command == "usage":
             return _usage(rest, store)
+        if command in {"token", "tokens", "token-usage"}:
+            return _tokens(rest, store)
         if command == "remove":
             return _remove(rest, store)
         if command == "doctor":

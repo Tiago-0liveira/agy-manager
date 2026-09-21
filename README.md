@@ -59,6 +59,11 @@ agym list
 agym usage
 agym usage personal
 agym usage --json
+agym usage --refresh
+agym tokens
+agym tokens personal
+agym tokens --json
+agym tokens --refresh
 agym doctor
 agym doctor personal
 agym remove personal
@@ -100,6 +105,42 @@ agym usage --timeout 45
 │            │                                                           │
 └────────────┴─────────────────────────────┴─────────────────────────────┘
 ```
+
+### Token Usage Tracking & Terminal Graphs
+
+`agym tokens` (alias: `agym token-usage`) tracks and visualizes token consumption across all accounts:
+
+```bash
+# Display summary card and fleet volume comparison chart
+agym tokens
+
+# Show detailed tabular token composition breakdown per profile
+agym tokens --breakdown
+
+# Filter specific profiles
+agym tokens personal work
+
+# Export full metrics and summary statistics as JSON
+agym tokens --json
+
+# Bypass local cache and re-scan conversation databases
+agym tokens --refresh
+```
+
+- **Metrics Captured**: Input, Output, Thinking, Cache Read, and Total tokens with automated cache efficiency percentages.
+- **Fleet Comparison Chart**: Proportional horizontal bar chart comparing consumption volume across all profiles.
+- **Composition Breakdown Table (`--breakdown` / `-b`)**: Clean, beautifully formatted tabular breakdown displaying Total, Input, Output, Think, Cache, and Hit % per profile with a Fleet Total aggregate row.
+- **Fleet Summary Card**: Displays fleet-wide token consumption, top consuming profile, average tokens per account, prompt cache hit ratio, and data cache status.
+- **Non-TTY Fallback**: Automatically adapts to piped environments (`agym tokens | cat`) using clean ASCII blocks and no escape codes.
+
+### Multi-Tier Caching
+
+To ensure instantaneous terminal responses and avoid redundant disk or subprocess operations:
+
+- **Usage Cache (`agym usage`)**: 60-second TTL. Queries within 1 minute return instantly from cache and show a subtle age indicator (e.g. `· 24s ago`). Live refresh queries the Google backend via `agy -p /usage`.
+- **Token Cache (`agym tokens`)**: 10-minute TTL. Scans local Antigravity conversation databases and transcripts, persisting cumulative snapshots per profile.
+- **Cache Bypass (`-f` / `--refresh` / `--no-cache`)**: Bypasses the cache (forces live API query for `usage`, re-scans local conversation databases for `tokens`).
+- **Cache Location & Privacy**: Stored securely at `~/.local/share/agym/cache/` (or `AGYM_DATA_HOME/cache`) with private `0o700` directories and atomic `0o600` files. Corrupted files are recovered automatically.
 
 ### Profile Launch Settings
 

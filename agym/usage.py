@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Sequence
 
+from .cache import CacheManager, TTL_USAGE_SECONDS, format_age, format_freshness_badge
 from .launcher import build_profile_env, resolve_agy
 from .profiles import Profile, ProfileStore
 from .subscription import calculate_subscription_health, format_subscription_cells
@@ -67,6 +68,9 @@ class AccountUsage:
     groups: list[UsageGroup] = field(default_factory=list)
     error: str | None = None
     subscription_date: str | None = None
+    cached: bool = False
+    age_seconds: float = 0.0
+    cached_at: str | None = None
 
 
 def parse_iso_datetime(raw: str | None) -> datetime | None:
@@ -210,6 +214,9 @@ def parse_usage_response(
     raw_output: str,
     account: str,
     subscription_date: str | None = None,
+    cached: bool = False,
+    age_seconds: float = 0.0,
+    cached_at: str | None = None,
 ) -> AccountUsage:
     if not raw_output or not raw_output.strip():
         return AccountUsage(
@@ -217,6 +224,9 @@ def parse_usage_response(
             status="error",
             error="empty response from agy",
             subscription_date=subscription_date,
+            cached=cached,
+            age_seconds=age_seconds,
+            cached_at=cached_at,
         )
 
     try:
@@ -227,6 +237,9 @@ def parse_usage_response(
             status="error",
             error=f"malformed JSON response from agy: {exc}",
             subscription_date=subscription_date,
+            cached=cached,
+            age_seconds=age_seconds,
+            cached_at=cached_at,
         )
 
     if not isinstance(payload, dict):
@@ -235,6 +248,9 @@ def parse_usage_response(
             status="error",
             error="malformed JSON response from agy (not an object)",
             subscription_date=subscription_date,
+            cached=cached,
+            age_seconds=age_seconds,
+            cached_at=cached_at,
         )
 
     status = payload.get("status")
@@ -244,6 +260,9 @@ def parse_usage_response(
             status="error",
             error=f"agy returned status: {status}",
             subscription_date=subscription_date,
+            cached=cached,
+            age_seconds=age_seconds,
+            cached_at=cached_at,
         )
 
     command = payload.get("command")
@@ -253,6 +272,9 @@ def parse_usage_response(
             status="error",
             error="missing or invalid usage command in agy response",
             subscription_date=subscription_date,
+            cached=cached,
+            age_seconds=age_seconds,
+            cached_at=cached_at,
         )
 
     data = command.get("data")
@@ -262,6 +284,9 @@ def parse_usage_response(
             status="error",
             error="missing command data in agy response",
             subscription_date=subscription_date,
+            cached=cached,
+            age_seconds=age_seconds,
+            cached_at=cached_at,
         )
 
     raw_groups = data.get("groups")
@@ -271,6 +296,9 @@ def parse_usage_response(
             status="error",
             error="missing groups list in usage data",
             subscription_date=subscription_date,
+            cached=cached,
+            age_seconds=age_seconds,
+            cached_at=cached_at,
         )
 
     groups: list[UsageGroup] = []
@@ -326,6 +354,9 @@ def parse_usage_response(
         status="success",
         groups=groups,
         subscription_date=subscription_date,
+        cached=cached,
+        age_seconds=age_seconds,
+        cached_at=cached_at,
     )
 
 
@@ -352,6 +383,9 @@ def account_usage_to_dict(usage: AccountUsage) -> dict[str, Any]:
         return {
             "account": usage.account,
             "status": "error",
+            "cached": usage.cached,
+            "age_seconds": round(usage.age_seconds, 1),
+            "cached_at": usage.cached_at,
             "error": usage.error or "unknown error",
             "subscription": sub_dict,
         }
@@ -383,6 +417,9 @@ def account_usage_to_dict(usage: AccountUsage) -> dict[str, Any]:
     return {
         "account": usage.account,
         "status": "success",
+        "cached": usage.cached,
+        "age_seconds": round(usage.age_seconds, 1),
+        "cached_at": usage.cached_at,
         "subscription": sub_dict,
         "groups": groups_data,
     }
@@ -547,8 +584,12 @@ def render_usage_table_lines(
                     )
                     for fam, _ in QUOTA_COLUMNS
                 ]
+                acc_sub = f"· {format_age(usage.age_seconds)}" if usage.cached else ""
+                if len(acc_sub) > acc_col_width:
+                    acc_sub = acc_sub[:acc_col_width]
+                acc_sub_disp = f"\033[90m{acc_sub:<{acc_col_width}}\033[0m" if (use_color and acc_sub) else f"{acc_sub:<{acc_col_width}}"
                 row_1 = f"│ {usage.account:<{acc_col_width}} │ " + " │ ".join(cells_5h + [sub_cell_1]) + " │"
-                row_2 = f"│ {'':<{acc_col_width}} │ " + " │ ".join(cells_wk + [sub_cell_2]) + " │"
+                row_2 = f"│ {acc_sub_disp} │ " + " │ ".join(cells_wk + [sub_cell_2]) + " │"
                 lines.append(row_1)
                 lines.append(row_2)
             else:
@@ -659,8 +700,25 @@ async def fetch_account_usage_async(
     profile: Profile,
     semaphore: asyncio.Semaphore,
     timeout: float = 30.0,
+    force_refresh: bool = False,
+    cache_manager: CacheManager | None = None,
     runner: Callable[..., Coroutine[Any, Any, tuple[int, str, str]]] | None = None,
 ) -> AccountUsage:
+    if not force_refresh and cache_manager is not None:
+        cached_entry = cache_manager.get_usage(profile.name, max_age=TTL_USAGE_SECONDS)
+        if cached_entry is not None:
+            parsed_data, raw_out, age_secs, cached_at = cached_entry
+            cached_usage = parse_usage_response(
+                raw_out,
+                account=profile.name,
+                subscription_date=profile.subscription_date,
+                cached=True,
+                age_seconds=age_secs,
+                cached_at=cached_at,
+            )
+            if cached_usage.status == "success":
+                return cached_usage
+
     async with semaphore:
         if not profile.home.exists():
             return AccountUsage(
@@ -710,11 +768,16 @@ async def fetch_account_usage_async(
                 subscription_date=profile.subscription_date,
             )
 
-        return parse_usage_response(
+        usage = parse_usage_response(
             out,
             account=profile.name,
             subscription_date=profile.subscription_date,
+            cached=False,
+            age_seconds=0.0,
         )
+        if usage.status == "success" and cache_manager is not None:
+            cache_manager.set_usage(profile.name, account_usage_to_dict(usage), out)
+        return usage
 
 
 async def fetch_all_usage(
@@ -722,6 +785,8 @@ async def fetch_all_usage(
     profiles: Sequence[Profile],
     concurrency_limit: int = 8,
     timeout: float = 30.0,
+    force_refresh: bool = False,
+    cache_manager: CacheManager | None = None,
     on_progress: Callable[[AccountUsage], None] | None = None,
     runner: Callable[..., Coroutine[Any, Any, tuple[int, str, str]]] | None = None,
 ) -> list[AccountUsage]:
@@ -737,6 +802,8 @@ async def fetch_all_usage(
             profile,
             semaphore,
             timeout=timeout,
+            force_refresh=force_refresh,
+            cache_manager=cache_manager,
             runner=runner,
         )
         if on_progress is not None:
@@ -784,8 +851,17 @@ class ProgressiveUsageUI:
                 self.stdout.write(f"[{self.completed_count}/{self.total}] {usage.account}: failed ({short_err})\n")
             self.stdout.flush()
 
+    def _render_title(self) -> str:
+        cached_count = sum(1 for u in self.completed.values() if u.cached)
+        if cached_count == len(self.completed) and cached_count > 0:
+            max_age = max((u.age_seconds for u in self.completed.values()), default=0.0)
+            return f"Antigravity Usage (Cached {format_age(max_age)})"
+        elif cached_count > 0:
+            return f"Antigravity Usage ({cached_count}/{len(self.completed)} cached)"
+        return "Antigravity Usage"
+
     def _render_tty_frame(self, spinner_char: str) -> list[str]:
-        lines: list[str] = ["Antigravity Usage", ""]
+        lines: list[str] = [self._render_title(), ""]
         table_lines = render_usage_table_lines(
             self.profiles,
             self.completed,
@@ -835,8 +911,9 @@ class ProgressiveUsageUI:
             spinner_char=None,
             use_color=self.is_tty,
         )
+        title = self._render_title()
         if self.is_tty:
-            lines = ["Antigravity Usage", ""] + table_lines
+            lines = [title, ""] + table_lines
             out: list[str] = []
             if self.last_lines_count > 0:
                 out.append(f"\033[{self.last_lines_count}A\r")
@@ -846,7 +923,7 @@ class ProgressiveUsageUI:
             self.stdout.write("".join(out))
             self.stdout.flush()
         else:
-            lines = ["Antigravity Usage", ""] + table_lines + [""]
+            lines = [title, ""] + table_lines + [""]
             self.stdout.write("\n".join(lines))
             self.stdout.flush()
 
@@ -856,13 +933,16 @@ async def run_usage(
     profiles: Sequence[Profile],
     *,
     json_mode: bool = False,
+    refresh: bool = False,
     timeout: float = 30.0,
     concurrency_limit: int = 8,
+    cache_manager: CacheManager | None = None,
     is_tty: bool | None = None,
     stdout: Any = None,
     runner: Callable[..., Coroutine[Any, Any, tuple[int, str, str]]] | None = None,
 ) -> list[AccountUsage]:
     out = sys.stdout if stdout is None else stdout
+    cm = cache_manager if cache_manager is not None else CacheManager()
     if not profiles:
         if json_mode:
             out.write(json.dumps({"accounts": []}, indent=2) + "\n")
@@ -878,6 +958,8 @@ async def run_usage(
             profiles,
             concurrency_limit=concurrency_limit,
             timeout=timeout,
+            force_refresh=refresh,
+            cache_manager=cm,
             runner=runner,
         )
         payload = usage_payload_to_dict(usages)
@@ -885,20 +967,45 @@ async def run_usage(
         out.flush()
         return usages
 
-    ui = ProgressiveUsageUI(profiles, is_tty=is_tty, stdout=out)
-    spinner_task = asyncio.create_task(ui.spinner_loop())
-    usages_result: list[AccountUsage] = []
-    try:
-        usages_result = await fetch_all_usage(
-            agy_path,
-            profiles,
-            concurrency_limit=concurrency_limit,
-            timeout=timeout,
-            on_progress=ui.on_progress,
-            runner=runner,
-        )
-    finally:
-        ui.finish(usages_result)
-        await spinner_task
+    # Check if any profile requires live query
+    need_live_query = refresh
+    if not refresh:
+        for p in profiles:
+            if cm.get_usage(p.name, max_age=TTL_USAGE_SECONDS) is None:
+                need_live_query = True
+                break
 
+    tty_mode = sys.stdout.isatty() if is_tty is None else is_tty
+    if need_live_query and tty_mode:
+        ui = ProgressiveUsageUI(profiles, is_tty=tty_mode, stdout=out)
+        spinner_task = asyncio.create_task(ui.spinner_loop())
+        usages_result: list[AccountUsage] = []
+        try:
+            usages_result = await fetch_all_usage(
+                agy_path,
+                profiles,
+                concurrency_limit=concurrency_limit,
+                timeout=timeout,
+                force_refresh=refresh,
+                cache_manager=cm,
+                on_progress=ui.on_progress,
+                runner=runner,
+            )
+        finally:
+            ui.finish(usages_result)
+            await spinner_task
+        return usages_result
+
+    ui = ProgressiveUsageUI(profiles, is_tty=tty_mode, stdout=out)
+    usages_result = await fetch_all_usage(
+        agy_path,
+        profiles,
+        concurrency_limit=concurrency_limit,
+        timeout=timeout,
+        force_refresh=refresh,
+        cache_manager=cm,
+        on_progress=ui.on_progress if not tty_mode else None,
+        runner=runner,
+    )
+    ui.finish(usages_result)
     return usages_result
