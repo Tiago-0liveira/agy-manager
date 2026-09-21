@@ -11,11 +11,10 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .profiles import Profile, ProfileError
+from .profiles import Profile, ProfileError, _default_config_root, _default_data_root
 from .wincred import has_profile_token, profile_credential_context
 
 logger = logging.getLogger("agym.launcher")
-
 
 
 class AgyNotFound(RuntimeError):
@@ -58,6 +57,13 @@ def build_profile_env(
     env = dict(os.environ if base_env is None else base_env)
     home = str(Path(profile_home).resolve())
     host_home = env.get("HOME") or env.get("USERPROFILE")
+
+    # Preserve agym config and data roots before overriding HOME, so that child
+    # processes (like statusline scripts) can locate agym profiles and cache.
+    if "AGYM_CONFIG_HOME" not in env:
+        env["AGYM_CONFIG_HOME"] = str(_default_config_root())
+    if "AGYM_DATA_HOME" not in env:
+        env["AGYM_DATA_HOME"] = str(_default_data_root())
 
     env["GEMINI_FORCE_FILE_STORAGE"] = "true"
     env["HOME"] = home

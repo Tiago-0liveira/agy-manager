@@ -144,7 +144,11 @@ agym tokens --refresh
 
 ### Persistent Antigravity Statusline
 
-`agym` provides an integrated statusline for Antigravity that renders the active account name, active model, live quota, and context window usage at all times at the bottom of the terminal:
+`agym` provides an integrated statusline for Antigravity that renders the active account name, active Git branch and worktree, active model, live quota, and context window usage at all times at the bottom of the terminal:
+
+```text
+👤 personal │ 🌿 feat/statusline [statusline] │ ⚡ Gemini 3.8 Flash │ 5h: [█████░] 90% (1h18m) │ Wk: 95% (6d) │ Ctx: 12%
+```
 
 ```bash
 # Check statusline installation and preview statusline across profiles
@@ -161,6 +165,7 @@ agym statusline --enable
 agym statusline --disable
 ```
 
+- **Git Branch & Worktree Awareness**: Pure filesystem-based repository inspection (< 1ms, zero subprocess overhead) displays the active Git branch and linked worktree (e.g. `🌿 feat/statusline [statusline]`), adapting to standard repos (`🌿 main`) and detached HEAD states.
 - **Automatic Multi-Account Configuration**: Setting up an account via `agym setup <profile>` automatically installs the statusline runner and synchronizes the `statusLine` configuration across all registered accounts in their isolated `settings.json`.
 - **Live & Cached Quota**: Seamlessly reads live bucket quota streamed by `agy` on state changes, falling back to `agym`'s usage cache when uninitialized.
 - **Adaptive Layout**: Automatically detects terminal width and adjusts between full (≥ 105 cols), standard (≥ 75 cols), compact (≥ 55 cols), and minimal layouts.

@@ -20,6 +20,7 @@ from agym.statusline import (
     format_mini_bar,
     format_short_reset_duration,
     format_short_tokens,
+    format_vcs_tag,
     get_profile_settings_path,
     get_rank_color,
     get_statusline_script_path,
@@ -27,13 +28,16 @@ from agym.statusline import (
     install_statusline_script,
     load_cache_quota,
     main as statusline_main,
+    parse_git_head,
     render_statusline,
     resolve_account_name,
     resolve_context_window,
+    resolve_git_vcs,
     resolve_model_display,
     resolve_quota,
     sync_all_profiles,
     sync_profile_statusline,
+    VCSInfo,
 )
 
 
@@ -331,11 +335,11 @@ class StatuslineRenderingTests(unittest.TestCase):
     def test_render_empty_payload(self) -> None:
         line = render_statusline(
             {},
-            profile_name="csgotiago",
+            profile_name="empty_profile",
             terminal_width=80,
             no_color=True,
         )
-        self.assertIn("👤 csgotiago", line)
+        self.assertIn("👤 empty_profile", line)
         self.assertIn("5h: -", line)
 
 
@@ -534,6 +538,185 @@ class SetupStatuslineIntegrationTests(unittest.TestCase):
             self.assertIn("statusLine", data)
             self.assertEqual(data["statusLine"]["type"], "command")
             self.assertTrue(data["statusLine"]["enabled"])
+
+
+class StatuslineVCSTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp_dir = Path(tempfile.mkdtemp())
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_parse_git_head(self) -> None:
+        self.assertEqual(parse_git_head("ref: refs/heads/main\n"), "main")
+        self.assertEqual(parse_git_head("ref: refs/heads/feat/statusline\n"), "feat/statusline")
+        self.assertEqual(parse_git_head("ref: refs/tags/v1.0.0"), "v1.0.0")
+        self.assertEqual(parse_git_head("ref: refs/remotes/origin/main"), "origin/main")
+        self.assertEqual(parse_git_head("ref: custom/ref"), "custom/ref")
+        self.assertEqual(parse_git_head("d3b07384d113edec49eaa6238ad5ff00\n"), "d3b0738")
+        self.assertIsNone(parse_git_head(None))
+        self.assertIsNone(parse_git_head(""))
+        self.assertIsNone(parse_git_head("   \n"))
+
+    def test_format_vcs_tag(self) -> None:
+        vcs_wt = VCSInfo(branch="feat/statusline", worktree="statusline")
+        formatted_color = format_vcs_tag(vcs_wt, include_worktree=True, no_color=False)
+        self.assertIn("🌿 feat/statusline", formatted_color)
+        self.assertIn("[statusline]", formatted_color)
+        self.assertIn("\033[38;5;75m", formatted_color)
+
+        formatted_no_color = format_vcs_tag(vcs_wt, include_worktree=True, no_color=True)
+        self.assertEqual(formatted_no_color, "🌿 feat/statusline [statusline]")
+
+        formatted_no_wt = format_vcs_tag(vcs_wt, include_worktree=False, no_color=True)
+        self.assertEqual(formatted_no_wt, "🌿 feat/statusline")
+
+        # None inputs
+        self.assertIsNone(format_vcs_tag(None))
+        self.assertIsNone(format_vcs_tag(VCSInfo()))
+
+        # Truncation
+        long_vcs = VCSInfo(branch="feature/very-long-branch-name", worktree=None)
+        truncated = format_vcs_tag(long_vcs, include_worktree=False, max_branch_len=14, no_color=True)
+        self.assertEqual(truncated, "🌿 feature/very-…")
+
+    def test_resolve_git_vcs_standard_repo(self) -> None:
+        repo_dir = self.tmp_dir / "standard_repo"
+        git_dir = repo_dir / ".git"
+        git_dir.mkdir(parents=True)
+        (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
+
+        vcs = resolve_git_vcs(cwd=repo_dir)
+        self.assertEqual(vcs.branch, "main")
+        self.assertIsNone(vcs.worktree)
+
+    def test_resolve_git_vcs_linked_worktree(self) -> None:
+        main_git = self.tmp_dir / "main_repo" / ".git"
+        wt_meta = main_git / "worktrees" / "my-wt"
+        wt_meta.mkdir(parents=True)
+        (wt_meta / "commondir").write_text("../..\n")
+        (wt_meta / "gitdir").write_text(str(self.tmp_dir / "wt_work" / ".git") + "\n")
+        (wt_meta / "HEAD").write_text("ref: refs/heads/feat/test-wt\n")
+
+        wt_dir = self.tmp_dir / "wt_work"
+        wt_dir.mkdir(parents=True)
+        (wt_dir / ".git").write_text(f"gitdir: {wt_meta}\n")
+
+        vcs = resolve_git_vcs(cwd=wt_dir)
+        self.assertEqual(vcs.branch, "feat/test-wt")
+        self.assertEqual(vcs.worktree, "my-wt")
+
+    def test_resolve_git_vcs_relative_gitdir(self) -> None:
+        main_git = self.tmp_dir / "main_repo" / ".git"
+        wt_meta = main_git / "worktrees" / "wt-rel"
+        wt_meta.mkdir(parents=True)
+        (wt_meta / "commondir").write_text("../..\n")
+        (wt_meta / "HEAD").write_text("ref: refs/heads/feat/rel\n")
+
+        wt_dir = self.tmp_dir / "wt_rel_work"
+        wt_dir.mkdir(parents=True)
+        rel_path = os.path.relpath(wt_meta, wt_dir)
+        (wt_dir / ".git").write_text(f"gitdir: {rel_path}\n")
+
+        vcs = resolve_git_vcs(cwd=wt_dir)
+        self.assertEqual(vcs.branch, "feat/rel")
+        self.assertEqual(vcs.worktree, "wt-rel")
+
+    def test_resolve_git_vcs_from_subdir(self) -> None:
+        main_git = self.tmp_dir / "main_repo" / ".git"
+        wt_meta = main_git / "worktrees" / "nested-wt"
+        wt_meta.mkdir(parents=True)
+        (wt_meta / "commondir").write_text("../..\n")
+        (wt_meta / "HEAD").write_text("ref: refs/heads/feat/nested\n")
+
+        wt_dir = self.tmp_dir / "nested_work"
+        (wt_dir / ".git").parent.mkdir(parents=True, exist_ok=True)
+        (wt_dir / ".git").write_text(f"gitdir: {wt_meta}\n")
+
+        subdir = wt_dir / "src" / "package" / "deep"
+        subdir.mkdir(parents=True)
+
+        vcs = resolve_git_vcs(cwd=subdir)
+        self.assertEqual(vcs.branch, "feat/nested")
+        self.assertEqual(vcs.worktree, "nested-wt")
+
+    def test_resolve_git_vcs_submodule(self) -> None:
+        sub_meta = self.tmp_dir / "main_repo" / ".git" / "modules" / "submodule1"
+        sub_meta.mkdir(parents=True)
+        (sub_meta / "HEAD").write_text("ref: refs/heads/sub-branch\n")
+
+        sub_dir = self.tmp_dir / "sub_work"
+        sub_dir.mkdir(parents=True)
+        (sub_dir / ".git").write_text(f"gitdir: {sub_meta}\n")
+
+        vcs = resolve_git_vcs(cwd=sub_dir)
+        self.assertEqual(vcs.branch, "sub-branch")
+        self.assertIsNone(vcs.worktree)
+
+    def test_resolve_git_vcs_non_git_dir(self) -> None:
+        empty_dir = self.tmp_dir / "empty"
+        empty_dir.mkdir()
+        vcs = resolve_git_vcs(cwd=empty_dir)
+        self.assertIsNone(vcs.branch)
+        self.assertIsNone(vcs.worktree)
+
+    def test_resolve_git_vcs_payload_metadata(self) -> None:
+        payload = {
+            "vcs": {"branch": "payload-branch", "worktree": "payload-wt"},
+        }
+        vcs = resolve_git_vcs(payload=payload)
+        self.assertEqual(vcs.branch, "payload-branch")
+        self.assertEqual(vcs.worktree, "payload-wt")
+
+    def test_render_statusline_vcs_integration(self) -> None:
+        wt_meta = self.tmp_dir / "repo" / ".git" / "worktrees" / "my-feature-wt"
+        wt_meta.mkdir(parents=True)
+        (wt_meta / "commondir").write_text("../..\n")
+        (wt_meta / "HEAD").write_text("ref: refs/heads/feat/statusline\n")
+
+        wt_dir = self.tmp_dir / "feat_wt"
+        wt_dir.mkdir(parents=True)
+        (wt_dir / ".git").write_text(f"gitdir: {wt_meta}\n")
+
+        payload = {
+            "model": {"display_name": "Flash 2.5"},
+            "quota": {"gemini-5h": {"remaining_fraction": 0.85}},
+        }
+
+        # Wide terminal: includes [worktree]
+        wide_line = render_statusline(
+            payload,
+            profile_name="tiagoliv",
+            terminal_width=110,
+            no_color=True,
+            cwd=wt_dir,
+        )
+        self.assertIn("👤 tiagoliv", wide_line)
+        self.assertIn("🌿 feat/statusline [my-feature-wt]", wide_line)
+        self.assertIn("5h: [█████░] 85%", wide_line)
+
+        # Narrower terminal (70 columns): includes branch only
+        narrow_line = render_statusline(
+            payload,
+            profile_name="tiagoliv",
+            terminal_width=70,
+            no_color=True,
+            cwd=wt_dir,
+        )
+        self.assertIn("👤 tiagoliv", narrow_line)
+        self.assertIn("🌿 feat/statusline", narrow_line)
+        self.assertNotIn("[my-feature-wt]", narrow_line)
+
+        # Ultra compact terminal (50 columns): omits vcs tag
+        ultra_line = render_statusline(
+            payload,
+            profile_name="tiagoliv",
+            terminal_width=50,
+            no_color=True,
+            cwd=wt_dir,
+        )
+        self.assertIn("👤 tiagoliv", ultra_line)
+        self.assertNotIn("🌿", ultra_line)
 
 
 if __name__ == "__main__":

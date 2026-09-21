@@ -19,6 +19,7 @@ BOLD = "\033[1m"
 DIM = "\033[2m"
 CYAN = "\033[38;5;39m"
 PURPLE = "\033[38;5;141m"
+BLUE = "\033[38;5;75m"
 GRAY = "\033[38;5;245m"
 DARK_GRAY = "\033[38;5;239m"
 SEP = f"{DARK_GRAY}│{RESET}"
@@ -301,12 +302,179 @@ def resolve_context_window(payload: dict[str, Any] | None = None) -> ContextWind
     )
 
 
+@dataclass
+class VCSInfo:
+    branch: str | None = None
+    worktree: str | None = None
+
+
+def parse_git_head(head_content: str | None) -> str | None:
+    if not head_content or not isinstance(head_content, str):
+        return None
+    cleaned = head_content.strip()
+    if not cleaned:
+        return None
+    lines = cleaned.splitlines()
+    if not lines:
+        return None
+    line = lines[0].strip()
+    if not line:
+        return None
+    if line.startswith("ref: refs/heads/"):
+        return line[len("ref: refs/heads/"):].strip()
+    if line.startswith("ref: refs/tags/"):
+        return line[len("ref: refs/tags/"):].strip()
+    if line.startswith("ref: refs/remotes/"):
+        return line[len("ref: refs/remotes/"):].strip()
+    if line.startswith("ref: "):
+        return line[len("ref: "):].strip()
+    # Detached HEAD (hash): check if 7+ hex characters
+    if len(line) >= 7 and all(c in "0123456789abcdefABCDEF" for c in line[:7]):
+        return line[:7]
+    return line
+
+
+def resolve_git_vcs(
+    cwd: Path | str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> VCSInfo:
+    if payload is None:
+        payload = {}
+
+    branch: str | None = None
+    worktree: str | None = None
+
+    # Check if payload explicitly provides VCS metadata without an explicit cwd
+    has_explicit_cwd = (
+        cwd is not None
+        or bool(payload.get("cwd"))
+        or bool(payload.get("workspace_path"))
+        or bool(payload.get("workspace"))
+    )
+    payload_vcs = payload.get("vcs") if isinstance(payload.get("vcs"), dict) else {}
+    payload_git = payload.get("git") if isinstance(payload.get("git"), dict) else {}
+    payload_branch = payload_vcs.get("branch") or payload_git.get("branch") or payload.get("branch")
+    payload_worktree = payload_vcs.get("worktree") or payload_git.get("worktree") or payload.get("worktree")
+
+    if not has_explicit_cwd and payload_branch:
+        return VCSInfo(
+            branch=str(payload_branch).strip(),
+            worktree=str(payload_worktree).strip() if payload_worktree else None,
+        )
+
+    # Determine directory to inspect
+    target_dir: Path | None = None
+    if cwd is not None:
+        try:
+            target_dir = Path(cwd).resolve()
+        except Exception:
+            target_dir = None
+    elif payload.get("cwd"):
+        try:
+            target_dir = Path(str(payload["cwd"])).resolve()
+        except Exception:
+            target_dir = None
+    elif payload.get("workspace_path"):
+        try:
+            target_dir = Path(str(payload["workspace_path"])).resolve()
+        except Exception:
+            target_dir = None
+    elif isinstance(payload.get("workspace"), str):
+        try:
+            target_dir = Path(payload["workspace"]).resolve()
+        except Exception:
+            target_dir = None
+    elif isinstance(payload.get("workspace"), dict) and payload["workspace"].get("path"):
+        try:
+            target_dir = Path(str(payload["workspace"]["path"])).resolve()
+        except Exception:
+            target_dir = None
+    else:
+        try:
+            target_dir = Path.cwd().resolve()
+        except Exception:
+            target_dir = None
+
+    # Inspect disk
+    if target_dir is not None:
+        try:
+            cur = target_dir
+            dot_git: Path | None = None
+            while True:
+                candidate = cur / ".git"
+                if candidate.exists():
+                    dot_git = candidate
+                    break
+                parent = cur.parent
+                if parent == cur:
+                    break
+                cur = parent
+
+            if dot_git is not None:
+                if dot_git.is_file():
+                    content = dot_git.read_text(encoding="utf-8", errors="replace").strip()
+                    if content.startswith("gitdir:"):
+                        gitdir_raw = content[len("gitdir:"):].strip()
+                        resolved_gitdir = (dot_git.parent / gitdir_raw).resolve()
+                        if resolved_gitdir.is_dir():
+                            commondir = resolved_gitdir / "commondir"
+                            if commondir.is_file() or resolved_gitdir.parent.name == "worktrees":
+                                worktree = resolved_gitdir.name
+                            head_file = resolved_gitdir / "HEAD"
+                            if head_file.is_file():
+                                head_content = head_file.read_text(encoding="utf-8", errors="replace")
+                                branch = parse_git_head(head_content)
+                elif dot_git.is_dir():
+                    head_file = dot_git / "HEAD"
+                    if head_file.is_file():
+                        head_content = head_file.read_text(encoding="utf-8", errors="replace")
+                        branch = parse_git_head(head_content)
+        except Exception:
+            pass
+
+    # Fallback to payload metadata if branch or worktree was not found on disk
+    if branch is None and payload_branch:
+        branch = str(payload_branch).strip()
+    if worktree is None and payload_worktree:
+        worktree = str(payload_worktree).strip()
+
+    return VCSInfo(branch=branch, worktree=worktree)
+
+
+def format_vcs_tag(
+    vcs: VCSInfo | None,
+    include_worktree: bool = True,
+    max_branch_len: int | None = None,
+    no_color: bool = False,
+) -> str | None:
+    if not vcs or not vcs.branch:
+        return None
+
+    branch = vcs.branch
+    if max_branch_len and len(branch) > max_branch_len:
+        branch = branch[: max_branch_len - 1] + "…"
+
+    blue = BLUE if not no_color else ""
+    dark_gray = DARK_GRAY if not no_color else ""
+    reset = RESET if not no_color else ""
+
+    if include_worktree and vcs.worktree:
+        if no_color:
+            return f"🌿 {branch} [{vcs.worktree}]"
+        return f"{blue}🌿 {branch} {dark_gray}[{vcs.worktree}]{reset}"
+
+    if no_color:
+        return f"🌿 {branch}"
+    return f"{blue}🌿 {branch}{reset}"
+
+
 def render_statusline(
     payload: dict[str, Any] | None = None,
     profile_name: str | None = None,
     terminal_width: int | None = None,
     no_color: bool | None = None,
     data_root: Path | None = None,
+    cwd: Path | str | None = None,
 ) -> str:
     if payload is None:
         payload = {}
@@ -318,6 +486,7 @@ def render_statusline(
     model = resolve_model_display(payload)
     quota = resolve_quota(account, payload, data_root=data_root)
     ctx = resolve_context_window(payload)
+    vcs = resolve_git_vcs(cwd=cwd, payload=payload)
 
     if terminal_width is None:
         try:
@@ -334,6 +503,16 @@ def render_statusline(
 
     # Account tag
     account_tag = f"{bold}{cyan}👤 {account}{reset}"
+
+    # VCS tag
+    include_worktree = terminal_width >= 75
+    max_branch = None if terminal_width >= 75 else 18
+    vcs_tag = format_vcs_tag(
+        vcs,
+        include_worktree=include_worktree,
+        max_branch_len=max_branch,
+        no_color=no_color,
+    )
 
     # Model tag
     model_tag = f"{purple}⚡ {model}{reset}" if model else None
@@ -384,6 +563,8 @@ def render_statusline(
     # Width-based adaptive layout
     if terminal_width >= 105:
         parts = [account_tag]
+        if vcs_tag:
+            parts.append(vcs_tag)
         if model_tag:
             parts.append(model_tag)
         parts.append(quota_5h_tag)
@@ -397,6 +578,8 @@ def render_statusline(
 
     if terminal_width >= 75:
         parts = [account_tag]
+        if vcs_tag:
+            parts.append(vcs_tag)
         if model_tag:
             parts.append(model_tag)
         parts.append(quota_5h_tag)
@@ -407,7 +590,10 @@ def render_statusline(
         return sep.join(parts)
 
     if terminal_width >= 55:
-        parts = [account_tag, quota_5h_tag]
+        parts = [account_tag]
+        if vcs_tag:
+            parts.append(vcs_tag)
+        parts.append(quota_5h_tag)
         if ctx_tag:
             parts.append(ctx_tag)
         return sep.join(parts)

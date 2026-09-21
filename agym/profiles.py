@@ -128,10 +128,29 @@ def validate_profile_name(name: str) -> str:
     return name
 
 
+def _detect_profile_escape_roots() -> tuple[Path | None, Path | None]:
+    home_str = os.environ.get("HOME") or ""
+    if "/profiles/" in home_str and (home_str.endswith("/home") or home_str.endswith(os.sep + "home")):
+        try:
+            p = Path(home_str).resolve()
+            if p.parent.parent.name == "profiles":
+                data_root = p.parent.parent.parent
+                if data_root.parent.name == "share" and data_root.parent.parent.name == ".local":
+                    host_home = data_root.parent.parent.parent
+                    return host_home / ".config" / "agym", data_root
+                return data_root / "config", data_root
+        except Exception:
+            pass
+    return None, None
+
+
 def _default_config_root() -> Path:
     override = os.environ.get("AGYM_CONFIG_HOME")
     if override:
         return Path(override).expanduser().resolve()
+    cfg_root, _ = _detect_profile_escape_roots()
+    if cfg_root is not None:
+        return cfg_root
     system = platform.system()
     if system == "Windows":
         base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
@@ -146,6 +165,9 @@ def _default_data_root() -> Path:
     override = os.environ.get("AGYM_DATA_HOME")
     if override:
         return Path(override).expanduser().resolve()
+    _, data_root = _detect_profile_escape_roots()
+    if data_root is not None:
+        return data_root
     system = platform.system()
     if system == "Windows":
         base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
