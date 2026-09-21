@@ -80,9 +80,8 @@ General Options:
   -h, --help                          Show this help message and exit
 
 Command Options:
-  agym setup <profile> [-s, --subscription-date DATE] [-f, --reauth]
+  agym setup <profile> [-s, --subscription-date DATE]
       -s, --subscription-date DATE    Renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)
-      -f, --reauth, --force           Re-authenticate an existing profile with a fresh sign-in flow
 
   agym config <profile> [--model MODEL] [-y|--dsp|--skip-perms|--[no-]dangerously-skip-permissions]
       --model MODEL                   Set default model (or 'default' to clear)
@@ -137,14 +136,6 @@ def _setup(argv: list[str], store: ProfileStore) -> int:
         metavar="DATE",
         help="Subscription renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)",
     )
-    parser.add_argument(
-        "--reauth",
-        "--force",
-        "-f",
-        action="store_true",
-        dest="reauth",
-        help="Re-authenticate an existing profile with a fresh Google sign-in flow",
-    )
     ns = parser.parse_args(argv)
     validate_profile_name(ns.profile)
 
@@ -160,17 +151,7 @@ def _setup(argv: list[str], store: ProfileStore) -> int:
 
     # Resolve the host binary before constructing or using the isolated HOME.
     agy = resolve_agy()
-    if store.exists(ns.profile):
-        if ns.reauth:
-            profile = store.get(ns.profile)
-            if ns.subscription_date is not None:
-                store.set_subscription_date(profile.name, subscription_date)
-                profile = store.get(ns.profile)
-            print(f"Re-authenticating profile '{profile.name}'.")
-        else:
-            raise ProfileExists(f"profile already exists: {ns.profile} (use --reauth to re-authenticate)")
-    else:
-        profile = store.create(ns.profile, subscription_date=subscription_date)
+    profile = store.create(ns.profile, subscription_date=subscription_date)
 
     print(f"Launching Antigravity to set up profile '{profile.name}'.")
     print(f"Profile home: {profile.home}")

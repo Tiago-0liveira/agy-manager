@@ -35,7 +35,6 @@ pip install .
 ```bash
 agym setup personal
 agym setup work
-agym setup work --reauth               # Re-authenticate an existing profile with a fresh sign-in flow
 
 agym personal
 agym work

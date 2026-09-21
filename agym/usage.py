@@ -739,7 +739,7 @@ async def fetch_account_usage_async(
             return AccountUsage(
                 account=profile.name,
                 status="error",
-                error="not authenticated (run 'agym setup --reauth " + profile.name + "')",
+                error="not authenticated (run 'agym setup " + profile.name + "')",
                 subscription_date=profile.subscription_date,
             )
 

@@ -253,18 +253,12 @@ class CliTests(unittest.TestCase):
             self.assertEqual(p.subscription_date, "2027-03-14")
             run.assert_called_with(Path("/real/agy"), p, replace_process=False, is_setup=True)
 
-            # Setting up again without --reauth raises error
+            # Setting up an existing profile raises error
             err = io.StringIO()
             with mock.patch("sys.stderr", err):
                 code_err = cli.main(["setup", "my-prof"])
             self.assertEqual(code_err, 2)
             self.assertIn("profile already exists", err.getvalue())
-
-            # Setting up with --reauth re-authenticates successfully
-            run.reset_mock()
-            code_reauth = cli.main(["setup", "my-prof", "--reauth"])
-            self.assertEqual(code_reauth, 0)
-            run.assert_called_with(Path("/real/agy"), p, replace_process=False, is_setup=True)
 
     @mock.patch("agym.cli.ProfileStore")
     def test_edit_subscription_date(self, Store: mock.Mock) -> None:
