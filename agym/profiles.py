@@ -28,7 +28,20 @@ class ProfileExists(ProfileError):
     pass
 
 
-RESERVED_NAMES = {"setup", "list", "remove", "doctor", "usage", "token", "tokens", "token-usage", "edit", "help", "config"}
+RESERVED_NAMES = {
+    "setup",
+    "list",
+    "remove",
+    "doctor",
+    "usage",
+    "token",
+    "tokens",
+    "token-usage",
+    "edit",
+    "help",
+    "config",
+    "rotate",
+}
 
 
 class ProfileNotFound(ProfileError):
@@ -176,7 +189,7 @@ class ProfileStore:
         if not self.config_path.exists():
             return {"version": 1, "profiles": {}}
         try:
-            with self.config_path.open("r", encoding="utf-8") as handle:
+            with self.config_path.open("r", encoding="utf-8-sig") as handle:
                 data = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
             raise ProfileError(f"cannot read {self.config_path}: {exc}") from exc
@@ -305,3 +318,51 @@ def unix_permissions_warning(path: Path) -> str | None:
     if mode & 0o077:
         return f"WARNING: {path} permissions are {mode:04o}; expected no group/world access"
     return None
+
+
+def load_accounts_file(filepath: Path | str) -> list[str]:
+    """Loads a list of account identifiers or profile names from a text or JSON file.
+
+    Handles Windows CRLF (\\r\\n), universal newlines, and UTF-8-SIG (stripping BOM).
+    Ignores comments (#) and blank lines.
+    """
+    path = Path(filepath).resolve()
+    if not path.is_file():
+        raise ProfileError(f"account file does not exist: {path}")
+
+    # Check for JSON extension
+    if path.suffix.lower() == ".json":
+        try:
+            with path.open("r", encoding="utf-8-sig") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ProfileError(f"cannot parse accounts JSON from {path}: {exc}") from exc
+        if isinstance(data, list):
+            raw_accounts = data
+        elif isinstance(data, dict):
+            raw_accounts = data.get("accounts", [])
+        else:
+            raise ProfileError(f"invalid JSON structure in {path}: expected list or dict with 'accounts'")
+
+        accounts: list[str] = []
+        for item in raw_accounts:
+            if isinstance(item, str) and item.strip():
+                accounts.append(item.strip())
+            elif isinstance(item, dict) and "name" in item:
+                accounts.append(str(item["name"]).strip())
+        return accounts
+
+    # Text / lines format
+    accounts = []
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                accounts.append(stripped)
+    except OSError as exc:
+        raise ProfileError(f"cannot read account file {path}: {exc}") from exc
+
+    return accounts
+

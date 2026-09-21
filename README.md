@@ -1,8 +1,6 @@
 # agym — Antigravity Manager
 
-`agym` is a small Python wrapper for explicitly selecting among multiple legitimate Google Antigravity accounts without mutating the normal host Antigravity login. Each named profile gets its own isolated fake home and `agym` launches the real host `agy` binary with file-backed credential storage enabled.
-
-It deliberately does **not** rotate accounts, pool quota, fail over on quota exhaustion, scrape OAuth data, or patch `agy`.
+`agym` is a Python tool for managing multiple isolated Google Antigravity accounts without mutating the host Antigravity login. Each named profile gets its own isolated home directory (`HOME`, `USERPROFILE`, `LOCALAPPDATA`, `APPDATA`), and `agym` launches the real host `agy` binary with file-backed credential storage and automated stale lock cleanup.
 
 ## Current backend
 
@@ -14,7 +12,7 @@ GEMINI_FORCE_FILE_STORAGE=true \
 agy
 ```
 
-On Windows it also redirects the conventional user-home variables used by native applications. The real `agy` executable is resolved from the host `PATH` before the profile environment is constructed. The process keeps the caller's current working directory and inherits the terminal directly.
+On Windows, it redirects `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `LOCALAPPDATA`, and `APPDATA` to the profile folder, pre-creates application data subdirectories, and cleans up stale Chromium singleton locks (`SingletonLock`, `lockfile`) before launch to prevent silent fallback to the default host profile. The real `agy` executable is resolved from the host `PATH` before the profile environment is constructed. The process keeps the caller's current working directory and inherits the terminal directly.
 
 > Important: the target machine must pass the OAuth isolation proof in [`docs/manual-integration.md`](docs/manual-integration.md). `agym` cannot prove a real Google login in unit tests.
 
@@ -56,6 +54,12 @@ agym personal -- -p "explain this repository"
 agym personal -p "explain this repository"
 
 agym list
+agym rotate                           # Sequentially rotates to next profile and launches agy
+agym rotate -p "run review"           # Rotates to next profile and executes prompt
+agym rotate --simulate 3              # Dry-run simulate next 3 rotations without launching
+agym rotate --status                  # View current rotation index, active profile, and history
+agym rotate --reset                   # Reset rotation state to initial index
+agym rotate --file accounts.txt       # Rotate through custom accounts file (handles CRLF / UTF-8 BOM)
 agym usage
 agym usage personal
 agym usage --json

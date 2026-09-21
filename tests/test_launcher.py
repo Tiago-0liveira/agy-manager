@@ -9,14 +9,17 @@ from unittest import mock
 from agym.launcher import (
     Spinner,
     build_agy_args,
+    build_browser_args,
     build_profile_env,
     build_stage1_prompt,
     build_stage2_prompt,
+    cleanup_profile_locks,
     exec_agy_interactive,
     resolve_agy,
     run_agy,
     run_agy_capture,
     run_auto_prompt,
+    terminate_process,
 )
 from agym.profiles import Profile, ProfileSettings
 
@@ -50,9 +53,56 @@ class LauncherTests(unittest.TestCase):
             {"USERPROFILE": r"C:\\Users\\host", "PATH": "X"},
             system="Windows",
         )
-        self.assertEqual(env["USERPROFILE"], str(self.home_a.resolve()))
-        self.assertEqual(env["HOME"], str(self.home_a.resolve()))
+        resolved_home = str(self.home_a.resolve())
+        self.assertEqual(env["USERPROFILE"], resolved_home)
+        self.assertEqual(env["HOME"], resolved_home)
         self.assertEqual(env["GEMINI_FORCE_FILE_STORAGE"], "true")
+        self.assertEqual(env["LOCALAPPDATA"], str((self.home_a / "AppData" / "Local").resolve()))
+        self.assertEqual(env["APPDATA"], str((self.home_a / "AppData" / "Roaming").resolve()))
+        self.assertTrue((self.home_a / "AppData" / "Local").is_dir())
+        self.assertTrue((self.home_a / "AppData" / "Roaming").is_dir())
+        self.assertIn("AGYM_CONFIG_HOME", env)
+        self.assertIn("AGYM_DATA_HOME", env)
+
+    def test_cleanup_profile_locks(self) -> None:
+        # Create lockfiles in various subdirectories
+        gemini_dir = self.home_a / ".gemini" / "antigravity-cli"
+        gemini_dir.mkdir(parents=True)
+        lock1 = gemini_dir / "SingletonLock"
+        lock1.write_text("123", encoding="utf-8")
+
+        appdata_dir = self.home_a / "AppData" / "Local"
+        appdata_dir.mkdir(parents=True)
+        lock2 = appdata_dir / "lockfile"
+        lock2.write_text("lock", encoding="utf-8")
+
+        root_lock = self.home_a / "parent.lock"
+        root_lock.write_text("lock", encoding="utf-8")
+
+        removed = cleanup_profile_locks(self.home_a)
+        self.assertIn(lock1, removed)
+        self.assertIn(lock2, removed)
+        self.assertIn(root_lock, removed)
+        self.assertFalse(lock1.exists())
+        self.assertFalse(lock2.exists())
+        self.assertFalse(root_lock.exists())
+
+    def test_build_browser_args(self) -> None:
+        target_dir = self.root / "custom_browser_profile"
+        args = build_browser_args(target_dir, extra_args=["--headless", "--no-sandbox"], profile_directory="Profile 1")
+        self.assertTrue(target_dir.is_dir())
+        self.assertIn(f"--user-data-dir={str(target_dir.resolve())}", args)
+        self.assertIn("--profile-directory=Profile 1", args)
+        self.assertIn("--headless", args)
+        self.assertIn("--no-sandbox", args)
+
+    def test_terminate_process(self) -> None:
+        mock_proc = mock.Mock()
+        mock_proc.poll.return_value = None
+        terminate_process(mock_proc, timeout=0.1)
+        mock_proc.terminate.assert_called_once()
+        mock_proc.wait.assert_called_once()
+
 
     def test_concurrent_profiles_get_different_auth_data_paths(self) -> None:
         a = build_profile_env(self.home_a, {"HOME": "/host", "PATH": "/bin"}, system="Linux")
@@ -64,11 +114,15 @@ class LauncherTests(unittest.TestCase):
         )
 
     def test_resolve_agy_uses_host_path(self) -> None:
-        fake = self.root / "bin" / "agy"
+        name = "agy.cmd" if os.name == "nt" else "agy"
+        fake = self.root / "bin" / name
         fake.parent.mkdir()
         fake.write_text("#!/bin/sh\n", encoding="utf-8")
         fake.chmod(0o755)
-        resolved = resolve_agy({"PATH": str(fake.parent), "HOME": "/host"})
+        path_env = {"PATH": str(fake.parent), "HOME": "/host"}
+        if os.name == "nt":
+            path_env["PATHEXT"] = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+        resolved = resolve_agy(path_env)
         self.assertEqual(resolved, fake.resolve())
 
     @mock.patch("agym.launcher.subprocess.run")
@@ -79,7 +133,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result, 17)
         args, kwargs = sp_run.call_args
         # Safe default: no --dangerously-skip-permissions
-        self.assertEqual(args[0], ["/usr/bin/agy", "-p", "review this"])
+        self.assertEqual(args[0], [str(Path("/usr/bin/agy")), "-p", "review this"])
         self.assertIsNone(kwargs["cwd"])
         self.assertNotIn("stdin", kwargs)
         self.assertNotIn("stdout", kwargs)
@@ -90,7 +144,7 @@ class LauncherTests(unittest.TestCase):
         sp_run.return_value.returncode = 0
         profile = Profile("personal", self.home_a, "now")
         run_agy(Path("/usr/bin/agy"), profile, ["-p", "review this"], replace_process=False)
-        self.assertEqual(sp_run.call_args.args[0], ["/usr/bin/agy", "-p", "review this"])
+        self.assertEqual(sp_run.call_args.args[0], [str(Path("/usr/bin/agy")), "-p", "review this"])
 
     def test_build_agy_args_safe_defaults(self) -> None:
         profile = Profile("personal", self.home_a, "now")
@@ -243,7 +297,7 @@ class LauncherTests(unittest.TestCase):
         args = build_agy_args(profile, passthrough_args=["-p", "hi"], agy_path=Path("/bin/agy"))
         self.assertEqual(
             args,
-            ["/bin/agy", "--model", "m", "--dangerously-skip-permissions", "-p", "hi"],
+            [str(Path("/bin/agy")), "--model", "m", "--dangerously-skip-permissions", "-p", "hi"],
         )
 
     @mock.patch("agym.launcher.exec_agy_interactive")

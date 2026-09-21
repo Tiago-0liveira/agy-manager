@@ -324,3 +324,71 @@ class CliTests(unittest.TestCase):
             self.assertEqual(code, 2)
             out = mock_out.getvalue()
             self.assertIn("agym — Explicit isolated-profile manager", out)
+
+    @mock.patch("agym.cli.ProfileStore")
+    def test_rotate_simulate(self, Store: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(Path(tmp) / "config", Path(tmp) / "data")
+            store.create("acc1")
+            store.create("acc2")
+            Store.return_value = store
+
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = cli.main(["rotate", "--simulate", "3"])
+            self.assertEqual(code, 0)
+            text = out.getvalue()
+            self.assertIn("Simulating 3 account rotations across 2 accounts:", text)
+            self.assertIn("Active Account: acc1", text)
+            self.assertIn("Active Account: acc2", text)
+            self.assertIn("Rotation Index: 1/2", text)
+            self.assertIn("Rotation Index: 2/2", text)
+
+    @mock.patch("agym.cli.ProfileStore")
+    def test_rotate_status_and_reset(self, Store: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(Path(tmp) / "config", Path(tmp) / "data")
+            store.create("user_alpha")
+            Store.return_value = store
+
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = cli.main(["rotate", "--status"])
+            self.assertEqual(code, 0)
+            self.assertIn("Total accounts: 1", out.getvalue())
+            self.assertIn("Accounts: user_alpha", out.getvalue())
+
+            out_reset = io.StringIO()
+            with mock.patch("sys.stdout", out_reset):
+                code_reset = cli.main(["rotate", "--reset"])
+            self.assertEqual(code_reset, 0)
+            self.assertIn("Rotation state reset", out_reset.getvalue())
+
+    @mock.patch("agym.cli.ProfileStore")
+    @mock.patch("agym.cli.resolve_agy")
+    @mock.patch("agym.cli.run_agy")
+    def test_rotate_launch(self, run: mock.Mock, resolve: mock.Mock, Store: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(Path(tmp) / "config", Path(tmp) / "data")
+            p1 = store.create("p1")
+            p2 = store.create("p2")
+            Store.return_value = store
+            resolve.return_value = Path("/real/agy")
+            run.return_value = 0
+
+            # 1st rotate -> launches p1
+            out1 = io.StringIO()
+            with mock.patch("sys.stdout", out1):
+                code1 = cli.main(["rotate", "-p", "step 1"])
+            self.assertEqual(code1, 0)
+            self.assertIn("Active Account: p1", out1.getvalue())
+            run.assert_called_with(Path("/real/agy"), p1, ["-p", "step 1"], replace_process=True)
+
+            # 2nd rotate -> launches p2
+            out2 = io.StringIO()
+            with mock.patch("sys.stdout", out2):
+                code2 = cli.main(["rotate", "-p", "step 2"])
+            self.assertEqual(code2, 0)
+            self.assertIn("Active Account: p2", out2.getvalue())
+            run.assert_called_with(Path("/real/agy"), p2, ["-p", "step 2"], replace_process=True)
+

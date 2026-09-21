@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import platform
 import shutil
@@ -11,6 +12,9 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .profiles import Profile, ProfileError
+
+logger = logging.getLogger("agym.launcher")
+
 
 
 class AgyNotFound(RuntimeError):
@@ -47,6 +51,8 @@ def build_profile_env(
     base_env: Mapping[str, str] | None = None,
     system: str | None = None,
 ) -> dict[str, str]:
+    from .profiles import _default_config_root, _default_data_root
+
     env = dict(os.environ if base_env is None else base_env)
     home = str(Path(profile_home).resolve())
     host_home = env.get("HOME") or env.get("USERPROFILE")
@@ -63,6 +69,24 @@ def build_profile_env(
             env["HOMEDRIVE"] = drive
             env["HOMEPATH"] = tail or "\\"
 
+        # On Windows, redirect application and Chromium user data directories
+        # to the isolated profile so Chrome/agy does not fall back to host %LOCALAPPDATA%
+        local_appdata = (home_path / "AppData" / "Local").resolve()
+        roaming_appdata = (home_path / "AppData" / "Roaming").resolve()
+        env["LOCALAPPDATA"] = str(local_appdata)
+        env["APPDATA"] = str(roaming_appdata)
+        try:
+            local_appdata.mkdir(parents=True, exist_ok=True)
+            roaming_appdata.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
+    # Ensure profile sessions retain access to the manager store
+    if "AGYM_CONFIG_HOME" not in env:
+        env["AGYM_CONFIG_HOME"] = str(_default_config_root())
+    if "AGYM_DATA_HOME" not in env:
+        env["AGYM_DATA_HOME"] = str(_default_data_root())
+
     # Preserve the host's conventional Git global config without copying it into
     # the isolated home. Existing explicit GIT_CONFIG_GLOBAL always wins.
     if "GIT_CONFIG_GLOBAL" not in env and host_home:
@@ -71,6 +95,82 @@ def build_profile_env(
             env["GIT_CONFIG_GLOBAL"] = str(candidate)
 
     return env
+
+
+LOCK_FILE_PATTERNS: tuple[str, ...] = (
+    "SingletonLock",
+    "SingletonCookie",
+    "SingletonSocket",
+    "lockfile",
+    "parent.lock",
+)
+
+
+def cleanup_profile_locks(profile_home: Path | str) -> list[Path]:
+    """Removes stale Chromium and profile lock files (SingletonLock, lockfile, etc.)
+    that can cause browser launches to fail or bind to an existing zombie process on Windows.
+    """
+    removed: list[Path] = []
+    base = Path(profile_home).resolve()
+    if not base.exists():
+        return removed
+
+    search_dirs = [
+        base,
+        base / ".gemini",
+        base / ".gemini" / "antigravity-cli",
+        base / "AppData" / "Local",
+        base / "AppData" / "Roaming",
+        base / "AppData" / "Local" / "Google" / "Chrome" / "User Data",
+    ]
+
+    for directory in search_dirs:
+        if not directory.is_dir():
+            continue
+        for lock_name in LOCK_FILE_PATTERNS:
+            lock_path = directory / lock_name
+            if lock_path.exists() or lock_path.is_symlink():
+                try:
+                    lock_path.unlink(missing_ok=True)
+                    removed.append(lock_path)
+                    logger.debug("Cleaned up stale lockfile: %s", lock_path)
+                except OSError as exc:
+                    logger.warning("Could not remove stale lockfile %s: %s", lock_path, exc)
+    return removed
+
+
+def build_browser_args(
+    user_data_dir: Path | str,
+    extra_args: Sequence[str] = (),
+    profile_directory: str | None = None,
+) -> list[str]:
+    """Builds robust cross-platform Chromium/browser launch arguments.
+
+    Ensures --user-data-dir is an absolute, resolved path with directory created,
+    avoiding Windows backslash escaping and quote mishandling.
+    """
+    profile_path = Path(user_data_dir).resolve()
+    profile_path.mkdir(parents=True, exist_ok=True)
+    args = [f"--user-data-dir={str(profile_path)}"]
+    if profile_directory:
+        args.append(f"--profile-directory={profile_directory}")
+    args.extend(extra_args)
+    return args
+
+
+def terminate_process(proc: subprocess.Popen, timeout: float = 5.0) -> None:
+    """Cleanly terminates a subprocess, escalating from SIGTERM to SIGKILL if hanging."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        try:
+            proc.kill()
+            proc.wait(timeout=timeout)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
 
 
 def _normalized_args(args: Sequence[str]) -> list[str]:
@@ -221,6 +321,7 @@ def run_agy(
         raise ProfileError(
             f"invalid settings for profile '{profile.name}': {', '.join(profile.settings.validation_errors)}"
         )
+    cleanup_profile_locks(profile.home)
     env = build_profile_env(profile.home)
     cmd_args = build_agy_args(profile, passthrough_args=args, env=env)
     return exec_agy_interactive(
@@ -317,6 +418,7 @@ def run_auto_prompt(
         print("agym: --auto-prompt requires a non-empty prompt", file=sys.stderr)
         return 1
 
+    cleanup_profile_locks(profile.home)
     env = build_profile_env(profile.home)
     stage1_prompt = build_stage1_prompt(user_prompt)
     stage1_args = build_agy_args(
