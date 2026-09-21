@@ -49,7 +49,8 @@ Usage:
 Commands:
   setup <profile>                     Create a new profile and complete Google sign-in
   config <profile>                    Configure profile model and permission settings
-  edit <profile>                      Edit profile settings (e.g. subscription renewal date)
+  edit <profile>                      Edit profile settings (e.g. subscription renewal date, rename)
+  rename <profile> <new-name>         Rename a profile and its isolated directory (alias: mv)
   list                                List all configured profiles and subscription status
   rotate                              Rotate through accounts/profiles sequentially and launch
   usage [profiles...]                 Show live model quota usage and subscription health
@@ -88,7 +89,11 @@ Command Options:
       -y, --dsp, --skip-perms         Enable auto-skipping tool permissions
       --no-dsp, --no-skip-perms       Disable auto-skipping tool permissions
 
-  agym edit <profile> [-s, --subscription-date DATE | --clear-subscription-date]
+  agym rename <old-profile> <new-name>
+      Rename a profile, its isolated data directory, and associated caches (alias: mv)
+
+  agym edit <profile> [--name NEW_NAME] [-s, --subscription-date DATE | --clear-subscription-date]
+      --name, --rename NEW_NAME       Rename the profile to a new name
       -s, --subscription-date DATE    Set renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)
       --clear-subscription-date       Remove stored subscription date
   agym usage [--json] [-f, --refresh] [--timeout SECONDS] [profiles...]
@@ -109,6 +114,8 @@ Examples:
   agym setup work -s 14/03/2027       Create profile with known subscription renewal date
   agym personal                       Open an interactive Antigravity session
   agym personal -p "write tests"      Run non-interactive Antigravity command
+  agym rename personal main           Rename profile 'personal' to 'main'
+  agym rename jmcar AI1               Rename profile 'jmcar' to 'AI1'
   agym list                           Check status and renewal timeline of all profiles
   agym usage                          View live quota table and subscription health
   agym tokens                         View token consumption and fleet statistics
@@ -138,6 +145,8 @@ def _setup(argv: list[str], store: ProfileStore) -> int:
     )
     ns = parser.parse_args(argv)
     validate_profile_name(ns.profile)
+    if store.exists(ns.profile):
+        raise ProfileExists(f"profile already exists: {ns.profile}")
 
     subscription_date = None
     if ns.subscription_date is not None:
@@ -240,6 +249,23 @@ def _config(argv: list[str], store: ProfileStore) -> int:
     return 0
 
 
+def _rename(argv: list[str], store: ProfileStore) -> int:
+    parser = argparse.ArgumentParser(
+        prog="agym rename",
+        description="Rename a profile, its isolated data directory, and associated caches.",
+        add_help=True,
+    )
+    parser.add_argument("old_profile", help="Current name of the profile")
+    parser.add_argument("new_name", help="New name for the profile")
+    ns = parser.parse_args(argv)
+    validate_profile_name(ns.old_profile)
+    validate_profile_name(ns.new_name)
+    profile = store.rename(ns.old_profile, ns.new_name)
+    print(f"Renamed profile '{ns.old_profile}' to '{profile.name}'.")
+    print(f"Profile home: {profile.home}")
+    return 0
+
+
 def _edit(argv: list[str], store: ProfileStore) -> int:
     parser = argparse.ArgumentParser(
         prog="agym edit",
@@ -247,6 +273,13 @@ def _edit(argv: list[str], store: ProfileStore) -> int:
         add_help=True,
     )
     parser.add_argument("profile", help="Name of the profile to edit")
+    parser.add_argument(
+        "--name",
+        "--rename",
+        dest="new_name",
+        metavar="NEW_NAME",
+        help="Rename the profile to a new name",
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--subscription-date",
@@ -263,6 +296,13 @@ def _edit(argv: list[str], store: ProfileStore) -> int:
     validate_profile_name(ns.profile)
     profile = store.get(ns.profile)
 
+    renamed = False
+    if ns.new_name is not None:
+        validate_profile_name(ns.new_name)
+        profile = store.rename(profile.name, ns.new_name)
+        print(f"Renamed profile '{ns.profile}' to '{profile.name}'.")
+        renamed = True
+
     if ns.clear_subscription_date:
         store.set_subscription_date(profile.name, None)
         print(f"Cleared subscription date for profile '{profile.name}'.")
@@ -276,6 +316,9 @@ def _edit(argv: list[str], store: ProfileStore) -> int:
             return 2
         store.set_subscription_date(profile.name, canonical)
         print(f"Updated subscription date for profile '{profile.name}' to {format_user_date(canonical)}.")
+        return 0
+
+    if renamed:
         return 0
 
     # Interactive prompt if no flag supplied
@@ -618,6 +661,8 @@ def main(argv: list[str] | None = None) -> int:
             return _config(rest, store)
         if command == "edit":
             return _edit(rest, store)
+        if command in {"rename", "mv"}:
+            return _rename(rest, store)
         if command == "list":
             return _list(rest, store)
         if command == "rotate":

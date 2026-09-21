@@ -188,3 +188,34 @@ class CacheManagerTests(unittest.TestCase):
         # Clear all
         self.cm.clear()
         self.assertIsNone(self.cm.get_usage("p2", now=now))
+
+    def test_rename_cache(self) -> None:
+        now = datetime(2026, 9, 21, 2, 0, 0, tzinfo=timezone.utc)
+        self.cm.set_usage("p1", {"status": "success"}, '{"status": "ok"}', now=now)
+        self.cm.record_token_snapshot(
+            "p1",
+            {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "thinking_tokens": 20,
+                "cache_read_tokens": 30,
+                "total_tokens": 200,
+            },
+            now=now,
+        )
+
+        self.cm.rename("p1", "p2")
+
+        # p1 cache files should be gone
+        self.assertIsNone(self.cm.get_usage("p1", now=now))
+        self.assertIsNone(self.cm.get_tokens("p1", now=now))
+
+        # p2 cache files should exist with updated profile name
+        u2 = self.cm.get_usage("p2", now=now)
+        self.assertIsNotNone(u2)
+        self.assertEqual(u2[0]["status"], "success")
+
+        t2 = self.cm.get_tokens("p2", now=now)
+        self.assertIsNotNone(t2)
+        self.assertEqual(t2[0]["profile"], "p2")
+        self.assertEqual(t2[0]["cumulative"]["total_tokens"], 200)

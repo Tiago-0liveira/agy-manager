@@ -342,6 +342,57 @@ class CacheManager:
         filepath = self.tokens_dir / f"{profile_name}.json"
         _write_json_atomic(filepath, data)
 
+    def rename(self, old_profile: str, new_profile: str) -> None:
+        """Renames cache and token ledger files from old_profile to new_profile."""
+        self._ensure_dirs()
+        # 1. Quota usage cache
+        old_u = self.usage_dir / f"{old_profile}.json"
+        new_u = self.usage_dir / f"{new_profile}.json"
+        if old_u.exists():
+            try:
+                with old_u.open("r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+                if isinstance(data, dict):
+                    data["profile"] = new_profile
+                    _write_json_atomic(new_u, data)
+                else:
+                    os.replace(old_u, new_u)
+                if old_u.exists() and old_u.resolve() != new_u.resolve():
+                    try:
+                        old_u.unlink()
+                    except OSError:
+                        pass
+            except (OSError, json.JSONDecodeError):
+                if old_u.exists() and old_u.resolve() != new_u.resolve():
+                    try:
+                        os.replace(old_u, new_u)
+                    except OSError:
+                        pass
+
+        # 2. Tokens cache & cumulative ledger
+        old_t = self.tokens_dir / f"{old_profile}.json"
+        new_t = self.tokens_dir / f"{new_profile}.json"
+        if old_t.exists():
+            try:
+                with old_t.open("r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+                if isinstance(data, dict):
+                    data["profile"] = new_profile
+                    _write_json_atomic(new_t, data)
+                else:
+                    os.replace(old_t, new_t)
+                if old_t.exists() and old_t.resolve() != new_t.resolve():
+                    try:
+                        old_t.unlink()
+                    except OSError:
+                        pass
+            except (OSError, json.JSONDecodeError):
+                if old_t.exists() and old_t.resolve() != new_t.resolve():
+                    try:
+                        os.replace(old_t, new_t)
+                    except OSError:
+                        pass
+
     def clear(self, profile_name: str | None = None) -> None:
         """Clears cache files for a specific profile or all profiles."""
         if profile_name:

@@ -54,6 +54,8 @@ agym personal -- -p "explain this repository"
 agym personal -p "explain this repository"
 
 agym list
+agym rename personal main
+agym rename jmcar AI1
 agym rotate                           # Sequentially rotates to next profile and launches agy
 agym rotate -p "run review"           # Rotates to next profile and executes prompt
 agym rotate --simulate 3              # Dry-run simulate next 3 rotations without launching
@@ -162,6 +164,20 @@ Each profile can be configured with default launch settings using `agym config <
     2. Environment variables (`DANGEROUSLY_SKIP_PERMISSIONS=1` or `DSP=1`)
     3. Profile configuration file (`settings.json`)
     4. Safe default (`false`) [Lowest priority]
+
+### Renaming Profiles
+
+Easily rename a profile and seamlessly move its isolated storage and caches without recreating or re-authenticating:
+
+```bash
+agym rename <old-profile> <new-name>
+# Or using the alias:
+agym mv <old-profile> <new-name>
+# Or via edit:
+agym edit <old-profile> --name <new-name>
+```
+
+This updates the configuration, moves the profile's home directory (`~/.local/share/agym/profiles/<profile>/`), preserves all profile settings and subscription tracking, and migrates local usage and token caches to the new name.
 
 ### Shell Integration & Aliases
 

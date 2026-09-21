@@ -402,3 +402,73 @@ class CliTests(unittest.TestCase):
             self.assertIn("Active Account: p2", out2.getvalue())
             run.assert_called_with(Path("/real/agy"), p2, ["-p", "step 2"], replace_process=True)
 
+    @mock.patch("agym.cli.ProfileStore")
+    def test_rename_command(self, Store: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(Path(tmp) / "config", Path(tmp) / "data")
+            store.create("personal")
+            Store.return_value = store
+
+            # Successful rename
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = cli.main(["rename", "personal", "AI1"])
+            self.assertEqual(code, 0)
+            self.assertIn("Renamed profile 'personal' to 'AI1'.", out.getvalue())
+            self.assertEqual(store.get("AI1").name, "AI1")
+
+            # Successful rename with alias 'mv'
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = cli.main(["mv", "AI1", "AI2"])
+            self.assertEqual(code, 0)
+            self.assertIn("Renamed profile 'AI1' to 'AI2'.", out.getvalue())
+            self.assertEqual(store.get("AI2").name, "AI2")
+
+            # Nonexistent profile
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                code = cli.main(["rename", "nonexistent", "target"])
+            self.assertEqual(code, 2)
+            self.assertIn("profile not found: nonexistent", err.getvalue())
+
+            # Already existing target
+            store.create("target")
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                code = cli.main(["rename", "AI2", "target"])
+            self.assertEqual(code, 2)
+            self.assertIn("profile already exists: target", err.getvalue())
+
+            # Renaming to same name
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                code = cli.main(["rename", "AI2", "AI2"])
+            self.assertEqual(code, 2)
+            self.assertIn("cannot rename profile to the same name: 'AI2'", err.getvalue())
+
+    @mock.patch("agym.cli.ProfileStore")
+    def test_edit_command_rename(self, Store: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(Path(tmp) / "config", Path(tmp) / "data")
+            store.create("personal")
+            Store.return_value = store
+
+            # Rename using --name
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = cli.main(["edit", "personal", "--name", "AI1"])
+            self.assertEqual(code, 0)
+            self.assertIn("Renamed profile 'personal' to 'AI1'.", out.getvalue())
+            self.assertEqual(store.get("AI1").name, "AI1")
+
+            # Rename using --rename and update subscription date
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = cli.main(["edit", "AI1", "--rename", "AI2", "-s", "14/03/2027"])
+            self.assertEqual(code, 0)
+            self.assertIn("Renamed profile 'AI1' to 'AI2'.", out.getvalue())
+            self.assertIn("Updated subscription date for profile 'AI2' to 14/03/2027.", out.getvalue())
+            p = store.get("AI2")
+            self.assertEqual(p.name, "AI2")
+            self.assertEqual(p.subscription_date, "2027-03-14")

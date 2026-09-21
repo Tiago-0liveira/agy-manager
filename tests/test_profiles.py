@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from agym.profiles import (
     InvalidProfileName,
+    ProfileError,
     ProfileExists,
     ProfileNotFound,
     ProfileSettings,
@@ -96,7 +99,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(p.settings.validation_errors, ())
 
     def test_reserved_profile_names(self) -> None:
-        for reserved in ["setup", "list", "remove", "doctor", "usage", "edit", "help"]:
+        for reserved in ["setup", "list", "remove", "doctor", "usage", "edit", "help", "rotate", "rename", "mv"]:
             with self.subTest(reserved=reserved), self.assertRaises(InvalidProfileName):
                 validate_profile_name(reserved)
 
@@ -213,3 +216,116 @@ class ProfileTests(unittest.TestCase):
         self.assertTrue(reloaded.settings.dangerously_skip_permissions)
         self.assertEqual(reloaded.home, p.home)
         self.assertEqual(reloaded.created_at, p.created_at)
+
+    def test_rename_profile_success(self) -> None:
+        p = self.store.create("personal")
+        self.store.update_settings(
+            "personal",
+            ProfileSettings(model="gemini-2.5-flash", dangerously_skip_permissions=True),
+        )
+        self.store.set_subscription_date("personal", "2027-03-14")
+
+        # Create dummy file inside profile home
+        dummy_dir = p.home / ".gemini"
+        dummy_dir.mkdir(parents=True, exist_ok=True)
+        dummy_file = dummy_dir / "oauth_sample.txt"
+        dummy_file.write_text("sample-data", encoding="utf-8")
+
+        renamed = self.store.rename("personal", "AI1")
+
+        self.assertEqual(renamed.name, "AI1")
+        self.assertEqual(renamed.home, (self.store.profiles_root / "AI1" / "home").resolve())
+        self.assertEqual(renamed.settings.model, "gemini-2.5-flash")
+        self.assertTrue(renamed.settings.dangerously_skip_permissions)
+        self.assertEqual(renamed.subscription_date, "2027-03-14")
+
+        # Verify old profile is gone
+        with self.assertRaises(ProfileNotFound):
+            self.store.get("personal")
+        self.assertNotIn("personal", [prof.name for prof in self.store.list()])
+        self.assertIn("AI1", [prof.name for prof in self.store.list()])
+
+        # Verify files on disk
+        self.assertFalse((self.store.profiles_root / "personal").exists())
+        self.assertTrue((self.store.profiles_root / "AI1").exists())
+        self.assertTrue((renamed.home / ".gemini" / "oauth_sample.txt").exists())
+        self.assertEqual(
+            (renamed.home / ".gemini" / "oauth_sample.txt").read_text(encoding="utf-8"),
+            "sample-data",
+        )
+
+        # Verify new store instance reads config correctly
+        reloaded_store = ProfileStore(self.store.config_root, self.store.data_root)
+        reloaded_p = reloaded_store.get("AI1")
+        self.assertEqual(reloaded_p.name, "AI1")
+        self.assertEqual(reloaded_p.home, renamed.home)
+        self.assertEqual(reloaded_p.settings.model, "gemini-2.5-flash")
+        self.assertTrue(reloaded_p.settings.dangerously_skip_permissions)
+        self.assertEqual(reloaded_p.subscription_date, "2027-03-14")
+
+    def test_rename_nonexistent_profile(self) -> None:
+        with self.assertRaises(ProfileNotFound):
+            self.store.rename("does-not-exist", "new-name")
+
+    def test_rename_to_existing_profile(self) -> None:
+        self.store.create("prof1")
+        self.store.create("prof2")
+        with self.assertRaises(ProfileExists):
+            self.store.rename("prof1", "prof2")
+
+    def test_rename_to_same_name(self) -> None:
+        self.store.create("prof1")
+        with self.assertRaises(ProfileError):
+            self.store.rename("prof1", "prof1")
+
+    def test_rename_invalid_names(self) -> None:
+        self.store.create("prof1")
+        for bad in ["bad name", "setup", "list", "rename", "mv", "..", ""]:
+            with self.subTest(bad=bad), self.assertRaises(InvalidProfileName):
+                self.store.rename("prof1", bad)
+
+    def test_rename_target_dir_already_exists_on_disk(self) -> None:
+        self.store.create("prof1")
+        target_dir = self.store.profiles_root / "prof2"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        with self.assertRaises(ProfileExists):
+            self.store.rename("prof1", "prof2")
+
+    def test_rename_when_source_dir_missing(self) -> None:
+        p = self.store.create("prof1")
+        shutil.rmtree(self.store.profile_dir("prof1"))
+        renamed = self.store.rename("prof1", "prof2")
+        self.assertEqual(renamed.name, "prof2")
+        self.assertTrue(renamed.home.is_dir())
+
+    def test_rename_rollback_on_save_failure(self) -> None:
+        p = self.store.create("prof1")
+        test_file = p.home / "test.txt"
+        test_file.write_text("important", encoding="utf-8")
+
+        with mock.patch.object(self.store, "_save", side_effect=OSError("disk error")):
+            with self.assertRaises(OSError):
+                self.store.rename("prof1", "prof2")
+
+        # Verify old dir is preserved and restored
+        self.assertTrue(self.store.profile_dir("prof1").exists())
+        self.assertTrue((p.home / "test.txt").exists())
+        self.assertEqual((p.home / "test.txt").read_text(encoding="utf-8"), "important")
+        self.assertFalse(self.store.profile_dir("prof2").exists())
+        # Profile in store is still prof1
+        self.assertEqual(self.store.get("prof1").name, "prof1")
+
+    def test_rename_migrates_rotation_state(self) -> None:
+        self.store.create("acc1")
+        rot_file = self.store.data_root / "rotation_state.json"
+        rot_file.write_text(
+            json.dumps({"index": 1, "last_account": "acc1", "history": ["acc0", "acc1"]}),
+            encoding="utf-8",
+        )
+
+        self.store.rename("acc1", "acc_renamed")
+
+        data = json.loads(rot_file.read_text(encoding="utf-8"))
+        self.assertEqual(data["last_account"], "acc_renamed")
+        self.assertEqual(data["history"], ["acc0", "acc_renamed"])
+
