@@ -9,6 +9,7 @@ from unittest import mock
 
 from agym.launcher import (
     Spinner,
+    agy_version,
     build_agy_args,
     build_browser_args,
     build_profile_env,
@@ -456,3 +457,50 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(call_agy, str(agy_path))
         self.assertEqual(call_argv, [str(agy_path), "--prompt-interactive", build_stage2_prompt("Ready")])
         self.assertEqual(call_env["HOME"], str(self.home_a.resolve()))
+
+    @mock.patch("agym.launcher.subprocess.run")
+    def test_run_agy_capture_parameters(self, mock_run: mock.Mock) -> None:
+        mock_run.return_value = mock.Mock(returncode=0, stdout="out", stderr="")
+        env = {"KEY": "VAL"}
+        res = run_agy_capture(Path("/bin/agy"), env, ["--prompt", "test"])
+        self.assertEqual(res.returncode, 0)
+        mock_run.assert_called_once_with(
+            [str(Path("/bin/agy")), "--prompt", "test"],
+            env=env,
+            cwd=None,
+            stdout=mock.ANY,
+            stderr=mock.ANY,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+
+    def test_run_agy_capture_utf8_non_ascii_and_invalid_bytes(self) -> None:
+        import sys
+        script = (
+            "import sys; "
+            "sys.stdout.buffer.write('Plan: \u2014 \U0001f680 '.encode('utf-8') + b'\\x81\\n'); "
+            "sys.stdout.buffer.flush()"
+        )
+        res = run_agy_capture(Path(sys.executable), {}, ["-c", script])
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("Plan: — 🚀", res.stdout)
+        self.assertIn("\ufffd", res.stdout)
+
+    @mock.patch("agym.launcher.subprocess.run")
+    def test_agy_version_parameters(self, mock_run: mock.Mock) -> None:
+        mock_run.return_value = mock.Mock(returncode=0, stdout="agy 2.5.0\n")
+        v = agy_version(Path("/bin/agy"))
+        self.assertEqual(v, "agy 2.5.0")
+        mock_run.assert_called_once_with(
+            [str(Path("/bin/agy")), "--version"],
+            stdin=mock.ANY,
+            stdout=mock.ANY,
+            stderr=mock.ANY,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
