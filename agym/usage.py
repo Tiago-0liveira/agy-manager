@@ -743,7 +743,7 @@ async def fetch_account_usage_async(
                 subscription_date=profile.subscription_date,
             )
 
-        env = build_profile_env(profile.home)
+        env = build_profile_env(profile.home, profile_name=profile.name)
         argv = [
             str(agy_path),
             "--dangerously-skip-permissions",

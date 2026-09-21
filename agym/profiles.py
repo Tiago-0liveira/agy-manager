@@ -25,6 +25,7 @@ RESERVED_NAMES = {
     "edit",
     "help",
     "config",
+    "statusline",
     "rotate",
     "rename",
     "mv",
@@ -41,6 +42,8 @@ class InvalidProfileName(ProfileError):
 
 class ProfileExists(ProfileError):
     pass
+
+
 class ProfileNotFound(ProfileError):
     pass
 
@@ -125,10 +128,36 @@ def validate_profile_name(name: str) -> str:
     return name
 
 
+def _detect_profile_escape_roots() -> tuple[Path | None, Path | None]:
+    home_str = os.environ.get("HOME") or os.environ.get("USERPROFILE") or ""
+    if not home_str:
+        return None, None
+    try:
+        norm = home_str.replace("\\", "/")
+        parts = [part for part in norm.split("/") if part]
+        if len(parts) >= 3 and parts[-1] == "home" and parts[-3] == "profiles":
+            if platform.system() == "Windows" or os.name == "nt":
+                data_root_str = norm.rsplit("/profiles/", 1)[0]
+                data_root = Path(data_root_str)
+                return data_root, data_root
+            p = Path(home_str).resolve()
+            data_root = p.parent.parent.parent
+            if data_root.parent.name == "share" and data_root.parent.parent.name == ".local":
+                host_home = data_root.parent.parent.parent
+                return host_home / ".config" / "agym", data_root
+            return data_root / "config", data_root
+    except Exception:
+        pass
+    return None, None
+
+
 def _default_config_root() -> Path:
     override = os.environ.get("AGYM_CONFIG_HOME")
     if override:
         return Path(override).expanduser().resolve()
+    cfg_root, _ = _detect_profile_escape_roots()
+    if cfg_root is not None:
+        return cfg_root
     system = platform.system()
     if system == "Windows":
         base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
@@ -143,6 +172,9 @@ def _default_data_root() -> Path:
     override = os.environ.get("AGYM_DATA_HOME")
     if override:
         return Path(override).expanduser().resolve()
+    _, data_root = _detect_profile_escape_roots()
+    if data_root is not None:
+        return data_root
     system = platform.system()
     if system == "Windows":
         base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")

@@ -33,6 +33,7 @@ from .subscription import (
     format_user_date,
     prompt_subscription_date,
 )
+from .statusline import get_statusline_status, render_statusline, sync_all_profiles
 from .tokens import run_tokens
 from .usage import run_usage
 from .wincred import get_profile_email
@@ -55,6 +56,7 @@ Commands:
   rotate                              Rotate through accounts/profiles sequentially and launch
   usage [profiles...]                 Show live model quota usage and subscription health
   tokens [profiles...]                Show token consumption graphs and fleet summary (aliases: token, token-usage)
+  statusline                          Manage and preview statusline across all registered profiles
   remove <profile>                    Delete a profile and its isolated data
   doctor [profile]                    Check environment, executable, permissions, and state
 
@@ -106,6 +108,13 @@ Command Options:
       -b, --breakdown                 Show detailed token composition breakdown table
       -f, --refresh                   Bypass cache and re-scan conversation databases
 
+  agym statusline [--preview [profile] | --sync | --status | --enable | --disable]
+      --preview, -p [PROFILE]         Preview rendered statusline for active or specified profile
+      --sync, -s                      Install and configure statusline across all profiles
+      --status                        Show statusline configuration status across all profiles
+      --enable                        Enable statusline for all profiles
+      --disable                       Disable statusline for all profiles
+
   agym remove <profile> [-y, --yes]
       -y, --yes                       Delete without interactive confirmation prompt
 
@@ -121,6 +130,9 @@ Examples:
   agym tokens                         View token consumption and fleet statistics
   agym tokens --breakdown             Show detailed token composition breakdown table
   agym tokens --json                  Export token consumption metrics as JSON
+  agym statusline                     Show statusline status and preview across profiles
+  agym statusline --sync              Ensure statusline is configured for all accounts
+  agym statusline --preview personal  Preview statusline rendering for profile 'personal'
   agym edit personal -s 01/06/2027    Update subscription date for an existing profile
   agym remove old-account --yes       Remove profile without prompting
 """
@@ -180,6 +192,11 @@ def _setup(argv: list[str], store: ProfileStore) -> int:
     email = get_profile_email(profile.home)
     auth_info = f" ({email})" if email else ""
     print(f"Profile '{profile.name}' is ready (persistent Antigravity state detected{auth_info}).")
+    try:
+        synced = sync_all_profiles(store)
+        print(f"Statusline configured for all registered accounts ({len(synced)} profiles).")
+    except Exception as exc:
+        _print_err(f"warning: failed to configure statusline: {exc}")
     return 0
 
 
@@ -599,6 +616,89 @@ def _rotate(argv: list[str], store: ProfileStore) -> int:
         return run_agy(agy, profile, passthrough, replace_process=True)
 
 
+def _statusline(argv: list[str], store: ProfileStore) -> int:
+    parser = argparse.ArgumentParser(
+        prog="agym statusline",
+        description="Manage and preview the Antigravity statusline across all registered profiles.",
+        add_help=True,
+    )
+    parser.add_argument(
+        "--preview",
+        "-p",
+        nargs="?",
+        const="",
+        metavar="PROFILE",
+        default=None,
+        help="Preview rendered statusline for the active or specified profile",
+    )
+    parser.add_argument(
+        "--sync",
+        "-s",
+        action="store_true",
+        help="Ensure statusline runner is installed and configured across all registered profiles",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Check statusline configuration status across all profiles",
+    )
+    parser.add_argument(
+        "--enable",
+        action="store_true",
+        help="Enable statusline across all profiles",
+    )
+    parser.add_argument(
+        "--disable",
+        action="store_true",
+        help="Disable statusline across all profiles",
+    )
+    ns = parser.parse_args(argv)
+
+    if ns.enable:
+        synced = sync_all_profiles(store, enabled=True)
+        print(f"Enabled statusline across {len(synced)} profile(s): {', '.join(synced) if synced else 'none'}")
+        return 0
+
+    if ns.disable:
+        synced = sync_all_profiles(store, enabled=False)
+        print(f"Disabled statusline across {len(synced)} profile(s): {', '.join(synced) if synced else 'none'}")
+        return 0
+
+    if ns.sync:
+        synced = sync_all_profiles(store, enabled=True)
+        print(f"Synchronized statusline across {len(synced)} profile(s): {', '.join(synced) if synced else 'none'}")
+        return 0
+
+    if ns.preview is not None:
+        target_profile = ns.preview.strip()
+        if not target_profile:
+            profiles = store.list()
+            target_profile = profiles[0].name if profiles else "default"
+        output = render_statusline(profile_name=target_profile, data_root=store.data_root)
+        print(f"Statusline preview for '{target_profile}':")
+        print(output)
+        return 0
+
+    status = get_statusline_status(store)
+    installed_str = "installed" if status["installed"] else "not installed"
+    print(f"Runner script: {status['script_path']} ({installed_str})")
+    profiles = status["profiles"]
+    if not profiles:
+        print("No profiles configured. Run 'agym setup <profile>' first.")
+        return 0
+
+    print(f"\nConfigured profiles ({len(profiles)}):")
+    for name, p_stat in profiles.items():
+        cfg = "configured" if p_stat["configured"] else "missing"
+        state = "enabled" if p_stat["enabled"] else "disabled"
+        print(f"  • {name:<16} [{cfg}, {state}]")
+
+    first_name = next(iter(profiles))
+    print(f"\nLive preview ('{first_name}'):")
+    print(render_statusline(profile_name=first_name, data_root=store.data_root))
+    return 0
+
+
 def _parse_auto_prompt(args: list[str]) -> tuple[str | None, list[str]]:
     if not args:
         return None, args
@@ -671,6 +771,8 @@ def main(argv: list[str] | None = None) -> int:
             return _usage(rest, store)
         if command in {"token", "tokens", "token-usage"}:
             return _tokens(rest, store)
+        if command == "statusline":
+            return _statusline(rest, store)
         if command == "remove":
             return _remove(rest, store)
         if command == "doctor":

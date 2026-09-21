@@ -11,11 +11,10 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .profiles import Profile, ProfileError
+from .profiles import Profile, ProfileError, _default_config_root, _default_data_root
 from .wincred import has_profile_token, profile_credential_context
 
 logger = logging.getLogger("agym.launcher")
-
 
 
 class AgyNotFound(RuntimeError):
@@ -51,6 +50,7 @@ def build_profile_env(
     profile_home: Path,
     base_env: Mapping[str, str] | None = None,
     system: str | None = None,
+    profile_name: str | None = None,
 ) -> dict[str, str]:
     from .profiles import _default_config_root, _default_data_root
 
@@ -58,8 +58,17 @@ def build_profile_env(
     home = str(Path(profile_home).resolve())
     host_home = env.get("HOME") or env.get("USERPROFILE")
 
+    # Preserve agym config and data roots before overriding HOME, so that child
+    # processes (like statusline scripts) can locate agym profiles and cache.
+    if "AGYM_CONFIG_HOME" not in env:
+        env["AGYM_CONFIG_HOME"] = str(_default_config_root())
+    if "AGYM_DATA_HOME" not in env:
+        env["AGYM_DATA_HOME"] = str(_default_data_root())
+
     env["GEMINI_FORCE_FILE_STORAGE"] = "true"
     env["HOME"] = home
+    if profile_name:
+        env["AGYM_PROFILE"] = profile_name
 
     target_system = system or platform.system()
     if target_system == "Windows":
@@ -94,6 +103,12 @@ def build_profile_env(
         candidate = Path(host_home) / ".gitconfig"
         if candidate.is_file():
             env["GIT_CONFIG_GLOBAL"] = str(candidate)
+
+    # Preserve the host's GitHub CLI config for credentials and gh CLI operations.
+    if "GH_CONFIG_DIR" not in env and host_home:
+        candidate_gh = Path(host_home) / ".config" / "gh"
+        if candidate_gh.is_dir():
+            env["GH_CONFIG_DIR"] = str(candidate_gh)
 
     return env
 
@@ -324,7 +339,7 @@ def run_agy(
             f"invalid settings for profile '{profile.name}': {', '.join(profile.settings.validation_errors)}"
         )
     cleanup_profile_locks(profile.home)
-    env = build_profile_env(profile.home)
+    env = build_profile_env(profile.home, profile_name=profile.name)
     cmd_args = build_agy_args(profile, passthrough_args=args, env=env)
     with profile_credential_context(profile.home, is_setup=is_setup):
         return exec_agy_interactive(
@@ -422,7 +437,7 @@ def run_auto_prompt(
         return 1
 
     cleanup_profile_locks(profile.home)
-    env = build_profile_env(profile.home)
+    env = build_profile_env(profile.home, profile_name=profile.name)
     stage1_prompt = build_stage1_prompt(user_prompt)
     stage1_args = build_agy_args(
         profile,
