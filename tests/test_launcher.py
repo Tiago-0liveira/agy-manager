@@ -143,6 +143,96 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(args_dup, ["--dangerously-skip-permissions", "-p", "hello"])
         self.assertEqual(args_dup.count("--dangerously-skip-permissions"), 1)
 
+    def test_build_agy_args_permission_aliases(self) -> None:
+        profile = Profile("personal", self.home_a, "now")
+        for alias in ["-y", "--yes", "--dsp", "--skip-perms", "--dangerously-skip-permission"]:
+            args = build_agy_args(profile, passthrough_args=[alias, "-p", "hello"])
+            self.assertEqual(
+                args,
+                ["--dangerously-skip-permissions", "-p", "hello"],
+                f"Failed for alias {alias}",
+            )
+            self.assertNotIn(alias, args)
+
+    def test_build_agy_args_negative_permission_aliases(self) -> None:
+        profile = Profile(
+            "personal",
+            self.home_a,
+            "now",
+            settings=ProfileSettings(dangerously_skip_permissions=True),
+        )
+        for neg_alias in [
+            "--no-dangerously-skip-permissions",
+            "--no-dangerously-skip-permission",
+            "--no-dsp",
+            "--no-skip-perms",
+        ]:
+            args = build_agy_args(profile, passthrough_args=[neg_alias, "-p", "hello"])
+            self.assertEqual(args, ["-p", "hello"], f"Failed for {neg_alias}")
+            self.assertNotIn("--dangerously-skip-permissions", args)
+            self.assertNotIn(neg_alias, args)
+
+    def test_build_agy_args_environment_variables(self) -> None:
+        profile = Profile("personal", self.home_a, "now")
+        for var in ["DANGEROUSLY_SKIP_PERMISSIONS", "DSP"]:
+            for truthy in ["1", "true", "True", "yes", "YES", "y", "on"]:
+                args = build_agy_args(profile, passthrough_args=["-p", "hello"], env={var: truthy})
+                self.assertEqual(
+                    args,
+                    ["--dangerously-skip-permissions", "-p", "hello"],
+                    f"Failed for {var}={truthy}",
+                )
+
+        profile_enabled = Profile(
+            "personal",
+            self.home_a,
+            "now",
+            settings=ProfileSettings(dangerously_skip_permissions=True),
+        )
+        for var in ["DANGEROUSLY_SKIP_PERMISSIONS", "DSP"]:
+            for falsy in ["0", "false", "no", "off"]:
+                args = build_agy_args(profile_enabled, passthrough_args=["-p", "hello"], env={var: falsy})
+                self.assertEqual(args, ["-p", "hello"], f"Failed for {var}={falsy}")
+
+    def test_build_agy_args_precedence_hierarchy(self) -> None:
+        profile_enabled = Profile(
+            "personal",
+            self.home_a,
+            "now",
+            settings=ProfileSettings(dangerously_skip_permissions=True),
+        )
+        profile_disabled = Profile(
+            "personal",
+            self.home_a,
+            "now",
+            settings=ProfileSettings(dangerously_skip_permissions=False),
+        )
+
+        # 1. CLI flag beats env var and profile setting
+        # CLI negative beats env truthy and profile True
+        args = build_agy_args(profile_enabled, passthrough_args=["--no-dsp", "-p", "hi"], env={"DSP": "1"})
+        self.assertEqual(args, ["-p", "hi"])
+
+        # CLI positive beats env falsy and profile False
+        args = build_agy_args(profile_disabled, passthrough_args=["-y", "-p", "hi"], env={"DSP": "0"})
+        self.assertEqual(args, ["--dangerously-skip-permissions", "-p", "hi"])
+
+        # 2. Env var beats profile setting
+        # Env truthy beats profile False
+        args = build_agy_args(profile_disabled, passthrough_args=["-p", "hi"], env={"DSP": "1"})
+        self.assertEqual(args, ["--dangerously-skip-permissions", "-p", "hi"])
+
+        # Env falsy beats profile True
+        args = build_agy_args(profile_enabled, passthrough_args=["-p", "hi"], env={"DSP": "0"})
+        self.assertEqual(args, ["-p", "hi"])
+
+        # 3. Profile setting beats default
+        args = build_agy_args(profile_enabled, passthrough_args=["-p", "hi"], env={})
+        self.assertEqual(args, ["--dangerously-skip-permissions", "-p", "hi"])
+
+        args = build_agy_args(profile_disabled, passthrough_args=["-p", "hi"], env={})
+        self.assertEqual(args, ["-p", "hi"])
+
     def test_build_agy_args_with_agy_path(self) -> None:
         profile = Profile(
             "personal",

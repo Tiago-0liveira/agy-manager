@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .diagnostics import doctor_lines
 from .launcher import (
+    ALL_PERMISSIONS_ALIASES,
     AgyNotFound,
     persistent_profile_data_exists,
     resolve_agy,
@@ -29,7 +30,7 @@ USAGE = """usage:
   agym setup <profile>
   agym <profile> [--] [agy args...]
   agym <profile> --auto-prompt "<prompt>"
-  agym config <profile> [--model <model>|default] [--[no-]dangerously-skip-permissions]
+  agym config <profile> [--model <model>|default] [-y|--dsp|--skip-perms|--[no-]dangerously-skip-permissions]
   agym list
   agym usage [--json] [--timeout SECONDS] [profiles...]
   agym remove <profile> [--yes]
@@ -76,15 +77,25 @@ def _config(argv: list[str], store: ProfileStore) -> int:
     parser.add_argument("--model", dest="model", default=None)
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
+        "-y",
+        "--yes",
+        "--dsp",
+        "--skip-perms",
         "--dangerously-skip-permissions",
+        "--dangerously-skip-permission",
         dest="dangerously_skip_permissions",
         action="store_true",
         default=None,
+        help="Enable auto-skipping tool permissions for this profile",
     )
     group.add_argument(
         "--no-dangerously-skip-permissions",
+        "--no-dangerously-skip-permission",
+        "--no-dsp",
+        "--no-skip-perms",
         dest="dangerously_skip_permissions",
         action="store_false",
+        help="Disable auto-skipping tool permissions for this profile",
     )
     ns = parser.parse_args(argv)
     profile = store.get(ns.profile)
@@ -233,9 +244,14 @@ def _launch(profile_name: str, argv: list[str], store: ProfileStore) -> int:
 
     auto_prompt, rest = _parse_auto_prompt(argv)
     if auto_prompt is not None:
-        if rest:
-            raise ProfileError(f"unexpected arguments with --auto-prompt: {' '.join(rest)}")
-        return run_auto_prompt(agy, profile, auto_prompt, replace_process=True)
+        perm_args = [arg for arg in rest if arg in ALL_PERMISSIONS_ALIASES]
+        other_args = [arg for arg in rest if arg not in ALL_PERMISSIONS_ALIASES]
+        if other_args:
+            raise ProfileError(f"unexpected arguments with --auto-prompt: {' '.join(other_args)}")
+        kwargs: dict[str, Any] = {"replace_process": True}
+        if perm_args:
+            kwargs["extra_args"] = perm_args
+        return run_auto_prompt(agy, profile, auto_prompt, **kwargs)
 
     return run_agy(agy, profile, argv, replace_process=True)
 

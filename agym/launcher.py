@@ -80,32 +80,100 @@ def _normalized_args(args: Sequence[str]) -> list[str]:
     return forwarded
 
 
+DANGEROUS_SKIP_PERMISSIONS_ALIASES: frozenset[str] = frozenset({
+    "-y",
+    "--yes",
+    "--dsp",
+    "--skip-perms",
+    "--dangerously-skip-permission",
+    "--dangerously-skip-permissions",
+})
+
+NO_DANGEROUS_SKIP_PERMISSIONS_ALIASES: frozenset[str] = frozenset({
+    "--no-dangerously-skip-permissions",
+    "--no-dangerously-skip-permission",
+    "--no-dsp",
+    "--no-skip-perms",
+})
+
+ALL_PERMISSIONS_ALIASES: frozenset[str] = (
+    DANGEROUS_SKIP_PERMISSIONS_ALIASES | NO_DANGEROUS_SKIP_PERMISSIONS_ALIASES
+)
+
+
+def resolve_env_dangerously_skip_permissions(env: Mapping[str, str] | None = None) -> bool | None:
+    lookup = os.environ if env is None else env
+    raw = lookup.get("DANGEROUSLY_SKIP_PERMISSIONS")
+    if raw is None:
+        raw = lookup.get("DSP")
+    if raw is None:
+        return None
+    cleaned = raw.strip().lower()
+    if cleaned in {"1", "true", "yes", "y", "on"}:
+        return True
+    if cleaned in {"0", "false", "no", "n", "off", ""}:
+        return False
+    return None
+
+
+def resolve_cli_dangerously_skip_permissions(args: Sequence[str]) -> bool | None:
+    result = None
+    for arg in args:
+        if arg in DANGEROUS_SKIP_PERMISSIONS_ALIASES:
+            result = True
+        elif arg in NO_DANGEROUS_SKIP_PERMISSIONS_ALIASES:
+            result = False
+    return result
+
+
+def resolve_dangerously_skip_permissions(
+    args: Sequence[str] = (),
+    env: Mapping[str, str] | None = None,
+    profile_default: bool = False,
+) -> bool:
+    cli_val = resolve_cli_dangerously_skip_permissions(args)
+    if cli_val is not None:
+        return cli_val
+    env_val = resolve_env_dangerously_skip_permissions(env)
+    if env_val is not None:
+        return env_val
+    return profile_default
+
+
 def build_agy_args(
     profile: Profile,
     operation_args: Sequence[str] = (),
     passthrough_args: Sequence[str] = (),
     *,
     agy_path: Path | str | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> list[str]:
     norm_op = _normalized_args(operation_args)
     norm_pass = _normalized_args(passthrough_args)
     combined = list(norm_op) + list(norm_pass)
 
     has_model = ("--model" in combined) or any(arg.startswith("--model=") for arg in combined)
-    has_danger = "--dangerously-skip-permissions" in combined
+    effective_danger = resolve_dangerously_skip_permissions(
+        combined,
+        env=env,
+        profile_default=profile.settings.dangerously_skip_permissions,
+    )
+
+    filtered_op = [arg for arg in norm_op if arg not in ALL_PERMISSIONS_ALIASES]
+    filtered_pass = [arg for arg in norm_pass if arg not in ALL_PERMISSIONS_ALIASES]
 
     prefix_args: list[str] = []
     if not has_model and profile.settings.model and profile.settings.model.strip():
         prefix_args.extend(["--model", profile.settings.model.strip()])
-    if not has_danger and profile.settings.dangerously_skip_permissions:
+    if effective_danger:
         prefix_args.append("--dangerously-skip-permissions")
 
     final_args: list[str] = []
     if agy_path is not None:
         final_args.append(str(agy_path))
     final_args.extend(prefix_args)
-    final_args.extend(norm_op)
-    final_args.extend(norm_pass)
+    final_args.extend(filtered_op)
+    final_args.extend(filtered_pass)
     return final_args
 
 
@@ -154,7 +222,7 @@ def run_agy(
             f"invalid settings for profile '{profile.name}': {', '.join(profile.settings.validation_errors)}"
         )
     env = build_profile_env(profile.home)
-    cmd_args = build_agy_args(profile, passthrough_args=args)
+    cmd_args = build_agy_args(profile, passthrough_args=args, env=env)
     return exec_agy_interactive(
         agy_path=agy_path,
         env=env,
@@ -239,6 +307,7 @@ def run_auto_prompt(
     user_prompt: str,
     *,
     replace_process: bool = True,
+    extra_args: Sequence[str] = (),
 ) -> int:
     if profile.settings.validation_errors:
         raise ProfileError(
@@ -250,7 +319,12 @@ def run_auto_prompt(
 
     env = build_profile_env(profile.home)
     stage1_prompt = build_stage1_prompt(user_prompt)
-    stage1_args = build_agy_args(profile, operation_args=["--prompt", stage1_prompt])
+    stage1_args = build_agy_args(
+        profile,
+        operation_args=["--prompt", stage1_prompt],
+        passthrough_args=extra_args,
+        env=env,
+    )
 
     spinner = Spinner(f"Generating implementation plan with profile '{profile.name}'")
     spinner.start()
@@ -284,7 +358,12 @@ def run_auto_prompt(
         sys.stderr.flush()
 
     stage2_prompt = build_stage2_prompt(raw_response)
-    stage2_args = build_agy_args(profile, operation_args=["--prompt-interactive", stage2_prompt])
+    stage2_args = build_agy_args(
+        profile,
+        operation_args=["--prompt-interactive", stage2_prompt],
+        passthrough_args=extra_args,
+        env=env,
+    )
     return exec_agy_interactive(
         agy_path=agy_path,
         env=env,

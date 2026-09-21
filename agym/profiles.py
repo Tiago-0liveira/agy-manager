@@ -63,8 +63,21 @@ class ProfileSettings:
         else:
             model = raw_model
 
-        raw_danger = data.get("dangerously_skip_permissions", False)
-        if not isinstance(raw_danger, bool):
+        danger_keys = (
+            "dangerously_skip_permissions",
+            "dangerously_skip_permission",
+            "dsp",
+            "skip_perms",
+        )
+        raw_danger = None
+        for key in danger_keys:
+            if key in data:
+                raw_danger = data[key]
+                break
+
+        if raw_danger is None:
+            dangerously_skip_permissions = False
+        elif not isinstance(raw_danger, bool):
             errors.append("dangerously_skip_permissions must be a boolean")
             dangerously_skip_permissions = False
         else:

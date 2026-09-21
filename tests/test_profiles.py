@@ -131,6 +131,16 @@ class ProfileTests(unittest.TestCase):
         s_bad_perm = ProfileSettings.from_dict({"model": "valid", "dangerously_skip_permissions": "yes"})
         self.assertIn("dangerously_skip_permissions must be a boolean", s_bad_perm.validation_errors)
 
+    def test_settings_aliases(self) -> None:
+        for key in ["dsp", "skip_perms", "dangerously_skip_permission"]:
+            s = ProfileSettings.from_dict({"model": "test", key: True})
+            self.assertTrue(s.dangerously_skip_permissions, f"Failed for {key}")
+            self.assertEqual(s.validation_errors, ())
+
+            s_invalid = ProfileSettings.from_dict({"model": "test", key: "invalid"})
+            self.assertFalse(s_invalid.dangerously_skip_permissions)
+            self.assertIn("dangerously_skip_permissions must be a boolean", s_invalid.validation_errors)
+
     def test_update_settings_persistence(self) -> None:
         p = self.store.create("personal")
         self.assertIsNone(p.settings.model)

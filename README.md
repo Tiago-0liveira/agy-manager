@@ -106,9 +106,35 @@ agym usage --timeout 45
 Each profile can be configured with default launch settings using `agym config <profile>`:
 
 - **Model selection**: Set a profile default model using `--model <model>` (e.g. `agym config personal --model gemini-2.5-flash`), or clear it back to the Antigravity default with `agym config personal --model default`.
-- **Permissions**: Automatic permission skipping (`--dangerously-skip-permissions`) is **OFF by default** for all profiles. It can be explicitly enabled for a specific profile with `agym config <profile> --dangerously-skip-permissions`, and disabled with `agym config <profile> --no-dangerously-skip-permissions`.
+- **Permissions**: Automatic permission skipping (`--dangerously-skip-permissions`) is **OFF by default** for all profiles. It can be configured per profile or supplied on invocation:
+  - **Short aliases**: Use `-y`, `--yes`, `--dsp`, or `--skip-perms` as concise shortcuts for `--dangerously-skip-permissions` (both singular `--dangerously-skip-permission` and plural `--dangerously-skip-permissions` are supported).
+  - **Disable aliases**: Use `--no-dsp`, `--no-skip-perms`, `--no-dangerously-skip-permissions`, or `--no-dangerously-skip-permission` to disable.
+  - **Profile configuration**: `agym config <profile> -y` (or `--dsp`, `--skip-perms`, `--dangerously-skip-permissions`) and `agym config <profile> --no-dsp` (or `--no-dangerously-skip-permissions`).
+  - **Invocation shortcut**: `agym personal -y` or `agym personal --dsp` or `agym personal --skip-perms`. `agym` normalizes these aliases and passes the native `--dangerously-skip-permissions` flag to `agy`.
+  - **Environment variables**: Set `DSP=1` or `DANGEROUSLY_SKIP_PERMISSIONS=1` for session/headless bypass. Set to `0` or `false` to disable.
+  - **Precedence Hierarchy**:
+    1. CLI flags (`-y`, `--dsp`, `--skip-perms`, `--no-dsp`, etc.) [Highest priority]
+    2. Environment variables (`DANGEROUSLY_SKIP_PERMISSIONS=1` or `DSP=1`)
+    3. Profile configuration file (`settings.json`)
+    4. Safe default (`false`) [Lowest priority]
 
-Invocation arguments take precedence over profile defaults (e.g. an explicit `--model` flag on the command line overrides the profile's configured model).
+### Shell Integration & Aliases
+
+For immediate convenience when invoking Antigravity or `agym` from your shell (`~/.bashrc`, `~/.zshrc`):
+
+```bash
+# Direct Antigravity shortcut with bypass
+alias agyy="agy --dangerously-skip-permissions"
+
+# Profile manager shortcuts with bypass
+alias agymp="agym personal -y"
+alias agymw="agym work -y"
+
+# Wrapper function allowing additional arguments
+agyy-run() {
+  agy --dangerously-skip-permissions "$@"
+}
+```
 
 ### Auto-Prompt
 

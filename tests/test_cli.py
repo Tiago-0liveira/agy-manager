@@ -68,6 +68,32 @@ class CliTests(unittest.TestCase):
             self.assertIn("dangerously-skip-permissions: false", out.getvalue())
             self.assertFalse(store.get("personal").settings.dangerously_skip_permissions)
 
+            # 4a. Verify aliases: -y, --yes, --dsp, --skip-perms, --dangerously-skip-permission
+            for alias in ["-y", "--yes", "--dsp", "--skip-perms", "--dangerously-skip-permission"]:
+                out = io.StringIO()
+                with mock.patch("sys.stdout", out), mock.patch("sys.stderr", io.StringIO()):
+                    code = cli.main(["config", "personal", alias])
+                self.assertEqual(code, 0, f"Failed for alias {alias}")
+                self.assertTrue(store.get("personal").settings.dangerously_skip_permissions, f"Failed for {alias}")
+
+                # Disable using a negative alias
+                with mock.patch("sys.stdout", io.StringIO()):
+                    code = cli.main(["config", "personal", "--no-dsp"])
+                self.assertEqual(code, 0)
+                self.assertFalse(store.get("personal").settings.dangerously_skip_permissions)
+
+            # 4b. Verify negative aliases: --no-skip-perms, --no-dangerously-skip-permission
+            for neg_alias in ["--no-skip-perms", "--no-dangerously-skip-permission"]:
+                # Enable first
+                with mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                    cli.main(["config", "personal", "-y"])
+                self.assertTrue(store.get("personal").settings.dangerously_skip_permissions)
+                out = io.StringIO()
+                with mock.patch("sys.stdout", out):
+                    code = cli.main(["config", "personal", neg_alias])
+                self.assertEqual(code, 0)
+                self.assertFalse(store.get("personal").settings.dangerously_skip_permissions)
+
             # 5. Reset model with 'default'
             out = io.StringIO()
             with mock.patch("sys.stdout", out):
@@ -135,6 +161,16 @@ class CliTests(unittest.TestCase):
                 Path("/usr/bin/agy"), profile, ["--", "--auto-prompt", "something"], replace_process=True
             )
             mock_run_auto_prompt.assert_not_called()
+
+            # 5. Permission aliases with --auto-prompt forward to run_auto_prompt
+            mock_run_auto_prompt.reset_mock()
+            mock_run_agy.reset_mock()
+            code = cli.main(["personal", "--auto-prompt", "make a plan", "-y"])
+            self.assertEqual(code, 0)
+            mock_run_auto_prompt.assert_called_once_with(
+                Path("/usr/bin/agy"), profile, "make a plan", replace_process=True, extra_args=["-y"]
+            )
+            mock_run_agy.assert_not_called()
 
     @mock.patch("agym.cli.ProfileStore")
     def test_auto_prompt_errors(self, Store: mock.Mock) -> None:

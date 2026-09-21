@@ -103,25 +103,43 @@ Only rely on the fake-home backend after all of these are true:
 Verify safe permissions default:
 
 ```bash
-agym config personal --no-dangerously-skip-permissions
+agym config personal --no-dsp
 agym personal
 ```
 
 Confirm the `--dangerously-skip-permissions` flag is not implicitly enabled. Tool permission prompts should behave normally.
 
-Then enable dangerous permissions explicitly:
+Then enable dangerous permissions explicitly with short alias:
 
 ```bash
-agym config personal --dangerously-skip-permissions
+agym config personal -y
 agym personal
 ```
 
-Confirm the profile-specific behavior applies (tool permissions are auto-approved).
+Confirm the profile-specific behavior applies (tool permissions are auto-approved). Also verify `--dsp`:
+
+```bash
+agym config personal --dsp
+agym personal
+```
+
+Verify on-the-fly invocation alias overrides default without saving:
+
+```bash
+agym config personal --no-dsp
+agym personal -y
+```
+
+Verify environment variable bypass:
+
+```bash
+DSP=1 agym personal
+```
 
 Reset it afterward to maintain safe defaults:
 
 ```bash
-agym config personal --no-dangerously-skip-permissions
+agym config personal --no-dsp
 ```
 
 ## 9. Manual test for model configuration
