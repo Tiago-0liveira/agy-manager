@@ -669,3 +669,57 @@ class CliUsageTests(unittest.TestCase):
 
             code = cli.main(["usage", "nonexistent"])
             self.assertEqual(code, 2)
+
+
+class SubscriptionUsageIntegrationTests(unittest.TestCase):
+    def test_table_rendering_with_subscription_column(self) -> None:
+        from agym.usage import render_usage_table_lines
+
+        p1 = Profile(name="p-safe", home=Path("/h1"), created_at="", subscription_date="2027-03-21")
+        p2 = Profile(name="p-exp", home=Path("/h2"), created_at="", subscription_date="2026-09-09")
+        p3 = Profile(name="p-unk", home=Path("/h3"), created_at="", subscription_date=None)
+
+        u1 = parse_usage_response(SAMPLE_REAL_RESPONSE, "p-safe", subscription_date="2027-03-21")
+        u2 = AccountUsage(
+            account="p-exp",
+            status="error",
+            error="session expired",
+            subscription_date="2026-09-09",
+        )
+        u3 = parse_usage_response(SAMPLE_REAL_RESPONSE, "p-unk", subscription_date=None)
+
+        completed = {"p-safe": u1, "p-exp": u2, "p-unk": u3}
+        lines = render_usage_table_lines([p1, p2, p3], completed, use_color=False)
+        rendered = "\n".join(lines)
+
+        # Header has Subscription
+        self.assertIn("Subscription", rendered)
+        # Safe profile has bar and renews date
+        self.assertIn("[██████████]", rendered)
+        self.assertIn("Renews: 21/03/2027", rendered)
+        # Expired profile shows failed quota error AND subscription status
+        self.assertIn("Failed: session expired", rendered)
+        self.assertIn("Expired: 09/09/2026", rendered)
+        # Unknown profile shows neutral unknown
+        self.assertIn("(date not set)", rendered)
+
+    def test_json_payload_includes_subscription(self) -> None:
+        u_sub = parse_usage_response(SAMPLE_REAL_RESPONSE, "p-sub", subscription_date="2027-03-21")
+        u_none = parse_usage_response(SAMPLE_REAL_RESPONSE, "p-none", subscription_date=None)
+
+        payload = usage_payload_to_dict([u_sub, u_none])
+        acc1 = payload["accounts"][0]
+        self.assertEqual(acc1["account"], "p-sub")
+        self.assertIn("subscription", acc1)
+        self.assertEqual(acc1["subscription"]["date"], "2027-03-21")
+        self.assertIsNotNone(acc1["subscription"]["days_remaining"])
+        self.assertIn("remaining", acc1["subscription"]["human_remaining"])
+        self.assertIsNotNone(acc1["subscription"]["rank"])
+
+        acc2 = payload["accounts"][1]
+        self.assertEqual(acc2["account"], "p-none")
+        self.assertIn("subscription", acc2)
+        self.assertIsNone(acc2["subscription"]["date"])
+        self.assertIsNone(acc2["subscription"]["days_remaining"])
+        self.assertEqual(acc2["subscription"]["status"], "unknown")
+

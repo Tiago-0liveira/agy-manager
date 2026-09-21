@@ -24,17 +24,78 @@ from .profiles import (
     ProfileStore,
     validate_profile_name,
 )
+from .subscription import (
+    SubscriptionError,
+    calculate_subscription_health,
+    format_iso_date,
+    format_user_date,
+    prompt_subscription_date,
+)
 from .usage import run_usage
 
-USAGE = """usage:
-  agym setup <profile>
+USAGE = """agym — Explicit isolated-profile manager for Google Antigravity CLI
+
+Usage:
+  agym <command> [arguments...]
   agym <profile> [--] [agy args...]
   agym <profile> --auto-prompt "<prompt>"
   agym config <profile> [--model <model>|default] [-y|--dsp|--skip-perms|--[no-]dangerously-skip-permissions]
-  agym list
+
+Commands:
+  setup <profile>                     Create a new profile and complete Google sign-in
+  config <profile>                    Configure profile model and permission settings
+  edit <profile>                      Edit profile settings (e.g. subscription renewal date)
+  list                                List all configured profiles and subscription status
+  usage [profiles...]                 Show live model quota usage and subscription health
+  remove <profile>                    Delete a profile and its isolated data
+  doctor [profile]                    Check environment, executable, permissions, and state
+
+Launching Antigravity:
+  agym <profile>                      Launch Antigravity under the specified profile.
+                                      Replaces the current process on POSIX, preserving native
+                                      terminal, TTY, working directory, and signal handling.
+
+  agym <profile> [agy args...]        Pass arguments directly to Antigravity.
+                                      Example: agym personal -p "explain this codebase"
+
+  agym <profile> -- [agy args...]     Use '--' separator before arguments if needed to
+                                      prevent agym from parsing flags intended for agy.
+
+  agym <profile> --auto-prompt "<prompt>"
+                                      Two-stage prompt workflow: run non-interactively to generate
+                                      a plan, then continue interactively in the same profile session.
+
+General Options:
+  -h, --help                          Show this help message and exit
+
+Command Options:
+  agym setup <profile> [-s, --subscription-date DATE]
+      -s, --subscription-date DATE    Renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)
+
+  agym config <profile> [--model MODEL] [-y|--dsp|--skip-perms|--[no-]dangerously-skip-permissions]
+      --model MODEL                   Set default model (or 'default' to clear)
+      -y, --dsp, --skip-perms         Enable auto-skipping tool permissions
+      --no-dsp, --no-skip-perms       Disable auto-skipping tool permissions
+
+  agym edit <profile> [-s, --subscription-date DATE | --clear-subscription-date]
+      -s, --subscription-date DATE    Set renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)
+      --clear-subscription-date       Remove stored subscription date
   agym usage [--json] [--timeout SECONDS] [profiles...]
-  agym remove <profile> [--yes]
-  agym doctor [profile]
+      --json                          Output quota and subscription data in JSON format
+      --timeout SECONDS               Per-profile query timeout in seconds (default: 30)
+
+  agym remove <profile> [-y, --yes]
+      -y, --yes                       Delete without interactive confirmation prompt
+
+Examples:
+  agym setup personal                 Create profile and authenticate with Google
+  agym setup work -s 14/03/2027       Create profile with known subscription renewal date
+  agym personal                       Open an interactive Antigravity session
+  agym personal -p "write tests"      Run non-interactive Antigravity command
+  agym list                           Check status and renewal timeline of all profiles
+  agym usage                          View live quota table and subscription health
+  agym edit personal -s 01/06/2027    Update subscription date for an existing profile
+  agym remove old-account --yes       Remove profile without prompting
 """
 
 
@@ -43,14 +104,34 @@ def _print_err(message: str) -> None:
 
 
 def _setup(argv: list[str], store: ProfileStore) -> int:
-    parser = argparse.ArgumentParser(prog="agym setup", add_help=True)
-    parser.add_argument("profile")
+    parser = argparse.ArgumentParser(
+        prog="agym setup",
+        description="Create a new isolated Antigravity profile and complete Google sign-in.",
+        add_help=True,
+    )
+    parser.add_argument("profile", help="Name for the new profile")
+    parser.add_argument(
+        "--subscription-date",
+        "-s",
+        metavar="DATE",
+        help="Subscription renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)",
+    )
     ns = parser.parse_args(argv)
     validate_profile_name(ns.profile)
 
+    subscription_date = None
+    if ns.subscription_date is not None:
+        try:
+            subscription_date = format_iso_date(ns.subscription_date)
+        except SubscriptionError as exc:
+            _print_err(str(exc))
+            return 2
+    elif sys.stdin.isatty():
+        subscription_date = prompt_subscription_date(existing=None)
+
     # Resolve the host binary before constructing or using the isolated HOME.
     agy = resolve_agy()
-    profile = store.create(ns.profile)
+    profile = store.create(ns.profile, subscription_date=subscription_date)
 
     print(f"Launching Antigravity to set up profile '{profile.name}'.")
     print(f"Profile home: {profile.home}")
@@ -137,25 +218,100 @@ def _config(argv: list[str], store: ProfileStore) -> int:
     return 0
 
 
+def _edit(argv: list[str], store: ProfileStore) -> int:
+    parser = argparse.ArgumentParser(
+        prog="agym edit",
+        description="Update profile configuration or subscription renewal date.",
+        add_help=True,
+    )
+    parser.add_argument("profile", help="Name of the profile to edit")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--subscription-date",
+        "-s",
+        metavar="DATE",
+        help="Subscription renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)",
+    )
+    group.add_argument(
+        "--clear-subscription-date",
+        action="store_true",
+        help="Clear the stored subscription date",
+    )
+    ns = parser.parse_args(argv)
+    validate_profile_name(ns.profile)
+    profile = store.get(ns.profile)
+
+    if ns.clear_subscription_date:
+        store.set_subscription_date(profile.name, None)
+        print(f"Cleared subscription date for profile '{profile.name}'.")
+        return 0
+
+    if ns.subscription_date is not None:
+        try:
+            canonical = format_iso_date(ns.subscription_date)
+        except SubscriptionError as exc:
+            _print_err(str(exc))
+            return 2
+        store.set_subscription_date(profile.name, canonical)
+        print(f"Updated subscription date for profile '{profile.name}' to {format_user_date(canonical)}.")
+        return 0
+
+    # Interactive prompt if no flag supplied
+    if not sys.stdin.isatty():
+        _print_err("interactive editing requires a terminal; use --subscription-date or --clear-subscription-date")
+        return 2
+
+    new_date = prompt_subscription_date(existing=profile.subscription_date)
+    if new_date == profile.subscription_date:
+        print("Subscription date unchanged.")
+        return 0
+
+    store.set_subscription_date(profile.name, new_date)
+    if new_date is None:
+        print(f"Subscription date for profile '{profile.name}' cleared.")
+    else:
+        print(f"Updated subscription date for profile '{profile.name}' to {format_user_date(new_date)}.")
+    return 0
+
+
 def _list(argv: list[str], store: ProfileStore) -> int:
-    if argv:
-        raise ProfileError("'agym list' takes no arguments")
+    parser = argparse.ArgumentParser(
+        prog="agym list",
+        description="List all configured profiles, state, and subscription renewal status.",
+        add_help=True,
+    )
+    parser.parse_args(argv)
     profiles = store.list()
     if not profiles:
         print("No profiles.")
         return 0
     for profile in profiles:
         state = "ready" if persistent_profile_data_exists(profile) else "no-state"
+        if profile.subscription_date:
+            health = calculate_subscription_health(profile.subscription_date)
+            date_disp = format_user_date(profile.subscription_date)
+            if health.status == "expired":
+                sub_info = f"; {health.human_remaining} ({date_disp})"
+            elif health.status == "critical" and health.days_remaining == 0:
+                sub_info = f"; expires today ({date_disp})"
+            else:
+                sub_info = f"; renews {date_disp} ({health.human_remaining})"
+        else:
+            sub_info = "; subscription: unknown"
         model_str = profile.settings.model or "default"
         perm_str = "skip" if profile.settings.dangerously_skip_permissions else "normal"
-        print(f"{profile.name}\t{state}\tmodel={model_str}\tpermissions={perm_str}")
+        print(f"{profile.name}\t{state}{sub_info}\tmodel={model_str}\tpermissions={perm_str}")
     return 0
 
 
 def _remove(argv: list[str], store: ProfileStore) -> int:
-    parser = argparse.ArgumentParser(prog="agym remove", add_help=True)
-    parser.add_argument("profile")
-    parser.add_argument("--yes", action="store_true")
+    parser = argparse.ArgumentParser(
+        prog="agym remove",
+        description="Delete a profile and its isolated data directory.",
+        add_help=True,
+    )
+    parser.add_argument("profile", help="Name of the profile to remove")
+    parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
     ns = parser.parse_args(argv)
     profile = store.get(ns.profile)
     target = store.profile_dir(profile.name).resolve()
@@ -171,8 +327,12 @@ def _remove(argv: list[str], store: ProfileStore) -> int:
 
 
 def _doctor(argv: list[str], store: ProfileStore) -> int:
-    parser = argparse.ArgumentParser(prog="agym doctor", add_help=True)
-    parser.add_argument("profile", nargs="?")
+    parser = argparse.ArgumentParser(
+        prog="agym doctor",
+        description="Inspect Antigravity executable, paths, permissions, and profile health.",
+        add_help=True,
+    )
+    parser.add_argument("profile", nargs="?", help="Optional specific profile to diagnose")
     ns = parser.parse_args(argv)
     for line in doctor_lines(store, ns.profile):
         print(line)
@@ -180,10 +340,20 @@ def _doctor(argv: list[str], store: ProfileStore) -> int:
 
 
 def _usage(argv: list[str], store: ProfileStore) -> int:
-    parser = argparse.ArgumentParser(prog="agym usage", add_help=True)
-    parser.add_argument("--json", action="store_true", dest="json_mode", help="output in JSON format")
-    parser.add_argument("--timeout", type=float, default=30.0, help="per-profile timeout in seconds (default: 30)")
-    parser.add_argument("profiles", nargs="*", help="optional specific profiles to query")
+    parser = argparse.ArgumentParser(
+        prog="agym usage",
+        description="Show quota limits, remaining capacity, reset times, and subscription health.",
+        add_help=True,
+    )
+    parser.add_argument("--json", action="store_true", dest="json_mode", help="Output in JSON format")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="Per-profile timeout in seconds (default: 30)",
+    )
+    parser.add_argument("profiles", nargs="*", help="Optional specific profiles to query")
     ns = parser.parse_args(argv)
 
     if ns.profiles:
@@ -269,6 +439,8 @@ def main(argv: list[str] | None = None) -> int:
             return _setup(rest, store)
         if command == "config":
             return _config(rest, store)
+        if command == "edit":
+            return _edit(rest, store)
         if command == "list":
             return _list(rest, store)
         if command == "usage":
@@ -278,7 +450,7 @@ def main(argv: list[str] | None = None) -> int:
         if command == "doctor":
             return _doctor(rest, store)
         return _launch(command, rest, store)
-    except (InvalidProfileName, ProfileExists, ProfileNotFound, ProfileError, AgyNotFound) as exc:
+    except (InvalidProfileName, ProfileExists, ProfileNotFound, ProfileError, AgyNotFound, SubscriptionError) as exc:
         _print_err(str(exc))
         return 2
     except KeyboardInterrupt:
