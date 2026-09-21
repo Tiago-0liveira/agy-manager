@@ -98,23 +98,23 @@ Command Options:
       --name, --rename NEW_NAME       Rename the profile to a new name
       -s, --subscription-date DATE    Set renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)
       --clear-subscription-date       Remove stored subscription date
-  agym usage [--json] [-f, --refresh] [-v, --view {table,grid,matrix,telemetry}] [--sort {default,quota,reset,name}] [--timeout SECONDS] [profiles...]
+  agym usage [--json] [-c, --claude] [-f, --refresh] [-v, --view {table,grid,matrix,telemetry}] [--sort {usage,quota,reset,name,sub,default}] [--timeout SECONDS] [profiles...]
       --json                          Output quota and subscription data in JSON format
+      -c, --claude                    Include Claude & GPT quotas in the usage view
       -f, --refresh                   Bypass cache and force live query
       -v, --view VIEW                 Visual graph layout: table (default), grid, matrix, or telemetry
-      -g, --grid                      Shortcut for --view grid (multi-column card dashboard)
+      -g, --grid                      Shortcut for --view grid (borderless account view)
       -m, --matrix                    Shortcut for --view matrix (ultra-dense heatmap for dozens of accounts)
       -t, --telemetry                 Shortcut for --view telemetry (executive tiered view & recommendation)
-      --sort CRITERION                Sort accounts by: default, quota, reset, or name
+      --sort CRITERION                Sort accounts by: usage (default), quota, reset, name, or sub
       --no-summary                    Hide top fleet capacity summary banner
       --timeout SECONDS               Per-profile query timeout in seconds (default: 30)
 
-  agym tokens [--json] [-b, --breakdown] [-f, --refresh] [-v, --view {table,grid,matrix,telemetry,classic}] [--sort {default,volume,cache,name}] [profiles...]
+  agym tokens [--json] [-b, --breakdown] [-f, --refresh] [-v, --view {table,matrix,telemetry,classic}] [--sort {default,volume,cache,name}] [profiles...]
       --json                          Output token metrics and summary in JSON format
       -b, --breakdown                 Show detailed token composition breakdown table
       -f, --refresh                   Bypass cache and re-scan conversation databases
-      -v, --view VIEW                 Visual layout: table (default), grid, matrix, telemetry, classic
-      -g, --grid                      Shortcut for --view grid (multi-column card dashboard)
+      -v, --view VIEW                 Visual layout: table (default), matrix, telemetry, classic
       -m, --matrix                    Shortcut for --view matrix (ultra-dense heatmap for dozens of accounts)
       -t, --telemetry                 Shortcut for --view telemetry (executive tiered view & analytics)
       --sort CRITERION                Sort accounts by: default, volume, cache, or name
@@ -485,6 +485,13 @@ def _usage(argv: list[str], store: ProfileStore) -> int:
         help="Sort order for profiles (default: usage; options: usage, quota, reset, name, sub, default)",
     )
     parser.add_argument(
+        "--claude",
+        "-c",
+        action="store_true",
+        dest="show_claude",
+        help="Include Claude & GPT quotas in the usage view",
+    )
+    parser.add_argument(
         "--summary",
         action="store_true",
         dest="include_summary",
@@ -529,6 +536,8 @@ def _usage(argv: list[str], store: ProfileStore) -> int:
     }
     if ns.refresh:
         kwargs["refresh"] = True
+    if ns.show_claude:
+        kwargs["show_claude"] = True
     if ns.view != "table":
         kwargs["view"] = ns.view
     if ns.sort != "usage":
@@ -568,17 +577,9 @@ def _tokens(argv: list[str], store: ProfileStore) -> int:
     parser.add_argument(
         "--view",
         "-v",
-        choices=["table", "grid", "matrix", "telemetry", "classic"],
+        choices=["table", "matrix", "telemetry", "classic"],
         default="table",
-        help="Visual layout style: table (default), grid, matrix, telemetry, classic",
-    )
-    parser.add_argument(
-        "--grid",
-        "-g",
-        action="store_const",
-        dest="view",
-        const="grid",
-        help="Shortcut for --view grid (multi-column card dashboard)",
+        help="Visual layout style: table (default), matrix, telemetry, classic",
     )
     parser.add_argument(
         "--matrix",

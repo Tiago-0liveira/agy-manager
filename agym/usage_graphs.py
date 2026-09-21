@@ -302,56 +302,162 @@ def render_usage_grid_lines(
     extract_bucket_fn: Any,
     format_short_reset_fn: Any,
     *,
+    show_claude: bool = False,
     use_color: bool = True,
     term_width: int | None = None,
 ) -> list[str]:
-    """Renders Option 2: Simple borderless layout (1 account per line, Gemini 5h & Wk, Sub)."""
+    """Renders modern borderless layout (Gemini 5h & Wk, optional Claude 5h & Wk, Sub)."""
+    if term_width is None:
+        term_width, _ = shutil.get_terminal_size((80, 24))
+
     acc_col_width = max(10, max([len(p.name) for p in profiles], default=10))
     cell_width = 26
-    quota_area = cell_width * 2 + 2
 
     dim = "\033[90m" if use_color else ""
     reset = "\033[0m" if use_color else ""
     bold = "\033[1m" if use_color else ""
     red = "\033[91m" if use_color else ""
 
-    header = (
-        f"{bold}{'Account':<{acc_col_width}}{reset}  "
-        f"{bold}{'Gemini 5h':<{cell_width}}{reset}  "
-        f"{bold}{'Gemini Wk':<{cell_width}}{reset}  "
-        f"{bold}Sub{reset}"
-    )
-    lines: list[str] = [header]
+    lines: list[str] = []
 
-    for p in profiles:
-        sub_health = calculate_subscription_health(p.subscription_date)
-        sub_plain = format_compact_sub(sub_health)
-        sub_badge = format_colored_compact_sub(sub_health, use_color=use_color)
-        sub_pad = " " * max(0, 3 - len(sub_plain))
+    if not show_claude:
+        # Default view: 1 line per account (Account, Gemini 5h, Gemini Wk, Sub)
+        quota_area = cell_width * 2 + 2
+        header = (
+            f"{bold}{'Account':<{acc_col_width}}{reset}  "
+            f"{bold}{'Gemini 5h':<{cell_width}}{reset}  "
+            f"{bold}{'Gemini Wk':<{cell_width}}{reset}  "
+            f"{bold}Sub{reset}"
+        )
+        lines.append(header)
 
-        if p.name not in completed_map:
-            row = f"{p.name:<{acc_col_width}}  {dim}{'Loading...':<{quota_area}}{reset}  {sub_badge}{sub_pad}"
+        for p in profiles:
+            sub_health = calculate_subscription_health(p.subscription_date)
+            sub_plain = format_compact_sub(sub_health)
+            sub_badge = format_colored_compact_sub(sub_health, use_color=use_color)
+            sub_pad = " " * max(0, 3 - len(sub_plain))
+
+            if p.name not in completed_map:
+                row = f"{p.name:<{acc_col_width}}  {dim}{'Loading...':<{quota_area}}{reset}  {sub_badge}{sub_pad}"
+                lines.append(row)
+                continue
+
+            usage = completed_map[p.name]
+            if usage.status != "success" and not (usage.status == "quiescent" and usage.groups):
+                err_msg = usage.error or "failed"
+                failed_text = f"✗ Failed: {err_msg}"
+                if len(failed_text) > quota_area:
+                    failed_text = failed_text[: quota_area - 3] + "..."
+                disp_err = f"{red}{failed_text:<{quota_area}}{reset}" if use_color else f"{failed_text:<{quota_area}}"
+                row = f"{p.name:<{acc_col_width}}  {disp_err}  {sub_badge}{sub_pad}"
+                lines.append(row)
+                continue
+
+            b_g5 = extract_bucket_fn(usage, "gemini", "5h")
+            b_gw = extract_bucket_fn(usage, "gemini", "week")
+            g5_cell = format_quota_cell_simple(b_g5, prefix="5h: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
+            gw_cell = format_quota_cell_simple(b_gw, prefix="Wk: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
+
+            row = f"{p.name:<{acc_col_width}}  {g5_cell}  {gw_cell}  {sub_badge}{sub_pad}"
             lines.append(row)
-            continue
 
-        usage = completed_map[p.name]
-        if usage.status != "success" and not (usage.status == "quiescent" and usage.groups):
-            err_msg = usage.error or "failed"
-            failed_text = f"✗ Failed: {err_msg}"
-            if len(failed_text) > quota_area:
-                failed_text = failed_text[: quota_area - 3] + "..."
-            disp_err = f"{red}{failed_text:<{quota_area}}{reset}" if use_color else f"{failed_text:<{quota_area}}"
-            row = f"{p.name:<{acc_col_width}}  {disp_err}  {sub_badge}{sub_pad}"
-            lines.append(row)
-            continue
+    else:
+        # Claude flag enabled
+        if term_width >= 120:
+            # Wide terminal: single line with all 4 quotas
+            quota_area = cell_width * 4 + 6
+            header = (
+                f"{bold}{'Account':<{acc_col_width}}{reset}  "
+                f"{bold}{'Gemini 5h':<{cell_width}}{reset}  "
+                f"{bold}{'Gemini Wk':<{cell_width}}{reset}  "
+                f"{bold}{'Claude 5h':<{cell_width}}{reset}  "
+                f"{bold}{'Claude Wk':<{cell_width}}{reset}  "
+                f"{bold}Sub{reset}"
+            )
+            lines.append(header)
 
-        b_g5 = extract_bucket_fn(usage, "gemini", "5h")
-        b_gw = extract_bucket_fn(usage, "gemini", "week")
-        g5_cell = format_quota_cell_simple(b_g5, prefix="5h: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
-        gw_cell = format_quota_cell_simple(b_gw, prefix="Wk: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
+            for p in profiles:
+                sub_health = calculate_subscription_health(p.subscription_date)
+                sub_plain = format_compact_sub(sub_health)
+                sub_badge = format_colored_compact_sub(sub_health, use_color=use_color)
+                sub_pad = " " * max(0, 3 - len(sub_plain))
 
-        row = f"{p.name:<{acc_col_width}}  {g5_cell}  {gw_cell}  {sub_badge}{sub_pad}"
-        lines.append(row)
+                if p.name not in completed_map:
+                    row = f"{p.name:<{acc_col_width}}  {dim}{'Loading...':<{quota_area}}{reset}  {sub_badge}{sub_pad}"
+                    lines.append(row)
+                    continue
+
+                usage = completed_map[p.name]
+                if usage.status != "success" and not (usage.status == "quiescent" and usage.groups):
+                    err_msg = usage.error or "failed"
+                    failed_text = f"✗ Failed: {err_msg}"
+                    if len(failed_text) > quota_area:
+                        failed_text = failed_text[: quota_area - 3] + "..."
+                    disp_err = f"{red}{failed_text:<{quota_area}}{reset}" if use_color else f"{failed_text:<{quota_area}}"
+                    row = f"{p.name:<{acc_col_width}}  {disp_err}  {sub_badge}{sub_pad}"
+                    lines.append(row)
+                    continue
+
+                b_g5 = extract_bucket_fn(usage, "gemini", "5h")
+                b_gw = extract_bucket_fn(usage, "gemini", "week")
+                b_c5 = extract_bucket_fn(usage, "claude", "5h")
+                b_cw = extract_bucket_fn(usage, "claude", "week")
+
+                g5_cell = format_quota_cell_simple(b_g5, prefix="5h: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
+                gw_cell = format_quota_cell_simple(b_gw, prefix="Wk: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
+                c5_cell = format_quota_cell_simple(b_c5, prefix="5h: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
+                cw_cell = format_quota_cell_simple(b_cw, prefix="Wk: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
+
+                row = f"{p.name:<{acc_col_width}}  {g5_cell}  {gw_cell}  {c5_cell}  {cw_cell}  {sub_badge}{sub_pad}"
+                lines.append(row)
+        else:
+            # Compact / narrow terminal (< 120 cols): 2 lines per account
+            quota_area = cell_width * 2 + 2
+            header = (
+                f"{bold}{'Account':<{acc_col_width}}{reset}  "
+                f"{bold}{'Model':<6}{reset}  "
+                f"{bold}{'5h Quota':<{cell_width}}{reset}  "
+                f"{bold}{'Wk Quota':<{cell_width}}{reset}  "
+                f"{bold}Sub{reset}"
+            )
+            lines.append(header)
+
+            for p in profiles:
+                sub_health = calculate_subscription_health(p.subscription_date)
+                sub_plain = format_compact_sub(sub_health)
+                sub_badge = format_colored_compact_sub(sub_health, use_color=use_color)
+                sub_pad = " " * max(0, 3 - len(sub_plain))
+
+                if p.name not in completed_map:
+                    row = f"{p.name:<{acc_col_width}}  {'':<6}  {dim}{'Loading...':<{quota_area}}{reset}  {sub_badge}{sub_pad}"
+                    lines.append(row)
+                    continue
+
+                usage = completed_map[p.name]
+                if usage.status != "success" and not (usage.status == "quiescent" and usage.groups):
+                    err_msg = usage.error or "failed"
+                    failed_text = f"✗ Failed: {err_msg}"
+                    if len(failed_text) > quota_area:
+                        failed_text = failed_text[: quota_area - 3] + "..."
+                    disp_err = f"{red}{failed_text:<{quota_area}}{reset}" if use_color else f"{failed_text:<{quota_area}}"
+                    row = f"{p.name:<{acc_col_width}}  {'':<6}  {disp_err}  {sub_badge}{sub_pad}"
+                    lines.append(row)
+                    continue
+
+                b_g5 = extract_bucket_fn(usage, "gemini", "5h")
+                b_gw = extract_bucket_fn(usage, "gemini", "week")
+                b_c5 = extract_bucket_fn(usage, "claude", "5h")
+                b_cw = extract_bucket_fn(usage, "claude", "week")
+
+                g5_cell = format_quota_cell_simple(b_g5, prefix="5h: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
+                gw_cell = format_quota_cell_simple(b_gw, prefix="Wk: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
+                c5_cell = format_quota_cell_simple(b_c5, prefix="5h: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
+                cw_cell = format_quota_cell_simple(b_cw, prefix="Wk: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
+
+                row1 = f"{p.name:<{acc_col_width}}  {'Gemini':<6}  {g5_cell}  {gw_cell}  {sub_badge}{sub_pad}"
+                row2 = f"{'':<{acc_col_width}}  {dim}{'Claude':<6}{reset}  {c5_cell}  {cw_cell}"
+                lines.append(row1)
+                lines.append(row2)
 
     return lines
 

@@ -482,11 +482,12 @@ class OutputRenderingTests(unittest.TestCase):
 
         # Final formatted report table
         self.assertIn("Antigravity Usage", output)
-        self.assertIn("Gemini", output)
-        self.assertIn("Claude & GPT", output)
+        self.assertIn("Gemini 5h", output)
+        self.assertIn("Gemini Wk", output)
+        self.assertNotIn("Claude & GPT", output)
         self.assertIn("personal", output)
-        self.assertIn("5h: [████████░░]  84%", output)
-        self.assertIn("Wk: [██████████]  99%", output)
+        self.assertIn("5h: [████████▍░]  84%", output)
+        self.assertIn("Wk: [█████████▉]  99%", output)
         self.assertIn("work", output)
         self.assertIn("Failed: agy exited with status 1 (session expired)", output)
 
@@ -716,16 +717,16 @@ class SubscriptionUsageIntegrationTests(unittest.TestCase):
         lines = render_usage_table_lines([p1, p2, p3], completed, use_color=False)
         rendered = "\n".join(lines)
 
-        # Header has Subscription
-        self.assertIn("Subscription", rendered)
-        # Safe profile has bar and renews date
-        self.assertIn("[██████████]", rendered)
-        self.assertIn("Renews: 21/03/2027", rendered)
+        # Header has Sub
+        self.assertIn("Sub", rendered)
+        # Safe profile has compact remaining time
+        self.assertIn("p-safe", rendered)
+        self.assertIn("5mo", rendered)
         # Expired profile shows failed quota error AND subscription status
         self.assertIn("Failed: session expired", rendered)
-        self.assertIn("Expired: 09/09/2026", rendered)
+        self.assertIn("exp", rendered)
         # Unknown profile shows neutral unknown
-        self.assertIn("(date not set)", rendered)
+        self.assertIn("p-unk", rendered)
 
     def test_json_payload_includes_subscription(self) -> None:
         u_sub = parse_usage_response(SAMPLE_REAL_RESPONSE, "p-sub", subscription_date="2027-03-21")
@@ -1069,5 +1070,45 @@ class UsageGraphsTests(unittest.TestCase):
                 self.assertEqual(code, 0)
                 mock_run.assert_called_once()
                 self.assertEqual(mock_run.call_args.kwargs["view"], "matrix")
+
+            with mock.patch("agym.cli.ProfileStore", return_value=store), \
+                 mock.patch("agym.cli.resolve_agy", return_value=Path("/fake/agy")), \
+                 mock.patch("agym.cli.run_usage", return_value=[]) as mock_run:
+                code = cli.main(["usage", "-c"])
+                self.assertEqual(code, 0)
+                mock_run.assert_called_once()
+                self.assertTrue(mock_run.call_args.kwargs["show_claude"])
+
+    def test_render_usage_with_claude_flag(self) -> None:
+        from agym.usage import render_usage_view_lines
+
+        p1 = Profile(name="dev", home=Path("/h1"), created_at="", subscription_date="2027-03-21")
+        u1 = parse_usage_response(SAMPLE_REAL_RESPONSE, "dev", subscription_date="2027-03-21")
+        completed = {"dev": u1}
+
+        # 1. Default (no claude): Claude omitted
+        default_lines = render_usage_view_lines([p1], completed, show_claude=False, use_color=False)
+        default_text = "\n".join(default_lines)
+        self.assertIn("Gemini 5h", default_text)
+        self.assertIn("Gemini Wk", default_text)
+        self.assertNotIn("Claude 5h", default_text)
+
+        # 2. Wide terminal (term_width >= 120): single line with Claude 5h & Claude Wk
+        wide_lines = render_usage_view_lines([p1], completed, show_claude=True, use_color=False, term_width=130)
+        wide_text = "\n".join(wide_lines)
+        self.assertIn("Gemini 5h", wide_text)
+        self.assertIn("Claude 5h", wide_text)
+        self.assertIn("Claude Wk", wide_text)
+        dev_wide = [l for l in wide_lines if "dev" in l]
+        self.assertEqual(len(dev_wide), 1)
+
+        # 3. Narrow terminal (term_width < 120): 2 lines per account (Gemini row & Claude row)
+        narrow_lines = render_usage_view_lines([p1], completed, show_claude=True, use_color=False, term_width=80)
+        narrow_text = "\n".join(narrow_lines)
+        self.assertIn("Model", narrow_text)
+        self.assertIn("Gemini", narrow_text)
+        self.assertIn("Claude", narrow_text)
+        dev_narrow = [l for l in narrow_lines if "dev" in l or "Claude" in l]
+        self.assertGreaterEqual(len(dev_narrow), 2)
 
 

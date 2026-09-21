@@ -647,20 +647,22 @@ class TokenViewsTests(unittest.TestCase):
         self.assertIn("Fleet Token Telemetry", rendered)
         self.assertIn("alpha", rendered)
         self.assertIn("beta", rendered)
+        self.assertIn("Volume Bar", rendered)
         self.assertIn("100.0k", rendered)
         self.assertIn("50.0k", rendered)
         self.assertIn("Fleet Total", rendered)
         self.assertIn("Hit %", rendered)
+        self.assertIn("Sub", rendered)
+        # Verify exactly 1 line for account alpha in the table rows
+        alpha_rows = [l for l in lines if l.startswith("alpha")]
+        self.assertEqual(len(alpha_rows), 1)
 
-    def test_render_tokens_grid_view(self) -> None:
-        from agym.tokens import render_tokens_grid_view
-
-        lines = render_tokens_grid_view([self.u1, self.u2, self.u3], use_color=False)
-        rendered = "\n".join(lines)
-        self.assertIn("alpha", rendered)
-        self.assertIn("beta", rendered)
-        self.assertIn("Vol:", rendered)
-        self.assertIn("Cache:", rendered)
+        # Breakdown table appended when breakdown=True
+        lines_b = render_tokens_table_view([self.u1, self.u2], breakdown=True, use_color=False)
+        rendered_b = "\n".join(lines_b)
+        self.assertIn("Token Composition Breakdown:", rendered_b)
+        self.assertIn("Input", rendered_b)
+        self.assertIn("Output", rendered_b)
 
     def test_render_tokens_matrix_view(self) -> None:
         from agym.tokens import render_tokens_matrix_view
@@ -693,12 +695,6 @@ class TokenViewsTests(unittest.TestCase):
                 cli.main(["tokens"])
                 mock_run.assert_called_once()
                 self.assertEqual(mock_run.call_args.kwargs["view"], "table")
-
-                # -g sets grid
-                mock_run.reset_mock()
-                cli.main(["tokens", "-g"])
-                mock_run.assert_called_once()
-                self.assertEqual(mock_run.call_args.kwargs["view"], "grid")
 
                 # -m sets matrix
                 mock_run.reset_mock()

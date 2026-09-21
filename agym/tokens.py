@@ -14,9 +14,12 @@ from typing import Any, Callable, Coroutine, Sequence
 from .cache import CacheManager, TTL_TOKENS_SECONDS, format_age, format_freshness_badge
 from .launcher import build_profile_env
 from .profiles import Profile
+from .subscription import calculate_subscription_health
 from .usage import ProgressiveUsageUI, _default_subprocess_runner, kill_active_subprocesses
 from .usage_graphs import (
     display_width,
+    format_colored_compact_sub,
+    format_compact_sub,
     format_micro_bar,
     format_smooth_bar,
     format_sparkline_glyph,
@@ -686,7 +689,7 @@ def render_composition_breakdown_table(
 ) -> list[str]:
     """Renders a compact, beautifully aligned Unicode table showing token breakdown per profile."""
     successful = [a for a in accounts if a.status == "success"]
-    name_w = max(10, max([len(a.account) for a in accounts], default=10))
+    name_w = max(11, max([len(a.account) for a in accounts], default=11))
     col_w = 7
 
     dim = COLOR_DIM if use_color else ""
@@ -865,9 +868,11 @@ def render_tokens_table_view(
     accounts: Sequence[AccountTokenUsage],
     *,
     sort_by: str = "default",
+    breakdown: bool = False,
     use_color: bool = True,
+    term_width: int | None = None,
 ) -> list[str]:
-    """Option 1: Modern Unified Telemetry Table merging volume and composition into 1 row per account."""
+    """Modern borderless layout for token usage (Profile, Volume Bar, Total, Share, Hit %, Sub)."""
     successful = [a for a in accounts if a.status == "success"]
     total_tokens = sum(a.usage.total_tokens for a in successful)
     total_in = sum(a.usage.input_tokens for a in successful)
@@ -881,72 +886,78 @@ def render_tokens_table_view(
 
     top_account = max(successful, key=lambda a: a.usage.total_tokens, default=None)
 
-    term_cols = shutil.get_terminal_size((100, 24)).columns
-    box_w = max(70, min(100, term_cols - 2))
+    if term_width is None:
+        term_width, _ = shutil.get_terminal_size((80, 24))
+    box_w = max(70, min(term_width, 100))
+    content_width = box_w - 4
 
     dim = COLOR_DIM if use_color else ""
     reset = COLOR_RESET if use_color else ""
     bold = COLOR_BOLD if use_color else ""
     cyan = COLOR_CYAN if use_color else ""
+    green = "\033[38;5;48m" if use_color else ""
+    red = COLOR_RED if use_color else ""
 
-    lines: list[str] = [f"{bold}Antigravity Token Usage{reset}", ""]
+    lines: list[str] = []
 
-    # Sleek Top Banner
-    t_title = f" Fleet Token Telemetry ({len(accounts)} Accounts · {format_token_count(total_tokens)} Total) "
-    top_b = f"{dim}╭─{reset}{bold}{t_title}{reset}{dim}{'─' * max(0, box_w - len(t_title) - 2)}╮{reset}"
-    bot_b = f"{dim}╰{'─' * max(0, box_w - 2)}╯{reset}"
+    # Sleek Top Banner (matching usage)
+    t_title = f"Fleet Token Telemetry ({len(accounts)} Accounts · {format_token_count(total_tokens)} Total)"
+    dashes_len = max(1, box_w - len(t_title) - 5)
+    top_b = f"{dim}╭─{reset} {bold}{t_title}{reset} {dim}{'─' * dashes_len}╮{reset}"
+    bottom_b = f"{dim}╰{'─' * (box_w - 2)}╯{reset}"
 
-    l1 = f"Total: {format_token_count(total_tokens)}   ·   In: {format_token_count(total_in)}   ·   Out: {format_token_count(total_out)}   ·   Think: {format_token_count(total_thk)}"
-    l2 = f"Cache Savings: {format_token_count(total_crd)} ({cache_hit_pct:.1f}% hit rate ⚡)"
+    l1_text = f"Total: {format_token_count(total_tokens)}   ·   In: {format_token_count(total_in)}   ·   Out: {format_token_count(total_out)}   ·   Think: {format_token_count(total_thk)}"
+    l2_text = f"Cache Savings: {format_token_count(total_crd)} ({cache_hit_pct:.1f}% hit rate ⚡)"
     if top_account and total_tokens > 0:
         top_share = (top_account.usage.total_tokens / total_tokens) * 100.0
-        l2 += f"   ·   Top Driver: {cyan}{top_account.account}{reset} ({top_share:.1f}%)"
+        l2_text += f"   ·   Top Driver: {cyan}{top_account.account}{reset} ({top_share:.1f}%)"
 
     lines.append(top_b)
-    for l_text in [l1, l2]:
+    for l_text in [l1_text, l2_text]:
         dw = display_width(l_text)
-        pad = " " * max(0, box_w - 4 - dw)
+        pad = " " * max(0, content_width - dw)
         lines.append(f"{dim}│{reset} {l_text}{pad} {dim}│{reset}")
-    lines.append(bot_b)
+    lines.append(bottom_b)
     lines.append("")
 
-    # Sort accounts
+    # Sort profiles (default sorts by volume descending)
     sorted_accs = list(accounts)
-    if sort_by == "volume":
+    if sort_by in ("default", "volume", "usage"):
         sorted_accs.sort(key=lambda a: a.usage.total_tokens, reverse=True)
     elif sort_by == "cache":
         sorted_accs.sort(key=lambda a: a.usage.cache_efficiency, reverse=True)
     elif sort_by == "name":
         sorted_accs.sort(key=lambda a: a.account.lower())
 
-    name_w = max(10, max([len(a.account) for a in sorted_accs], default=10))
-    bar_w = 16
-    mix_w = 14
+    acc_col_width = max(11, max([len(a.account) for a in sorted_accs], default=11))
+    bar_w = 12
+    bar_col_w = bar_w + 7  # bar (12) + [ ] (2) + space (1) + pct (4) = 19
 
-    h_name = "─" * name_w
-    h_tot = "─" * 8
-    h_share = "─" * 7
-    h_bar = "─" * (bar_w + 2)
-    h_mix = "─" * (mix_w + 2)
-    h_hit = "─" * 7
+    # Borderless header
+    header = (
+        f"{bold}{'Profile':<{acc_col_width}}{reset}  "
+        f"{bold}{'Volume Bar':<{bar_col_w}}{reset}  "
+        f"{bold}{'Total':>8}{reset}  "
+        f"{bold}{'Share':>7}{reset}  "
+        f"{bold}{'Hit %':>9}{reset}  "
+        f"{bold}Sub{reset}"
+    )
+    lines.append(header)
 
-    t_top = f"{dim}┌─{h_name}─┬─{h_tot}─┬─{h_share}─┬─{h_bar}─┬─{h_mix}─┬─{h_hit}─┐{reset}"
-    t_mid = f"{dim}├─{h_name}─┼─{h_tot}─┼─{h_share}─┼─{h_bar}─┼─{h_mix}─┼─{h_hit}─┤{reset}"
-    t_bot = f"{dim}└─{h_name}─┴─{h_tot}─┴─{h_share}─┴─{h_bar}─┴─{h_mix}─┴─{h_hit}─┘{reset}"
-
-    sep = f" {dim}│{reset} "
-    lines.append(t_top)
-    hdr = f"{dim}│{reset} {bold}{'Profile':<{name_w}}{reset}{sep}{bold}{'Total':>8}{reset}{sep}{bold}{'Share':>7}{reset}{sep}{bold}{'Relative Volume':^{bar_w + 2}}{reset}{sep}{bold}{'Composition Mix':^{mix_w + 2}}{reset}{sep}{bold}{'Hit %':>7}{reset} {dim}│{reset}"
-    lines.append(hdr)
-    lines.append(t_mid)
+    inner_err_w = bar_col_w + 2 + 8 + 2 + 7 + 2 + 9
 
     for a in sorted_accs:
+        sub_health = calculate_subscription_health(a.subscription_date)
+        sub_plain = format_compact_sub(sub_health)
+        sub_badge = format_colored_compact_sub(sub_health, use_color=use_color)
+        sub_pad = " " * max(0, 3 - len(sub_plain))
+
         if a.status != "success":
-            err_w = 8 + 7 + bar_w + 2 + mix_w + 2 + 7 + 12
             err_msg = f"✗ Failed: {a.error or 'error'}"
-            if len(err_msg) > err_w:
-                err_msg = err_msg[:err_w-3] + "..."
-            lines.append(f"{dim}│{reset} {a.account:<{name_w}}{sep}{COLOR_RED}{err_msg:<{err_w}}{reset} {dim}│{reset}")
+            if len(err_msg) > inner_err_w:
+                err_msg = err_msg[: inner_err_w - 3] + "..."
+            disp_err = f"{red}{err_msg:<{inner_err_w}}{reset}" if use_color else f"{err_msg:<{inner_err_w}}"
+            lines.append(f"{a.account:<{acc_col_width}}  {disp_err}  {sub_badge}{sub_pad}")
             continue
 
         tot_s = format_token_count(a.usage.total_tokens)
@@ -954,122 +965,50 @@ def render_tokens_table_view(
         share_s = f"{share_pct:5.1f}%"
 
         v_frac = (a.usage.total_tokens / max_tokens) if max_tokens > 0 else 0.0
+        v_pct = round(v_frac * 100)
         v_bar = format_smooth_bar(v_frac, width=bar_w, use_color=use_color)
-        m_bar = render_stacked_bar(a.usage, width=mix_w, use_color=use_color)
+        v_col_display = f"{v_bar} {v_pct:3d}%"
 
         hit_val = a.usage.cache_efficiency
-        hit_col = COLOR_OUTPUT if hit_val >= 80 else (COLOR_CACHE if hit_val >= 50 else COLOR_RED)
-        hit_s = f"{hit_col if use_color else ''}{hit_val:5.1f}%{reset}"
+        hit_badge = (
+            f"{green if hit_val >= 80 else (COLOR_CACHE if hit_val >= 50 else red)}{hit_val:5.1f}% ⚡{reset}"
+            if use_color
+            else f"{hit_val:5.1f}% ⚡"
+        )
 
-        row = f"{dim}│{reset} {a.account:<{name_w}}{sep}{bold}{tot_s:>8}{reset}{sep}{dim}{share_s:>7}{reset}{sep}{v_bar}{sep}{m_bar}{sep}{hit_s:>7} {dim}│{reset}"
+        row = (
+            f"{a.account:<{acc_col_width}}  "
+            f"{v_col_display}  "
+            f"{bold}{tot_s:>8}{reset}  "
+            f"{dim}{share_s:>7}{reset}  "
+            f"{hit_badge:>9}  "
+            f"{sub_badge}{sub_pad}"
+        )
         lines.append(row)
 
     if len(sorted_accs) > 1:
-        lines.append(t_mid)
         fl_tot_s = format_token_count(total_tokens)
-        fl_v_bar = format_smooth_bar(1.0, width=bar_w, use_color=use_color)
-        fl_usage = TokenUsage(
-            input_tokens=total_in,
-            output_tokens=total_out,
-            thinking_tokens=total_thk,
-            cache_read_tokens=total_crd,
-            total_tokens=total_tokens,
+        fl_bar = format_smooth_bar(1.0, width=bar_w, use_color=use_color)
+        fl_col_display = f"{fl_bar} 100%"
+        fl_hit_badge = (
+            f"{green if cache_hit_pct >= 80 else (COLOR_CACHE if cache_hit_pct >= 50 else red)}{cache_hit_pct:5.1f}% ⚡{reset}"
+            if use_color
+            else f"{cache_hit_pct:5.1f}% ⚡"
         )
-        fl_m_bar = render_stacked_bar(fl_usage, width=mix_w, use_color=use_color)
-        fl_hit_s = f"{COLOR_OUTPUT if use_color else ''}{cache_hit_pct:5.1f}%{reset}"
-        tot_row = f"{dim}│{reset} {bold}{'Fleet Total':<{name_w}}{reset}{sep}{bold}{fl_tot_s:>8}{reset}{sep}{dim}{'100.0%':>7}{reset}{sep}{fl_v_bar}{sep}{fl_m_bar}{sep}{fl_hit_s:>7} {dim}│{reset}"
+
+        tot_row = (
+            f"{bold}{'Fleet Total':<{acc_col_width}}{reset}  "
+            f"{fl_col_display}  "
+            f"{bold}{fl_tot_s:>8}{reset}  "
+            f"{dim}{'100.0%':>7}{reset}  "
+            f"{fl_hit_badge:>9}  "
+            f"{'-':<3}"
+        )
         lines.append(tot_row)
 
-    lines.append(t_bot)
-    lines.append(f"{dim}Legend:{reset} {COLOR_INPUT}■ Input{reset}  {COLOR_OUTPUT}■ Output{reset}  {COLOR_THINKING}■ Thinking{reset}  {COLOR_CACHE}■ Cache Read{reset}")
-    return lines
-
-
-def render_tokens_grid_view(
-    accounts: Sequence[AccountTokenUsage],
-    *,
-    sort_by: str = "default",
-    use_color: bool = True,
-) -> list[str]:
-    """Option 2 (Grid): Multi-column card dashboard for 20-30 accounts."""
-    successful = [a for a in accounts if a.status == "success"]
-    total_tokens = sum(a.usage.total_tokens for a in successful)
-    max_tokens = max((a.usage.total_tokens for a in successful), default=1)
-
-    term_cols = shutil.get_terminal_size((100, 24)).columns
-    card_width = 34
-    cols = max(1, min(4, term_cols // (card_width + 1)))
-
-    dim = COLOR_DIM if use_color else ""
-    reset = COLOR_RESET if use_color else ""
-    bold = COLOR_BOLD if use_color else ""
-    cyan = COLOR_CYAN if use_color else ""
-    red = COLOR_RED if use_color else ""
-
-    lines: list[str] = [f"{bold}Antigravity Token Usage{reset}", ""]
-
-    sorted_accs = list(accounts)
-    if sort_by == "volume":
-        sorted_accs.sort(key=lambda a: a.usage.total_tokens, reverse=True)
-    elif sort_by == "cache":
-        sorted_accs.sort(key=lambda a: a.usage.cache_efficiency, reverse=True)
-    elif sort_by == "name":
-        sorted_accs.sort(key=lambda a: a.account.lower())
-
-    cards: list[list[str]] = []
-    for a in sorted_accs:
-        tot_s = format_token_count(a.usage.total_tokens)
-        share_pct = (a.usage.total_tokens / total_tokens * 100.0) if total_tokens > 0 else 0.0
-
-        acc_name = a.account
-        if len(acc_name) > 12:
-            acc_name = acc_name[:10] + ".."
-
-        tag = f" {tot_s} ({share_pct:4.1f}%) "
-        name_tag = f" {acc_name} "
-        dash_len = max(1, card_width - 4 - len(name_tag) - len(tag))
-        top_line = f"┌─{name_tag}{'─' * dash_len}{tag}─┐"
-
-        if a.status != "success":
-            err_msg = a.error or "failed"
-            if len(err_msg) > card_width - 6:
-                err_msg = err_msg[: card_width - 9] + "..."
-            c_lines = [
-                top_line,
-                f"│ {red}✗ {err_msg:<{card_width - 6}}{reset} │",
-                f"│ {'':<{card_width - 4}} │",
-                f"│ {'':<{card_width - 4}} │",
-                f"│ {'':<{card_width - 4}} │",
-                f"└{'─' * (card_width - 2)}┘",
-            ]
-            cards.append(c_lines)
-            continue
-
-        v_frac = a.usage.total_tokens / max_tokens if max_tokens > 0 else 0.0
-        v_bar = format_smooth_bar(v_frac, width=12, use_color=use_color)
-        m_bar = render_stacked_bar(a.usage, width=14, use_color=use_color)
-
-        in_s = format_token_count(a.usage.input_tokens)
-        out_s = format_token_count(a.usage.output_tokens)
-        thk_s = format_token_count(a.usage.thinking_tokens)
-        crd_s = format_token_count(a.usage.cache_read_tokens)
-        hit_s = f"{a.usage.cache_efficiency:.1f}%"
-
-        r1 = f"│ Vol:  {v_bar} {v_frac * 100:3.0f}%     │"
-        r2 = f"│ In: {in_s:>5} · Out: {out_s:>4} · Thk: {thk_s:>4} │"
-        r3 = f"│ Cache: {crd_s:>6} · Hit: {hit_s:>5} ⚡  │"
-        r4 = f"│ Mix:  {m_bar}           │"
-        bot = f"└{'─' * (card_width - 2)}┘"
-
-        cards.append([top_line, r1, r2, r3, r4, bot])
-
-    for i in range(0, len(cards), cols):
-        chunk = cards[i : i + cols]
-        for line_idx in range(6):
-            row_parts = [card[line_idx] for card in chunk]
-            lines.append(" ".join(row_parts))
-        if i + cols < len(cards):
-            lines.append("")
+    if breakdown:
+        lines.append("")
+        lines.extend(render_composition_breakdown_table(sorted_accs, use_color=use_color))
 
     return lines
 
@@ -1261,16 +1200,15 @@ def render_tokens_telemetry_view(
 def render_token_dashboard_view(
     accounts: Sequence[AccountTokenUsage],
     *,
-    view: str = "classic",
+    view: str = "table",
     sort_by: str = "default",
     breakdown: bool = False,
     use_color: bool = True,
+    term_width: int | None = None,
 ) -> list[str]:
-    """Dispatches dashboard rendering to the chosen view style: table, grid, matrix, telemetry, or classic."""
+    """Dispatches dashboard rendering to the chosen view style: table, matrix, telemetry, or classic."""
     if view == "table":
-        return render_tokens_table_view(accounts, sort_by=sort_by, use_color=use_color)
-    elif view == "grid":
-        return render_tokens_grid_view(accounts, sort_by=sort_by, use_color=use_color)
+        return render_tokens_table_view(accounts, sort_by=sort_by, breakdown=breakdown, use_color=use_color, term_width=term_width)
     elif view == "matrix":
         return render_tokens_matrix_view(accounts, sort_by=sort_by, use_color=use_color)
     elif view == "telemetry":
@@ -1288,7 +1226,7 @@ async def run_tokens(
     *,
     json_mode: bool = False,
     breakdown: bool = False,
-    view: str = "classic",
+    view: str = "table",
     sort_by: str = "default",
     refresh: bool = False,
     timeout: float = 30.0,

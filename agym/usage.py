@@ -534,116 +534,23 @@ def render_usage_table_lines(
     profiles: Sequence[Profile],
     completed_map: dict[str, AccountUsage],
     *,
+    show_claude: bool = False,
     spinner_char: str | None = None,
     use_color: bool = True,
     smooth: bool = False,
     bar_width: int = 10,
+    term_width: int | None = None,
 ) -> list[str]:
-    # cell_width: prefix (4 chars: "5h: " / "Wk: ") + bar (12) + 1 + pct (4) + 1 + reset (5) = 27
-    cell_width = bar_width + 17
-    spinner_pad = 2 if spinner_char else 0
-    acc_col_width = max(10, max([len(p.name) + spinner_pad for p in profiles], default=10))
-
-    quota_area_width = cell_width * len(QUOTA_COLUMNS) + 3 * (len(QUOTA_COLUMNS) - 1)
-
-    top_border = (
-        "┌─"
-        + ("─" * acc_col_width)
-        + "─┬─"
-        + "─┬─".join("─" * cell_width for _ in TABLE_COLUMNS)
-        + "─┐"
+    """Default usage view: borderless layout (Gemini 5h & Wk, optional Claude, Sub)."""
+    return render_usage_grid_lines(
+        profiles,
+        completed_map,
+        extract_quota_bucket,
+        format_short_reset_time,
+        show_claude=show_claude,
+        use_color=use_color,
+        term_width=term_width,
     )
-
-    header_cols = [f"{title:^{cell_width}}" for _, title in TABLE_COLUMNS]
-    header_row = f"│ {'Account':<{acc_col_width}} │ " + " │ ".join(header_cols) + " │"
-
-    divider = (
-        "├─"
-        + ("─" * acc_col_width)
-        + "─┼─"
-        + "─┼─".join("─" * cell_width for _ in TABLE_COLUMNS)
-        + "─┤"
-    )
-
-    bottom_border = (
-        "└─"
-        + ("─" * acc_col_width)
-        + "─┴─"
-        + "─┴─".join("─" * cell_width for _ in TABLE_COLUMNS)
-        + "─┘"
-    )
-
-    lines = [top_border, header_row, divider]
-
-    for idx, p in enumerate(profiles):
-        sub_health = calculate_subscription_health(p.subscription_date)
-        sub_cell_1, sub_cell_2 = format_subscription_cells(
-            sub_health, width=cell_width, use_color=use_color
-        )
-
-        if p.name in completed_map:
-            usage = completed_map[p.name]
-            if usage.status == "success":
-                # Row 1: 5h limit
-                cells_5h = [
-                    format_quota_cell(
-                        extract_quota_bucket(usage, fam, "5h"),
-                        prefix="5h: ",
-                        bar_width=bar_width,
-                        use_color=use_color,
-                        smooth=smooth,
-                        target_width=cell_width,
-                    )
-                    for fam, _ in QUOTA_COLUMNS
-                ]
-                # Row 2: Week limit (below the 5h)
-                cells_wk = [
-                    format_quota_cell(
-                        extract_quota_bucket(usage, fam, "week"),
-                        prefix="Wk: ",
-                        bar_width=bar_width,
-                        use_color=use_color,
-                        smooth=smooth,
-                        target_width=cell_width,
-                    )
-                    for fam, _ in QUOTA_COLUMNS
-                ]
-                acc_sub_disp = f"{'':<{acc_col_width}}"
-                row_1 = f"│ {usage.account:<{acc_col_width}} │ " + " │ ".join(cells_5h + [sub_cell_1]) + " │"
-                row_2 = f"│ {acc_sub_disp} │ " + " │ ".join(cells_wk + [sub_cell_2]) + " │"
-                lines.append(row_1)
-                lines.append(row_2)
-            else:
-                err_msg = usage.error or "unknown error"
-                failed_text = f"✗ Failed: {err_msg}"
-                if len(failed_text) > quota_area_width:
-                    failed_text = failed_text[: quota_area_width - 3] + "..."
-                if use_color:
-                    failed_display = f"\033[91m{failed_text:<{quota_area_width}}\033[0m"
-                else:
-                    failed_display = f"{failed_text:<{quota_area_width}}"
-                row_1 = f"│ {usage.account:<{acc_col_width}} │ {failed_display} │ {sub_cell_1} │"
-                row_2 = f"│ {'':<{acc_col_width}} │ {'':<{quota_area_width}} │ {sub_cell_2} │"
-                lines.append(row_1)
-                lines.append(row_2)
-        else:
-            loading_text = "Loading..."
-            if use_color:
-                loading_display = f"\033[90m{loading_text:<{quota_area_width}}\033[0m"
-            else:
-                loading_display = f"{loading_text:<{quota_area_width}}"
-            acc_str = f"{spinner_char} {p.name}" if spinner_char else p.name
-            row_1 = f"│ {acc_str:<{acc_col_width}} │ {loading_display} │ {sub_cell_1} │"
-            row_2 = f"│ {'':<{acc_col_width}} │ {'':<{quota_area_width}} │ {sub_cell_2} │"
-            lines.append(row_1)
-            lines.append(row_2)
-
-        # "only seperate after the week"
-        if idx < len(profiles) - 1:
-            lines.append(divider)
-
-    lines.append(bottom_border)
-    return lines
 
 
 def sort_profiles(
@@ -691,6 +598,7 @@ def render_usage_view_lines(
     *,
     view: str = "table",
     sort_by: str = "usage",
+    show_claude: bool = False,
     include_summary: bool = True,
     spinner_char: str | None = None,
     use_color: bool = True,
@@ -726,6 +634,7 @@ def render_usage_view_lines(
                 completed_map,
                 extract_quota_bucket,
                 format_short_reset_time,
+                show_claude=show_claude,
                 use_color=use_color,
                 term_width=term_width,
             )
@@ -751,10 +660,12 @@ def render_usage_view_lines(
             render_usage_table_lines(
                 sorted_profs,
                 completed_map,
+                show_claude=show_claude,
                 spinner_char=spinner_char,
                 use_color=use_color,
                 smooth=use_color,
                 bar_width=bar_width,
+                term_width=term_width,
             )
         )
 
@@ -977,6 +888,7 @@ class ProgressiveUsageUI:
         stdout: Any = None,
         view: str = "table",
         sort_by: str = "usage",
+        show_claude: bool = False,
         include_summary: bool | None = None,
     ) -> None:
         self.profiles = list(profiles)
@@ -984,6 +896,7 @@ class ProgressiveUsageUI:
         self.is_tty = sys.stdout.isatty() if is_tty is None else is_tty
         self.view = view
         self.sort_by = sort_by
+        self.show_claude = show_claude
         if include_summary is None:
             self.include_summary = self.is_tty
         else:
@@ -1026,6 +939,7 @@ class ProgressiveUsageUI:
             self.completed,
             view=self.view,
             sort_by=self.sort_by,
+            show_claude=self.show_claude,
             include_summary=self.include_summary,
             spinner_char=spinner_char,
             use_color=True,
@@ -1072,6 +986,7 @@ class ProgressiveUsageUI:
             completed_map,
             view=self.view,
             sort_by=self.sort_by,
+            show_claude=self.show_claude,
             include_summary=self.include_summary,
             spinner_char=None,
             use_color=self.is_tty,
@@ -1103,6 +1018,7 @@ async def run_usage(
     concurrency_limit: int = 8,
     view: str = "table",
     sort_by: str = "usage",
+    show_claude: bool = False,
     include_summary: bool | None = None,
     cache_manager: CacheManager | None = None,
     is_tty: bool | None = None,
@@ -1151,6 +1067,7 @@ async def run_usage(
             stdout=out,
             view=view,
             sort_by=sort_by,
+            show_claude=show_claude,
             include_summary=include_summary,
         )
         spinner_task = asyncio.create_task(ui.spinner_loop())
@@ -1177,6 +1094,7 @@ async def run_usage(
         stdout=out,
         view=view,
         sort_by=sort_by,
+        show_claude=show_claude,
         include_summary=include_summary,
     )
     usages_result = await fetch_all_usage(
