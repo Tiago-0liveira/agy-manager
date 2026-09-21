@@ -303,3 +303,24 @@ class CliTests(unittest.TestCase):
                 out = mock_out.getvalue()
                 self.assertIn("p-with-date\tready; renews 01/01/2030", out)
                 self.assertIn("p-no-date\tready; subscription: unknown", out)
+
+    def test_help_output(self) -> None:
+        import io
+        from unittest.mock import patch
+
+        for arg in ["--help", "-h", "help"]:
+            with self.subTest(arg=arg), patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+                code = cli.main([arg])
+                self.assertEqual(code, 0)
+                out = mock_out.getvalue()
+                self.assertIn("agym — Explicit isolated-profile manager", out)
+                self.assertIn("Commands:", out)
+                self.assertIn("Launching Antigravity:", out)
+                self.assertIn("Command Options:", out)
+                self.assertIn("Examples:", out)
+
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+            code = cli.main([])
+            self.assertEqual(code, 2)
+            out = mock_out.getvalue()
+            self.assertIn("agym — Explicit isolated-profile manager", out)
