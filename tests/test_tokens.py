@@ -607,3 +607,109 @@ class CLITokensIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 code3 = cli.main(["token"])
                 self.assertEqual(code3, 0)
                 mock_run.assert_called_once()
+
+
+class TokenViewsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.u1 = AccountTokenUsage(
+            account="alpha",
+            status="success",
+            usage=TokenUsage(
+                input_tokens=10_000,
+                output_tokens=2_000,
+                thinking_tokens=1_000,
+                cache_read_tokens=87_000,
+                total_tokens=100_000,
+            ),
+        )
+        self.u2 = AccountTokenUsage(
+            account="beta",
+            status="success",
+            usage=TokenUsage(
+                input_tokens=5_000,
+                output_tokens=1_000,
+                thinking_tokens=500,
+                cache_read_tokens=43_500,
+                total_tokens=50_000,
+            ),
+        )
+        self.u3 = AccountTokenUsage(
+            account="gamma",
+            status="error",
+            error="connection refused",
+        )
+
+    def test_render_tokens_table_view(self) -> None:
+        from agym.tokens import render_tokens_table_view
+
+        lines = render_tokens_table_view([self.u1, self.u2, self.u3], use_color=False)
+        rendered = "\n".join(lines)
+        self.assertIn("Fleet Token Telemetry", rendered)
+        self.assertIn("alpha", rendered)
+        self.assertIn("beta", rendered)
+        self.assertIn("100.0k", rendered)
+        self.assertIn("50.0k", rendered)
+        self.assertIn("Fleet Total", rendered)
+        self.assertIn("Hit %", rendered)
+
+    def test_render_tokens_grid_view(self) -> None:
+        from agym.tokens import render_tokens_grid_view
+
+        lines = render_tokens_grid_view([self.u1, self.u2, self.u3], use_color=False)
+        rendered = "\n".join(lines)
+        self.assertIn("alpha", rendered)
+        self.assertIn("beta", rendered)
+        self.assertIn("Vol:", rendered)
+        self.assertIn("Cache:", rendered)
+
+    def test_render_tokens_matrix_view(self) -> None:
+        from agym.tokens import render_tokens_matrix_view
+
+        lines = render_tokens_matrix_view([self.u1, self.u2, self.u3], use_color=False)
+        rendered = "\n".join(lines)
+        self.assertIn("Fleet Token Matrix", rendered)
+        self.assertIn("alpha", rendered)
+        self.assertIn("beta", rendered)
+
+    def test_render_tokens_telemetry_view(self) -> None:
+        from agym.tokens import render_tokens_telemetry_view
+
+        lines = render_tokens_telemetry_view([self.u1, self.u2, self.u3], use_color=False)
+        rendered = "\n".join(lines)
+        self.assertIn("AGYM TOKEN FLEET ANALYTICS", rendered)
+        self.assertIn("HEAVY DRIVERS", rendered)
+        self.assertIn("Optimization Insight", rendered)
+
+    def test_cli_tokens_view_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = ProfileStore(config_root=tmp_path / "config", data_root=tmp_path / "data")
+            store.create("p1")
+
+            with mock.patch("agym.cli.ProfileStore", return_value=store), \
+                 mock.patch("agym.cli.resolve_agy", return_value=Path("/fake/agy")), \
+                 mock.patch("agym.cli.run_tokens", return_value=[]) as mock_run:
+                # Default view is table
+                cli.main(["tokens"])
+                mock_run.assert_called_once()
+                self.assertEqual(mock_run.call_args.kwargs["view"], "table")
+
+                # -g sets grid
+                mock_run.reset_mock()
+                cli.main(["tokens", "-g"])
+                mock_run.assert_called_once()
+                self.assertEqual(mock_run.call_args.kwargs["view"], "grid")
+
+                # -m sets matrix
+                mock_run.reset_mock()
+                cli.main(["tokens", "-m"])
+                mock_run.assert_called_once()
+                self.assertEqual(mock_run.call_args.kwargs["view"], "matrix")
+
+                # -t sets telemetry
+                mock_run.reset_mock()
+                cli.main(["tokens", "-t", "--sort", "volume"])
+                mock_run.assert_called_once()
+                self.assertEqual(mock_run.call_args.kwargs["view"], "telemetry")
+                self.assertEqual(mock_run.call_args.kwargs["sort_by"], "volume")
+

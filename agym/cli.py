@@ -109,10 +109,15 @@ Command Options:
       --no-summary                    Hide top fleet capacity summary banner
       --timeout SECONDS               Per-profile query timeout in seconds (default: 30)
 
-  agym tokens [--json] [-b, --breakdown] [-f, --refresh] [profiles...]
+  agym tokens [--json] [-b, --breakdown] [-f, --refresh] [-v, --view {table,grid,matrix,telemetry,classic}] [--sort {default,volume,cache,name}] [profiles...]
       --json                          Output token metrics and summary in JSON format
       -b, --breakdown                 Show detailed token composition breakdown table
       -f, --refresh                   Bypass cache and re-scan conversation databases
+      -v, --view VIEW                 Visual layout: table (default), grid, matrix, telemetry, classic
+      -g, --grid                      Shortcut for --view grid (multi-column card dashboard)
+      -m, --matrix                    Shortcut for --view matrix (ultra-dense heatmap for dozens of accounts)
+      -t, --telemetry                 Shortcut for --view telemetry (executive tiered view & analytics)
+      --sort CRITERION                Sort accounts by: default, volume, cache, or name
 
   agym statusline [--preview [profile] | --sync | --status | --enable | --disable]
       --preview, -p [PROFILE]         Preview rendered statusline for active or specified profile
@@ -561,6 +566,43 @@ def _tokens(argv: list[str], store: ProfileStore) -> int:
         help="Bypass cache and re-scan conversation databases",
     )
     parser.add_argument(
+        "--view",
+        "-v",
+        choices=["table", "grid", "matrix", "telemetry", "classic"],
+        default="table",
+        help="Visual layout style: table (default), grid, matrix, telemetry, classic",
+    )
+    parser.add_argument(
+        "--grid",
+        "-g",
+        action="store_const",
+        dest="view",
+        const="grid",
+        help="Shortcut for --view grid (multi-column card dashboard)",
+    )
+    parser.add_argument(
+        "--matrix",
+        "-m",
+        action="store_const",
+        dest="view",
+        const="matrix",
+        help="Shortcut for --view matrix (ultra-dense heatmap for dozens of accounts)",
+    )
+    parser.add_argument(
+        "--telemetry",
+        "-t",
+        action="store_const",
+        dest="view",
+        const="telemetry",
+        help="Shortcut for --view telemetry (executive tiered view & analytics)",
+    )
+    parser.add_argument(
+        "--sort",
+        choices=["default", "volume", "cache", "name"],
+        default="default",
+        help="Sort order for profiles (default, volume, cache, name)",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=30.0,
@@ -586,13 +628,21 @@ def _tokens(argv: list[str], store: ProfileStore) -> int:
         return 0
 
     agy = resolve_agy()
-    kwargs = {
+    resolved_view = ns.view
+    if ns.breakdown and not any(arg in argv for arg in ("--view", "-v", "-g", "--grid", "-m", "--matrix", "-t", "--telemetry")):
+        resolved_view = "classic"
+
+    kwargs: dict[str, Any] = {
         "json_mode": ns.json_mode,
         "breakdown": ns.breakdown,
         "timeout": ns.timeout,
     }
     if ns.refresh:
         kwargs["refresh"] = True
+    if resolved_view != "classic":
+        kwargs["view"] = resolved_view
+    if ns.sort != "default":
+        kwargs["sort_by"] = ns.sort
     try:
         asyncio.run(run_tokens(agy, profiles, **kwargs))
         return 0
