@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import tempfile
@@ -10,9 +11,11 @@ from unittest import mock
 from agym.wincred import (
     DEFAULT_USER,
     TARGET_NAME,
+    async_profile_credential_context,
     extract_email_from_blob,
     get_profile_email,
     get_profile_token_path,
+    get_wincred_async_lock,
     has_profile_token,
     load_profile_token,
     profile_credential_context,
@@ -119,19 +122,58 @@ class WincredUnitTests(unittest.TestCase):
         self.assertTrue(has_profile_token(self.home))
         self.assertEqual(get_profile_email(self.home), "eve@example.com")
 
-    @mock.patch("agym.wincred.is_windows_platform", return_value=False)
-    @mock.patch("agym.wincred.wincred_write")
-    @mock.patch("agym.wincred.wincred_delete")
-    def test_credential_context_noop_on_non_windows(
+    @mock.patch("agym.wincred.is_windows_platform", return_value=True)
+    @mock.patch("agym.wincred.wincred_read")
+    def test_sync_after_launch_guards_against_cross_contamination(
         self,
-        mock_delete: mock.Mock,
-        mock_write: mock.Mock,
+        mock_read: mock.Mock,
         _mock_win: mock.Mock,
     ) -> None:
-        with profile_credential_context(self.home, is_setup=True):
-            pass
-        mock_delete.assert_not_called()
-        mock_write.assert_not_called()
+        alice_blob = json.dumps({"email": "alice@example.com"}).encode("utf-8")
+        bob_blob = json.dumps({"email": "bob@example.com"}).encode("utf-8")
+        save_profile_token(self.home, blob=alice_blob)
+        self.assertEqual(get_profile_email(self.home), "alice@example.com")
+
+        mock_read.return_value = ("antigravity", bob_blob)
+        # In regular usage (is_setup=False), cross-account overwrite must be blocked
+        sync_credentials_after_launch(self.home, is_setup=False)
+        self.assertEqual(get_profile_email(self.home), "alice@example.com")
+
+    @mock.patch("agym.wincred.is_windows_platform", return_value=True)
+    @mock.patch("agym.wincred.wincred_read")
+    def test_sync_after_launch_allows_different_email_during_setup(
+        self,
+        mock_read: mock.Mock,
+        _mock_win: mock.Mock,
+    ) -> None:
+        alice_blob = json.dumps({"email": "alice@example.com"}).encode("utf-8")
+        bob_blob = json.dumps({"email": "bob@example.com"}).encode("utf-8")
+        save_profile_token(self.home, blob=alice_blob)
+
+        mock_read.return_value = ("antigravity", bob_blob)
+        # In setup mode (is_setup=True), new identity must be allowed
+        sync_credentials_after_launch(self.home, is_setup=True)
+        self.assertEqual(get_profile_email(self.home), "bob@example.com")
+
+    @mock.patch("agym.wincred.is_windows_platform", return_value=True)
+    @mock.patch("agym.wincred.wincred_read")
+    @mock.patch("agym.wincred.wincred_write")
+    def test_async_profile_credential_context(
+        self,
+        mock_write: mock.Mock,
+        mock_read: mock.Mock,
+        _mock_win: mock.Mock,
+    ) -> None:
+        blob = json.dumps({"email": "charlie@example.com"}).encode("utf-8")
+        mock_read.return_value = ("antigravity", blob)
+
+        async def _run() -> None:
+            async with async_profile_credential_context(self.home, is_setup=True):
+                pass
+
+        asyncio.run(_run())
+        self.assertTrue(has_profile_token(self.home))
+        self.assertEqual(get_profile_email(self.home), "charlie@example.com")
 
 
 if __name__ == "__main__":

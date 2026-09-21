@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import ctypes
 import json
@@ -7,10 +8,10 @@ import logging
 import os
 import platform
 import tempfile
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from ctypes import wintypes
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any, AsyncGenerator, Generator
 
 logger = logging.getLogger("agym.wincred")
 
@@ -272,7 +273,22 @@ def sync_credentials_before_launch(profile_home: Path | str, is_setup: bool = Fa
         logger.debug("No saved token found; purged '%s'", TARGET_NAME)
 
 
-def sync_credentials_after_launch(profile_home: Path | str) -> None:
+_wincred_async_lock: asyncio.Lock | None = None
+
+
+def get_wincred_async_lock() -> asyncio.Lock:
+    """Returns a process-wide asyncio.Lock ensuring mutually exclusive Windows Credential Manager access."""
+    global _wincred_async_lock
+    if _wincred_async_lock is None:
+        _wincred_async_lock = asyncio.Lock()
+    return _wincred_async_lock
+
+
+def sync_credentials_after_launch(
+    profile_home: Path | str,
+    *,
+    is_setup: bool = False,
+) -> None:
     """Persists any updated or newly acquired credential from Windows Credential Manager
     into the profile's isolated token storage.
     """
@@ -281,10 +297,27 @@ def sync_credentials_after_launch(profile_home: Path | str) -> None:
 
     profile_home_path = Path(profile_home).resolve()
     cred = wincred_read(TARGET_NAME)
-    if cred is not None:
-        user, blob = cred
-        save_profile_token(profile_home_path, user, blob)
-        logger.debug("Persisted updated '%s' to profile %s", TARGET_NAME, profile_home_path)
+    if cred is None:
+        return
+
+    user, blob = cred
+    raw_text = blob.decode("utf-8", errors="replace") if isinstance(blob, bytes) else blob
+    new_email = extract_email_from_blob(raw_text)
+
+    # Protect existing profiles against accidental cross-account token pollution
+    if not is_setup:
+        existing_email = get_profile_email(profile_home_path)
+        if existing_email and new_email and existing_email.strip().lower() != new_email.strip().lower():
+            logger.warning(
+                "Prevented token cross-contamination for profile at '%s': existing account '%s' does not match credential account '%s'",
+                profile_home_path,
+                existing_email,
+                new_email,
+            )
+            return
+
+    save_profile_token(profile_home_path, user, blob)
+    logger.debug("Persisted updated '%s' to profile %s", TARGET_NAME, profile_home_path)
 
 
 @contextmanager
@@ -305,4 +338,23 @@ def profile_credential_context(
     try:
         yield
     finally:
-        sync_credentials_after_launch(profile_home)
+        sync_credentials_after_launch(profile_home, is_setup=is_setup)
+
+
+@asynccontextmanager
+async def async_profile_credential_context(
+    profile_home: Path | str,
+    *,
+    is_setup: bool = False,
+) -> AsyncGenerator[None, None]:
+    """Async context manager ensuring serialized, isolated Windows Credential Manager access.
+
+    Serializes concurrent tasks on Windows to prevent race conditions on gemini:antigravity.
+    """
+    if not is_windows_platform():
+        yield
+        return
+
+    async with get_wincred_async_lock():
+        with profile_credential_context(profile_home, is_setup=is_setup):
+            yield

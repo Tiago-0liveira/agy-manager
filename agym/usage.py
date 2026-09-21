@@ -14,7 +14,12 @@ from .cache import CacheManager, TTL_USAGE_SECONDS, format_age, format_freshness
 from .launcher import build_profile_env, resolve_agy
 from .profiles import Profile, ProfileStore
 from .subscription import calculate_subscription_health, format_subscription_cells
-from .wincred import profile_credential_context
+from .wincred import (
+    async_profile_credential_context,
+    has_profile_token,
+    is_windows_platform,
+    profile_credential_context,
+)
 
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -676,6 +681,7 @@ async def _default_subprocess_runner(
     proc = await asyncio.create_subprocess_exec(
         *argv,
         env=env,
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -729,6 +735,14 @@ async def fetch_account_usage_async(
                 subscription_date=profile.subscription_date,
             )
 
+        if runner is None and is_windows_platform() and not has_profile_token(profile.home):
+            return AccountUsage(
+                account=profile.name,
+                status="error",
+                error="not authenticated (run 'agym setup --reauth " + profile.name + "')",
+                subscription_date=profile.subscription_date,
+            )
+
         env = build_profile_env(profile.home)
         argv = [
             str(agy_path),
@@ -743,7 +757,7 @@ async def fetch_account_usage_async(
             if runner is not None:
                 code, out, err = await asyncio.wait_for(runner(argv, env, timeout), timeout=timeout)
             else:
-                with profile_credential_context(profile.home):
+                async with async_profile_credential_context(profile.home):
                     code, out, err = await asyncio.wait_for(_default_subprocess_runner(argv, env, timeout), timeout=timeout)
         except asyncio.TimeoutError:
             timeout_str = f"{int(timeout)}s" if timeout.is_integer() else f"{timeout}s"
@@ -842,17 +856,25 @@ class ProgressiveUsageUI:
         self.total = len(self.profiles)
         self._stop_event = asyncio.Event()
 
+    def _safe_write(self, text: str) -> None:
+        try:
+            self.stdout.write(text)
+        except UnicodeEncodeError:
+            encoding = getattr(self.stdout, "encoding", None) or "ascii"
+            safe_text = text.encode(encoding, errors="replace").decode(encoding)
+            self.stdout.write(safe_text)
+
     def on_progress(self, usage: AccountUsage) -> None:
         self.completed[usage.account] = usage
         self.completed_count += 1
         if not self.is_tty:
             if usage.status == "success":
-                self.stdout.write(f"[{self.completed_count}/{self.total}] {usage.account}: completed\n")
+                self._safe_write(f"[{self.completed_count}/{self.total}] {usage.account}: completed\n")
             else:
                 err_msg = usage.error or "unknown error"
                 m = re.search(r"\((.*?)\)", err_msg)
                 short_err = m.group(1) if m else err_msg
-                self.stdout.write(f"[{self.completed_count}/{self.total}] {usage.account}: failed ({short_err})\n")
+                self._safe_write(f"[{self.completed_count}/{self.total}] {usage.account}: failed ({short_err})\n")
             self.stdout.flush()
 
     def _render_title(self) -> str:
@@ -882,7 +904,7 @@ class ProgressiveUsageUI:
             out.append(f"\033[{self.last_lines_count}A\r")
         for line in lines:
             out.append(f"\033[2K{line}\n")
-        self.stdout.write("".join(out))
+        self._safe_write("".join(out))
         self.stdout.flush()
         self.last_lines_count = len(lines)
 
@@ -890,7 +912,7 @@ class ProgressiveUsageUI:
         if not self.is_tty:
             return
         # Hide terminal cursor
-        self.stdout.write("\033[?25l")
+        self._safe_write("\033[?25l")
         self.stdout.flush()
         try:
             while not self._stop_event.is_set():
@@ -903,7 +925,7 @@ class ProgressiveUsageUI:
                 except asyncio.TimeoutError:
                     pass
         finally:
-            self.stdout.write("\033[?25h")
+            self._safe_write("\033[?25h")
             self.stdout.flush()
 
     def finish(self, usages: Sequence[AccountUsage]) -> None:
@@ -924,11 +946,11 @@ class ProgressiveUsageUI:
             for line in lines:
                 out.append(f"\033[2K{line}\n")
             out.append("\033[?25h")
-            self.stdout.write("".join(out))
+            self._safe_write("".join(out))
             self.stdout.flush()
         else:
             lines = [title, ""] + table_lines + [""]
-            self.stdout.write("\n".join(lines))
+            self._safe_write("\n".join(lines))
             self.stdout.flush()
 
 
