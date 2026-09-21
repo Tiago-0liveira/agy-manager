@@ -409,93 +409,94 @@ class ProfileStore:
             return self.get(name)
 
     def rename(self, old_name: str, new_name: str) -> Profile:
-        validate_profile_name(old_name)
-        validate_profile_name(new_name)
-        if old_name == new_name:
-            raise ProfileError(f"cannot rename profile to the same name: '{old_name}'")
+        with self._profile_lock():
+            validate_profile_name(old_name)
+            validate_profile_name(new_name)
+            if old_name == new_name:
+                raise ProfileError(f"cannot rename profile to the same name: '{old_name}'")
 
-        data = self._load()
-        if old_name not in data["profiles"]:
-            raise ProfileNotFound(f"profile not found: {old_name}")
-        if new_name in data["profiles"]:
-            raise ProfileExists(f"profile already exists: {new_name}")
+            data = self._load()
+            if old_name not in data["profiles"]:
+                raise ProfileNotFound(f"profile not found: {old_name}")
+            if new_name in data["profiles"]:
+                raise ProfileExists(f"profile already exists: {new_name}")
 
-        old_dir = self.profiles_root / old_name
-        new_dir = self.profiles_root / new_name
+            old_dir = self.profiles_root / old_name
+            new_dir = self.profiles_root / new_name
 
-        # Refuse to touch anything that does not resolve directly beneath our profiles root.
-        if old_dir.resolve().parent != self.profiles_root.resolve():
-            raise ProfileError(f"refusing unsafe profile path: {old_dir.resolve()}")
-        if new_dir.resolve().parent != self.profiles_root.resolve():
-            raise ProfileError(f"refusing unsafe profile path: {new_dir.resolve()}")
+            # Refuse to touch anything that does not resolve directly beneath our profiles root.
+            if old_dir.resolve().parent != self.profiles_root.resolve():
+                raise ProfileError(f"refusing unsafe profile path: {old_dir.resolve()}")
+            if new_dir.resolve().parent != self.profiles_root.resolve():
+                raise ProfileError(f"refusing unsafe profile path: {new_dir.resolve()}")
 
-        if new_dir.exists():
-            raise ProfileExists(f"target profile directory already exists: {new_dir}")
+            if new_dir.exists():
+                raise ProfileExists(f"target profile directory already exists: {new_dir}")
 
-        dir_moved = False
-        if old_dir.exists():
-            shutil.move(str(old_dir), str(new_dir))
-            dir_moved = True
-            new_home = (new_dir / "home").resolve()
-            _chmod_private_dir(new_dir)
-            if not new_home.exists():
+            dir_moved = False
+            if old_dir.exists():
+                shutil.move(str(old_dir), str(new_dir))
+                dir_moved = True
+                new_home = (new_dir / "home").resolve()
+                _chmod_private_dir(new_dir)
+                if not new_home.exists():
+                    new_home.mkdir(parents=True, exist_ok=True)
+                _chmod_private_dir(new_home)
+            else:
+                self.profiles_root.mkdir(parents=True, exist_ok=True)
+                _chmod_private_dir(self.data_root)
+                _chmod_private_dir(self.profiles_root)
+                new_dir.mkdir(parents=True, exist_ok=True)
+                new_home = (new_dir / "home").resolve()
                 new_home.mkdir(parents=True, exist_ok=True)
-            _chmod_private_dir(new_home)
-        else:
-            self.profiles_root.mkdir(parents=True, exist_ok=True)
-            _chmod_private_dir(self.data_root)
-            _chmod_private_dir(self.profiles_root)
-            new_dir.mkdir(parents=True, exist_ok=True)
-            new_home = (new_dir / "home").resolve()
-            new_home.mkdir(parents=True, exist_ok=True)
-            _chmod_private_dir(new_dir)
-            _chmod_private_dir(new_home)
+                _chmod_private_dir(new_dir)
+                _chmod_private_dir(new_home)
 
-        profile_data = data["profiles"].pop(old_name)
-        profile_data["home"] = str(new_home)
-        data["profiles"][new_name] = profile_data
+            profile_data = data["profiles"].pop(old_name)
+            profile_data["home"] = str(new_home)
+            data["profiles"][new_name] = profile_data
 
-        try:
-            self._save(data)
-        except Exception:
-            if dir_moved and new_dir.exists():
-                try:
-                    shutil.move(str(new_dir), str(old_dir))
-                except OSError:
-                    pass
-            raise
+            try:
+                self._save(data)
+            except Exception:
+                if dir_moved and new_dir.exists():
+                    try:
+                        shutil.move(str(new_dir), str(old_dir))
+                    except OSError:
+                        pass
+                raise
 
-        try:
-            from .cache import CacheManager
+            try:
+                from .cache import CacheManager
 
-            cm = CacheManager(cache_root=self.data_root / "cache")
-            cm.rename(old_name, new_name)
-        except Exception:
-            pass
+                cm = CacheManager(cache_root=self.data_root / "cache")
+                cm.rename(old_name, new_name)
+            except Exception:
+                pass
 
-        try:
-            rot_file = self.data_root / "rotation_state.json"
-            if rot_file.is_file():
-                with rot_file.open("r", encoding="utf-8-sig") as handle:
-                    rot_data = json.load(handle)
-                if isinstance(rot_data, dict):
-                    changed = False
-                    if rot_data.get("last_account") == old_name:
-                        rot_data["last_account"] = new_name
-                        changed = True
-                    if "history" in rot_data and isinstance(rot_data["history"], list):
-                        new_history = [new_name if x == old_name else x for x in rot_data["history"]]
-                        if new_history != rot_data["history"]:
-                            rot_data["history"] = new_history
+            try:
+                rot_file = self.data_root / "rotation_state.json"
+                if rot_file.is_file():
+                    with rot_file.open("r", encoding="utf-8-sig") as handle:
+                        rot_data = json.load(handle)
+                    if isinstance(rot_data, dict):
+                        changed = False
+                        if rot_data.get("last_account") == old_name:
+                            rot_data["last_account"] = new_name
                             changed = True
-                    if changed:
-                        from .rotator import _atomic_save_state, RotationState
+                        if "history" in rot_data and isinstance(rot_data["history"], list):
+                            new_history = [new_name if x == old_name else x for x in rot_data["history"]]
+                            if new_history != rot_data["history"]:
+                                rot_data["history"] = new_history
+                                changed = True
+                        if changed:
+                            from .rotator import _atomic_save_state, RotationState
 
-                        _atomic_save_state(rot_file, RotationState.from_dict(rot_data))
-        except Exception:
-            pass
+                            _atomic_save_state(rot_file, RotationState.from_dict(rot_data))
+            except Exception:
+                pass
 
-        return self.get(new_name)
+            return self.get(new_name)
 
     def remove(self, name: str) -> Path:
         with self._profile_lock():

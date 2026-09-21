@@ -242,6 +242,35 @@ class TestProfileStoreThreadSafety(unittest.TestCase):
         shared = self.store.get("shared_profile")
         self.assertIsNotNone(shared)
 
+    def test_concurrent_threads_rename(self) -> None:
+        """Concurrent rename and create operations must be serialized by profile lock."""
+        num_threads = 6
+        for i in range(num_threads):
+            self.store.create(f"orig_{i}")
+
+        errors: list[tuple[int, Exception]] = []
+
+        def worker(idx: int) -> None:
+            try:
+                # Rename profile
+                self.store.rename(f"orig_{idx}", f"renamed_{idx}")
+                # Create another profile concurrently
+                self.store.create(f"new_{idx}")
+            except Exception as exc:
+                errors.append((idx, exc))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(num_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+
+        self.assertEqual(errors, [], f"Rename thread errors: {errors}")
+        for i in range(num_threads):
+            self.assertFalse(self.store.exists(f"orig_{i}"))
+            self.assertTrue(self.store.exists(f"renamed_{i}"))
+            self.assertTrue(self.store.exists(f"new_{i}"))
+
 
 class TestProfileStoreMultiprocessing(unittest.TestCase):
     """Verifies cross-process locking and concurrency with multiprocessing."""

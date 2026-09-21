@@ -32,6 +32,7 @@ from agym.launcher import (
     AgyNotFound,
     agy_version,
     build_profile_env,
+    cleanup_profile_locks,
     persistent_profile_data_exists,
     resolve_agy,
     resolve_dangerously_skip_permissions,
@@ -522,7 +523,7 @@ class AntigravityProviderAdapter(ProviderAdapter):
             )
 
         # Tier 3: Non-billable CLI model catalog probe
-        env = build_profile_env(profile.home)
+        env = build_profile_env(profile.home, profile_name=profile.name)
         try:
             proc = await asyncio.create_subprocess_exec(
                 str(agy_path),
@@ -601,7 +602,7 @@ class AntigravityProviderAdapter(ProviderAdapter):
         except Exception:
             return []
 
-        env = build_profile_env(profile.home)
+        env = build_profile_env(profile.home, profile_name=profile.name)
         try:
             proc = await asyncio.create_subprocess_exec(
                 str(agy_path),
@@ -753,7 +754,8 @@ class AntigravityProviderAdapter(ProviderAdapter):
             return
 
         # 5. Environment & CWD setup
-        env = build_profile_env(profile.home)
+        cleanup_profile_locks(profile.home)
+        env = build_profile_env(profile.home, profile_name=profile.name)
         cwd = request.working_directory or str(profile.home)
         Path(cwd).mkdir(parents=True, exist_ok=True)
 
