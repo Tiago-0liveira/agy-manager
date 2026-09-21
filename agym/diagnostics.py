@@ -9,12 +9,15 @@ from typing import Iterable
 from . import __version__
 from .launcher import AgyNotFound, agy_version, resolve_agy
 from .profiles import Profile, ProfileStore, unix_permissions_warning
+from .wincred import get_profile_email, has_profile_token, is_windows_platform
 
 KNOWN_CREDENTIAL_FILE = "antigravity-oauth-token"
 
 
 def _credential_state_present(profile: Profile) -> bool:
     # Report presence only; never read credential contents.
+    if has_profile_token(profile.home):
+        return True
     return (profile.home / ".gemini" / "antigravity-cli" / KNOWN_CREDENTIAL_FILE).is_file()
 
 
@@ -72,6 +75,9 @@ def doctor_lines(store: ProfileStore, selected: str | None = None) -> list[str]:
         lines.append(
             f"    credential state file: {'present' if _credential_state_present(profile) else 'not detected'}"
         )
+        email = get_profile_email(profile.home)
+        if email:
+            lines.append(f"    authenticated account: {email}")
         for err in profile.settings.validation_errors:
             lines.append(f"    invalid settings: {err}")
         model_display = profile.settings.model if profile.settings.model else "default"

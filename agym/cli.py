@@ -25,6 +25,7 @@ from .profiles import (
     ProfileStore,
     validate_profile_name,
 )
+from .rotator import AccountRotator, RotationError
 from .subscription import (
     SubscriptionError,
     calculate_subscription_health,
@@ -34,6 +35,7 @@ from .subscription import (
 )
 from .tokens import run_tokens
 from .usage import run_usage
+from .wincred import get_profile_email
 
 USAGE = """agym — Explicit isolated-profile manager for Google Antigravity CLI
 
@@ -41,6 +43,7 @@ Usage:
   agym <command> [arguments...]
   agym <profile> [--] [agy args...]
   agym <profile> --auto-prompt "<prompt>"
+  agym rotate [--file <file>] [--status] [--reset] [--simulate [N]] [-- [agy args...]]
   agym config <profile> [--model <model>|default] [-y|--dsp|--skip-perms|--[no-]dangerously-skip-permissions]
 
 Commands:
@@ -48,6 +51,7 @@ Commands:
   config <profile>                    Configure profile model and permission settings
   edit <profile>                      Edit profile settings (e.g. subscription renewal date)
   list                                List all configured profiles and subscription status
+  rotate                              Rotate through accounts/profiles sequentially and launch
   usage [profiles...]                 Show live model quota usage and subscription health
   tokens [profiles...]                Show token consumption graphs and fleet summary (aliases: token, token-usage)
   remove <profile>                    Delete a profile and its isolated data
@@ -57,6 +61,10 @@ Launching Antigravity:
   agym <profile>                      Launch Antigravity under the specified profile.
                                       Replaces the current process on POSIX, preserving native
                                       terminal, TTY, working directory, and signal handling.
+
+  agym rotate [agy args...]           Rotate to next account/profile and launch Antigravity.
+                                      Ensures non-repeating execution, atomic state updates,
+                                      and cross-platform Chromium lock cleanup on Windows.
 
   agym <profile> [agy args...]        Pass arguments directly to Antigravity.
                                       Example: agym personal -p "explain this codebase"
@@ -148,7 +156,7 @@ def _setup(argv: list[str], store: ProfileStore) -> int:
     print(f"Launching Antigravity to set up profile '{profile.name}'.")
     print(f"Profile home: {profile.home}")
     print("Complete the normal Google sign-in flow, then exit Antigravity.")
-    code = run_agy(agy, profile, replace_process=False)
+    code = run_agy(agy, profile, replace_process=False, is_setup=True)
     if code != 0:
         _print_err(f"agy exited with status {code}; profile was kept for inspection/retry")
         return code
@@ -160,7 +168,9 @@ def _setup(argv: list[str], store: ProfileStore) -> int:
         _print_err("run 'agym doctor %s' and the manual integration test before relying on this profile" % profile.name)
         return 1
 
-    print(f"Profile '{profile.name}' is ready (persistent Antigravity state detected).")
+    email = get_profile_email(profile.home)
+    auth_info = f" ({email})" if email else ""
+    print(f"Profile '{profile.name}' is ready (persistent Antigravity state detected{auth_info}).")
     return 0
 
 
@@ -469,6 +479,83 @@ def _tokens(argv: list[str], store: ProfileStore) -> int:
         return 130
 
 
+def _rotate(argv: list[str], store: ProfileStore) -> int:
+    parser = argparse.ArgumentParser(
+        prog="agym rotate",
+        description="Rotate through configured profiles or an account file sequentially and launch Antigravity.",
+        add_help=True,
+    )
+    parser.add_argument("--status", action="store_true", help="Show current rotation status and history")
+    parser.add_argument("--reset", action="store_true", help="Reset rotation state back to the first account")
+    parser.add_argument(
+        "--simulate",
+        nargs="?",
+        const=3,
+        type=int,
+        metavar="COUNT",
+        help="Simulate COUNT rotation steps without launching agy (default: 3)",
+    )
+    parser.add_argument(
+        "--file",
+        "-f",
+        metavar="FILE",
+        help="Custom account file (txt or json) to rotate through instead of configured profiles",
+    )
+    ns, passthrough = parser.parse_known_args(argv)
+    if passthrough and passthrough[0] == "--":
+        passthrough = passthrough[1:]
+
+    rotator = AccountRotator(store=store, accounts_file=ns.file)
+
+    if ns.reset:
+        rotator.reset()
+        print("Rotation state reset to initial position.")
+        return 0
+
+    if ns.status:
+        st = rotator.get_status()
+        print(f"Total accounts: {st['total_accounts']}")
+        print(f"Accounts: {', '.join(st['accounts']) if st['accounts'] else 'none'}")
+        curr_str = str(st['current_index']) if st['current_index'] is not None else "not started"
+        print(f"Current index: {curr_str}")
+        print(f"Active account: {st['active_account'] or 'none'}")
+        print(f"Next account: {st['next_account'] or 'none'}")
+        print(f"State file: {st['state_file']}")
+        return 0
+
+    if ns.simulate is not None:
+        count = ns.simulate
+        accounts = rotator.get_accounts()
+        if not accounts:
+            _print_err("no accounts available to simulate rotation")
+            return 1
+        print(f"Simulating {count} account rotations across {len(accounts)} accounts:")
+        for _ in range(count):
+            idx, account_id, path = rotator.rotate(cleanup_locks=False)
+            print(f"  Active Account: {account_id} | Resolved Profile Path: {path} | Rotation Index: {idx + 1}/{len(accounts)}")
+        return 0
+
+    accounts = rotator.get_accounts()
+    if not accounts:
+        _print_err("no profiles or accounts configured. Run 'agym setup <profile>' or provide '--file <accounts>'")
+        return 1
+
+    idx, account_id, profile_home = rotator.rotate(cleanup_locks=True)
+    total = len(accounts)
+    print(f"Active Account: {account_id}")
+    print(f"Resolved Profile Path: {profile_home}")
+    print(f"Rotation Index: {idx + 1}/{total}")
+
+    agy = resolve_agy()
+    try:
+        profile = store.get(account_id)
+        return _launch(profile.name, passthrough, store)
+    except ProfileNotFound:
+        from .profiles import Profile
+        profile = Profile(name=account_id, home=profile_home, created_at="standalone")
+        return run_agy(agy, profile, passthrough, replace_process=True)
+
+
 def _parse_auto_prompt(args: list[str]) -> tuple[str | None, list[str]]:
     if not args:
         return None, args
@@ -509,6 +596,14 @@ def _launch(profile_name: str, argv: list[str], store: ProfileStore) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if sys.platform == "win32":
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, "reconfigure"):
+                try:
+                    stream.reconfigure(encoding="utf-8", errors="replace")
+                except Exception:
+                    pass
+
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or args[0] in {"-h", "--help", "help"}:
         print(USAGE.rstrip())
@@ -525,6 +620,8 @@ def main(argv: list[str] | None = None) -> int:
             return _edit(rest, store)
         if command == "list":
             return _list(rest, store)
+        if command == "rotate":
+            return _rotate(rest, store)
         if command == "usage":
             return _usage(rest, store)
         if command in {"token", "tokens", "token-usage"}:

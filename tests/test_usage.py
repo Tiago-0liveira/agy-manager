@@ -507,6 +507,30 @@ class OutputRenderingTests(unittest.TestCase):
         self.assertIn("personal", output)
         self.assertIn("Gemini", output)
 
+    def test_progressive_ui_safe_write_handles_encoding_error(self) -> None:
+        p1 = Profile(name="personal", home=Path("/h1"), created_at="")
+
+        class StrictAsciiWriter:
+            def __init__(self) -> None:
+                self.encoding = "ascii"
+                self.written: list[str] = []
+
+            def write(self, s: str) -> None:
+                # Raise UnicodeEncodeError if non-ascii chars passed
+                s.encode("ascii")
+                self.written.append(s)
+
+            def flush(self) -> None:
+                pass
+
+        writer = StrictAsciiWriter()
+        ui = ProgressiveUsageUI([p1], is_tty=False, stdout=writer)
+        u1 = parse_usage_response(SAMPLE_REAL_RESPONSE, "personal")
+        # Should not raise UnicodeEncodeError even when writing Unicode box characters
+        ui.on_progress(u1)
+        ui.finish([u1])
+        self.assertTrue(len(writer.written) > 0)
+
 
 class TableAndBarStylingTests(unittest.TestCase):
     def test_short_reset_time_abbreviations(self) -> None:
