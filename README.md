@@ -41,6 +41,16 @@ agym setup work
 agym personal
 agym work
 
+# Profile launch configuration
+agym config personal
+agym config personal --model gemini-2.5-flash
+agym config personal --model default
+agym config personal --dangerously-skip-permissions
+agym config personal --no-dangerously-skip-permissions
+
+# Auto-prompt workflow
+agym personal --auto-prompt "make me a plan to change feature A to B"
+
 agym personal -- -p "explain this repository"
 # The `--` is optional with agym's dispatcher:
 agym personal -p "explain this repository"
@@ -90,6 +100,55 @@ agym usage --timeout 45
 │            │                                                           │
 └────────────┴─────────────────────────────┴─────────────────────────────┘
 ```
+
+### Profile Launch Settings
+
+Each profile can be configured with default launch settings using `agym config <profile>`:
+
+- **Model selection**: Set a profile default model using `--model <model>` (e.g. `agym config personal --model gemini-2.5-flash`), or clear it back to the Antigravity default with `agym config personal --model default`.
+- **Permissions**: Automatic permission skipping (`--dangerously-skip-permissions`) is **OFF by default** for all profiles. It can be configured per profile or supplied on invocation:
+  - **Short aliases**: Use `-y`, `--yes`, `--dsp`, or `--skip-perms` as concise shortcuts for `--dangerously-skip-permissions` (both singular `--dangerously-skip-permission` and plural `--dangerously-skip-permissions` are supported).
+  - **Disable aliases**: Use `--no-dsp`, `--no-skip-perms`, `--no-dangerously-skip-permissions`, or `--no-dangerously-skip-permission` to disable.
+  - **Profile configuration**: `agym config <profile> -y` (or `--dsp`, `--skip-perms`, `--dangerously-skip-permissions`) and `agym config <profile> --no-dsp` (or `--no-dangerously-skip-permissions`).
+  - **Invocation shortcut**: `agym personal -y` or `agym personal --dsp` or `agym personal --skip-perms`. `agym` normalizes these aliases and passes the native `--dangerously-skip-permissions` flag to `agy`.
+  - **Environment variables**: Set `DSP=1` or `DANGEROUSLY_SKIP_PERMISSIONS=1` for session/headless bypass. Set to `0` or `false` to disable.
+  - **Precedence Hierarchy**:
+    1. CLI flags (`-y`, `--dsp`, `--skip-perms`, `--no-dsp`, etc.) [Highest priority]
+    2. Environment variables (`DANGEROUSLY_SKIP_PERMISSIONS=1` or `DSP=1`)
+    3. Profile configuration file (`settings.json`)
+    4. Safe default (`false`) [Lowest priority]
+
+### Shell Integration & Aliases
+
+For immediate convenience when invoking Antigravity or `agym` from your shell (`~/.bashrc`, `~/.zshrc`):
+
+```bash
+# Direct Antigravity shortcut with bypass
+alias agyy="agy --dangerously-skip-permissions"
+
+# Profile manager shortcuts with bypass
+alias agymp="agym personal -y"
+alias agymw="agym work -y"
+
+# Wrapper function allowing additional arguments
+agyy-run() {
+  agy --dangerously-skip-permissions "$@"
+}
+```
+
+### Auto-Prompt
+
+The `--auto-prompt` feature runs a two-stage prompt workflow:
+
+```bash
+agym personal --auto-prompt "make me a plan to change feature A to B"
+```
+
+1. `agym` runs the selected profile non-interactively with `agy [profile defaults] --prompt "<USER PROMPT>"`.
+2. Captures the raw response output.
+3. Starts the same profile interactively using `agy [profile defaults] --prompt-interactive "<RAW RESPONSE>"`.
+
+The first stage is non-interactive while the second stage becomes the normal interactive terminal session in the current working directory using the exact same profile, environment, and defaults.
 
 ## Storage
 

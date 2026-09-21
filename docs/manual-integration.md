@@ -97,3 +97,91 @@ Only rely on the fake-home backend after all of these are true:
 - A and B remain different accounts concurrently.
 - Activity/refresh in one profile does not alter the other profile.
 - HOME side effects are acceptable for your development workflow.
+
+## 8. Manual test for profile permissions
+
+Verify safe permissions default:
+
+```bash
+agym config personal --no-dsp
+agym personal
+```
+
+Confirm the `--dangerously-skip-permissions` flag is not implicitly enabled. Tool permission prompts should behave normally.
+
+Then enable dangerous permissions explicitly with short alias:
+
+```bash
+agym config personal -y
+agym personal
+```
+
+Confirm the profile-specific behavior applies (tool permissions are auto-approved). Also verify `--dsp`:
+
+```bash
+agym config personal --dsp
+agym personal
+```
+
+Verify on-the-fly invocation alias overrides default without saving:
+
+```bash
+agym config personal --no-dsp
+agym personal -y
+```
+
+Verify environment variable bypass:
+
+```bash
+DSP=1 agym personal
+```
+
+Reset it afterward to maintain safe defaults:
+
+```bash
+agym config personal --no-dsp
+```
+
+## 9. Manual test for model configuration
+
+Configure a known valid model for the profile:
+
+```bash
+agym config personal --model <known-valid-model>
+agym personal
+```
+
+Confirm Antigravity starts and uses that model.
+
+Then reset to normal default model:
+
+```bash
+agym config personal --model default
+```
+
+Confirm the override is removed and Antigravity uses its normal default model.
+
+## 10. Real OAuth auto-prompt test
+
+Test the two-stage `--auto-prompt` workflow:
+
+```bash
+agym personal --auto-prompt "Make me a concise implementation plan for changing feature A to feature B."
+```
+
+Confirm:
+
+1. The first non-interactive `agy --prompt` call authenticates using the `personal` profile.
+2. Its returned response becomes the initial prompt input to `--prompt-interactive`.
+3. The resulting interactive session also uses the `personal` profile.
+4. Terminal behavior (TTY, resizing, colors, alternate-screen) remains normal.
+5. The current repository working directory is unchanged.
+6. Host Antigravity credentials remain untouched.
+
+Repeat with another profile:
+
+```bash
+agym work --auto-prompt "Make me a concise implementation plan for changing feature A to feature B."
+```
+
+Confirm that the two accounts stay isolated and each stage uses its respective profile authentication.
