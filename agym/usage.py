@@ -109,13 +109,13 @@ def format_short_reset_time(dt: datetime | None, now: datetime | None = None) ->
     """Formats reset time into an abbreviated string.
 
     Examples:
-        - 6d 21h -> "6d+"
+        - 6d 21h -> "6d"
         - 6d 0h  -> "6d"
-        - 4h 17m -> "4h+"
+        - 4h 17m -> "4h"
         - 3h 0m  -> "3h"
-        - 2h 59m -> "2h59m" (less than 3h shows minutes too)
-        - 1h 15m -> "1h15m" (less than 3h shows minutes too)
-        - 1h 5m  -> "1h05m" (less than 3h shows minutes too)
+        - 2h 59m -> "2h"
+        - 1h 15m -> "1h"
+        - 1h 5m  -> "1h"
         - 45m    -> "45m"
         - 9m     -> "9m"
         - <1m    -> "<1m"
@@ -143,11 +143,9 @@ def format_short_reset_time(dt: datetime | None, now: datetime | None = None) ->
     minutes = rem // 60
 
     if days > 0:
-        return f"{days}d+" if hours > 0 else f"{days}d"
-    if hours >= 3:
-        return f"{hours}h+" if minutes > 0 else f"{hours}h"
+        return f"{days}d"
     if hours > 0:
-        return f"{hours}h{minutes:02d}m" if minutes > 0 else f"{hours}h"
+        return f"{hours}h"
     if minutes > 0:
         return f"{minutes}m"
     return "<1m"
@@ -610,10 +608,7 @@ def render_usage_table_lines(
                     )
                     for fam, _ in QUOTA_COLUMNS
                 ]
-                acc_sub = f"· {format_age(usage.age_seconds)}" if usage.cached else ""
-                if len(acc_sub) > acc_col_width:
-                    acc_sub = acc_sub[:acc_col_width]
-                acc_sub_disp = f"\033[90m{acc_sub:<{acc_col_width}}\033[0m" if (use_color and acc_sub) else f"{acc_sub:<{acc_col_width}}"
+                acc_sub_disp = f"{'':<{acc_col_width}}"
                 row_1 = f"│ {usage.account:<{acc_col_width}} │ " + " │ ".join(cells_5h + [sub_cell_1]) + " │"
                 row_2 = f"│ {acc_sub_disp} │ " + " │ ".join(cells_wk + [sub_cell_2]) + " │"
                 lines.append(row_1)
@@ -677,6 +672,13 @@ def sort_profiles(
                 return b.reset_time.timestamp()
             return float("inf")
         return sorted(profiles, key=get_reset_key)
+    if sort_by in ("sub", "subscription"):
+        def get_sub_key(p: Profile) -> float:
+            h = calculate_subscription_health(p.subscription_date)
+            if h.days_remaining is not None:
+                return float(h.days_remaining)
+            return float("inf")
+        return sorted(profiles, key=get_sub_key)
     return list(profiles)
 
 
@@ -1012,12 +1014,6 @@ class ProgressiveUsageUI:
             self.stdout.flush()
 
     def _render_title(self) -> str:
-        cached_count = sum(1 for u in self.completed.values() if u.cached)
-        if cached_count == len(self.completed) and cached_count > 0:
-            max_age = max((u.age_seconds for u in self.completed.values()), default=0.0)
-            return f"Antigravity Usage (Cached {format_age(max_age)})"
-        elif cached_count > 0:
-            return f"Antigravity Usage ({cached_count}/{len(self.completed)} cached)"
         return "Antigravity Usage"
 
     def _render_tty_frame(self, spinner_char: str) -> list[str]:

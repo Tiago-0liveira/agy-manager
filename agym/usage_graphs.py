@@ -7,9 +7,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Sequence
 
-from .cache import format_age
 from .profiles import Profile
-from .subscription import calculate_subscription_health, format_subscription_cells
+from .subscription import (
+    calculate_subscription_health,
+    format_colored_compact_sub,
+    format_compact_sub,
+    format_subscription_cells,
+)
 
 FRACTIONAL_BLOCKS = [" ", "▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"]
 SPARKLINE_GLYPHS = [" ", " ", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
@@ -214,11 +218,8 @@ def render_fleet_summary_banner(
     if telemetry.total_accounts == 0:
         return []
 
-    inner_width = max(60, width - 4)
-    bar_width = max(10, min(24, inner_width - 45))
-
-    g_bar = format_smooth_bar(telemetry.gemini_avg_pct / 100.0, width=bar_width, use_color=use_color)
-    c_bar = format_smooth_bar(telemetry.claude_avg_pct / 100.0, width=bar_width, use_color=use_color)
+    box_width = max(70, min(width, 100))
+    content_width = box_width - 4
 
     dim = "\033[90m" if use_color else ""
     reset = "\033[0m" if use_color else ""
@@ -228,24 +229,71 @@ def render_fleet_summary_banner(
     red = "\033[38;5;196m" if use_color else ""
     cyan = "\033[36m" if use_color else ""
 
-    top_border = f"{dim}╭─{reset} {bold}Fleet Capacity ({telemetry.total_accounts} Accounts){reset} {dim}{'─' * max(0, inner_width - 24 - len(str(telemetry.total_accounts)))}╮{reset}"
-    bottom_border = f"{dim}╰{'─' * (inner_width + 2)}╯{reset}"
+    title = f"Fleet Capacity ({telemetry.total_accounts} Accounts)"
+    dashes_len = max(1, box_width - len(title) - 5)
+    top_border = f"{dim}╭─{reset} {bold}{title}{reset} {dim}{'─' * dashes_len}╮{reset}"
+    bottom_border = f"{dim}╰{'─' * (box_width - 2)}╯{reset}"
 
     stats_part = f"{green}● {telemetry.ready_count} Ready{reset}  {yellow}▲ {telemetry.consuming_count} Active{reset}  {red}✖ {telemetry.depleted_count} Low{reset}"
-    g_line_content = f"Gemini Pool: {g_bar} {telemetry.gemini_avg_pct:4.0f}% avg   {stats_part}"
+    stats_dw = display_width(stats_part)
+
+    # Calculate bar width so line 1 fits within content_width
+    avail_bar = content_width - 27 - stats_dw
+    if avail_bar < 6:
+        stats_part = f"{green}● {telemetry.ready_count}{reset}  {yellow}▲ {telemetry.consuming_count}{reset}  {red}✖ {telemetry.depleted_count}{reset}"
+        stats_dw = display_width(stats_part)
+        avail_bar = content_width - 27 - stats_dw
+    bar_width = max(6, min(16, avail_bar))
+
+    g_bar = format_smooth_bar(telemetry.gemini_avg_pct / 100.0, width=bar_width, use_color=use_color)
+    g_line_content = f"Gemini Pool: {g_bar} {telemetry.gemini_avg_pct:3.0f}% avg   {stats_part}"
     dw_g = display_width(g_line_content)
-    pad_g = " " * max(0, inner_width - dw_g)
+    pad_g = " " * max(0, content_width - dw_g)
     line_1 = f"{dim}│{reset} {g_line_content}{pad_g} {dim}│{reset}"
 
-    c_line_content = f"Claude Pool: {c_bar} {telemetry.claude_avg_pct:4.0f}% avg"
+    c_bar = format_smooth_bar(telemetry.claude_avg_pct / 100.0, width=bar_width, use_color=use_color)
+    c_line_content = f"Claude Pool: {c_bar} {telemetry.claude_avg_pct:3.0f}% avg"
     if telemetry.next_reset_acc and telemetry.next_reset_time_str:
-        reset_info = f"Next Reset: {cyan}{telemetry.next_reset_acc}{reset} in {cyan}{telemetry.next_reset_time_str}{reset}"
+        reset_label = "Next Reset:" if content_width >= 72 else "Next:"
+        reset_info = f"{reset_label} {cyan}{telemetry.next_reset_acc}{reset} in {cyan}{telemetry.next_reset_time_str}{reset}"
         c_line_content += f"   {reset_info}"
     dw_c = display_width(c_line_content)
-    pad_c = " " * max(0, inner_width - dw_c)
+    pad_c = " " * max(0, content_width - dw_c)
     line_2 = f"{dim}│{reset} {c_line_content}{pad_c} {dim}│{reset}"
 
     return [top_border, line_1, line_2, bottom_border]
+
+
+def format_quota_cell_simple(
+    bucket: Any,
+    prefix: str = "5h: ",
+    *,
+    use_color: bool = True,
+    format_short_reset_fn: Any = None,
+) -> str:
+    dim = "\033[90m" if use_color else ""
+    reset = "\033[0m" if use_color else ""
+    if bucket is None:
+        prefix_disp = f"{dim}{prefix}{reset}" if prefix else ""
+        return f"{prefix_disp}{'-':^22}"
+
+    bar = format_smooth_bar(bucket.remaining_fraction, width=10, use_color=use_color)
+    pct = bucket.percentage
+    pct_str = f"{pct:3d}%"
+    rst = format_short_reset_fn(bucket.reset_time) if format_short_reset_fn else "-"
+    rst_fmt = f"{rst:>4}"
+
+    if use_color:
+        color = get_color_for_percentage(float(pct))
+        prefix_disp = f"{dim}{prefix}{reset}" if prefix else ""
+        pct_display = f"{color}{pct_str}{reset}"
+        rst_display = f"\033[36m{rst_fmt}{reset}"
+    else:
+        prefix_disp = prefix
+        pct_display = pct_str
+        rst_display = rst_fmt
+
+    return f"{prefix_disp}{bar} {pct_display} {rst_display}"
 
 
 def render_usage_grid_lines(
@@ -257,102 +305,66 @@ def render_usage_grid_lines(
     use_color: bool = True,
     term_width: int | None = None,
 ) -> list[str]:
-    """Renders Option 2: Multi-column card grid, supporting 2-3 cards side-by-side."""
-    if term_width is None:
-        term_width, _ = shutil.get_terminal_size((100, 24))
-
-    card_width = 32  # width of each card box
-    # compute number of columns (at least 1, max 4)
-    cols = max(1, min(4, term_width // (card_width + 1)))
+    """Renders Option 2: Simple borderless columnar view with Subscription time remaining."""
+    acc_col_width = max(10, max([len(p.name) for p in profiles], default=10))
+    cell_width = 26
 
     dim = "\033[90m" if use_color else ""
     reset = "\033[0m" if use_color else ""
-    cyan = "\033[36m" if use_color else ""
+    bold = "\033[1m" if use_color else ""
     red = "\033[91m" if use_color else ""
 
-    cards: list[list[str]] = []
+    header = (
+        f"{bold}{'Account':<{acc_col_width}}{reset}  "
+        f"{bold}{'Gemini':<{cell_width}}{reset}  "
+        f"{bold}{'Claude & GPT':<{cell_width}}{reset}  "
+        f"{bold}Sub{reset}"
+    )
+    lines: list[str] = [header]
+
     for p in profiles:
         sub_health = calculate_subscription_health(p.subscription_date)
-        sub_str = sub_health.human_remaining.split()[0] if sub_health.human_remaining != "unknown" else "-"
-
-        acc_name = p.name
-        if len(acc_name) > 13:
-            acc_name = acc_name[:11] + ".."
-
-        # Top border: ┌─ name ── 18mo ─┐
-        sub_tag = f" {sub_str} " if sub_str != "-" else ""
-        name_tag = f" {acc_name} "
-        dash_len = max(1, card_width - 4 - len(name_tag) - len(sub_tag))
-        top_line = f"┌─{name_tag}{'─' * dash_len}{sub_tag}─┐"
+        sub_plain = format_compact_sub(sub_health)
+        sub_badge = format_colored_compact_sub(sub_health, use_color=use_color)
+        sub_pad = " " * max(0, 3 - len(sub_plain))
 
         if p.name not in completed_map:
-            c_lines = [
-                top_line,
-                f"│ {'Loading...':<{card_width - 4}} │",
-                f"│ {'':<{card_width - 4}} │",
-                f"│ {'':<{card_width - 4}} │",
-                f"│ {'':<{card_width - 4}} │",
-                f"└{'─' * (card_width - 2)}┘",
-            ]
-            cards.append(c_lines)
+            row_1 = f"{p.name:<{acc_col_width}}  {dim}{'Loading...':<{cell_width}}{reset}  {'':<{cell_width}}  {sub_badge}{sub_pad}"
+            row_2 = f"{'':<{acc_col_width}}  {'':<{cell_width}}  {'':<{cell_width}}     "
+            lines.append(row_1)
+            lines.append(row_2)
             continue
 
         usage = completed_map[p.name]
         if usage.status != "success" and not (usage.status == "quiescent" and usage.groups):
             err_msg = usage.error or "failed"
-            if len(err_msg) > card_width - 6:
-                err_msg = err_msg[: card_width - 9] + "..."
-            c_lines = [
-                top_line,
-                f"│ {red}✗ {err_msg:<{card_width - 6}}{reset} │",
-                f"│ {'':<{card_width - 4}} │",
-                f"│ {'':<{card_width - 4}} │",
-                f"│ {'':<{card_width - 4}} │",
-                f"└{'─' * (card_width - 2)}┘",
-            ]
-            cards.append(c_lines)
+            failed_text = f"✗ Failed: {err_msg}"
+            quota_area = cell_width * 2 + 2
+            if len(failed_text) > quota_area:
+                failed_text = failed_text[: quota_area - 3] + "..."
+            disp_err = f"{red}{failed_text:<{quota_area}}{reset}" if use_color else f"{failed_text:<{quota_area}}"
+            row_1 = f"{p.name:<{acc_col_width}}  {disp_err}  {sub_badge}{sub_pad}"
+            row_2 = f"{'':<{acc_col_width}}  {'':<{cell_width}}  {'':<{cell_width}}     "
+            lines.append(row_1)
+            lines.append(row_2)
             continue
 
         b_g5 = extract_bucket_fn(usage, "gemini", "5h")
-        b_gw = extract_bucket_fn(usage, "gemini", "week")
         b_c5 = extract_bucket_fn(usage, "claude", "5h")
+        g5_cell = format_quota_cell_simple(b_g5, prefix="5h: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
+        c5_cell = format_quota_cell_simple(b_c5, prefix="5h: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
+
+        b_gw = extract_bucket_fn(usage, "gemini", "week")
         b_cw = extract_bucket_fn(usage, "claude", "week")
+        gw_cell = format_quota_cell_simple(b_gw, prefix="Wk: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
+        cw_cell = format_quota_cell_simple(b_cw, prefix="Wk: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
 
-        g5_bar = format_smooth_bar(b_g5.remaining_fraction if b_g5 else 1.0, width=7, use_color=use_color)
-        gw_bar = format_smooth_bar(b_gw.remaining_fraction if b_gw else 1.0, width=7, use_color=use_color)
-        c5_bar = format_smooth_bar(b_c5.remaining_fraction if b_c5 else 1.0, width=7, use_color=use_color)
-        cw_bar = format_smooth_bar(b_cw.remaining_fraction if b_cw else 1.0, width=7, use_color=use_color)
+        row_1 = f"{p.name:<{acc_col_width}}  {g5_cell}  {c5_cell}  {sub_badge}{sub_pad}"
+        row_2 = f"{'':<{acc_col_width}}  {gw_cell}  {cw_cell}     "
+        lines.append(row_1)
+        lines.append(row_2)
 
-        g5_pct = f"{b_g5.percentage if b_g5 else 100:3d}%"
-        gw_pct = f"{b_gw.percentage if b_gw else 100:3d}%"
-        c5_pct = f"{b_c5.percentage if b_c5 else 100:3d}%"
-        cw_pct = f"{b_cw.percentage if b_cw else 100:3d}%"
-
-        g5_rst = format_short_reset_fn(b_g5.reset_time) if b_g5 else ""
-        c5_rst = format_short_reset_fn(b_c5.reset_time) if b_c5 else ""
-
-        rst_tag = f" {cyan}{g5_rst:>4}{reset}" if g5_rst and g5_rst != "-" else "     "
-
-        # 4 content rows
-        r1 = f"│ Gemini 5h: {g5_bar} {g5_pct}{rst_tag} │"
-        r2 = f"│        Wk: {gw_bar} {gw_pct}       │"
-        r3 = f"│ Claude 5h: {c5_bar} {c5_pct}       │"
-        r4 = f"│        Wk: {cw_bar} {cw_pct}       │"
-        bot = f"└{'─' * (card_width - 2)}┘"
-
-        cards.append([top_line, r1, r2, r3, r4, bot])
-
-    # Assemble cards into rows of `cols`
-    output_lines: list[str] = []
-    for i in range(0, len(cards), cols):
-        chunk = cards[i : i + cols]
-        for line_idx in range(6):  # each card has 6 lines
-            row_parts = [card[line_idx] for card in chunk]
-            output_lines.append(" ".join(row_parts))
-        if i + cols < len(cards):
-            output_lines.append("")  # small blank separator between card rows
-
-    return output_lines
+    return lines
 
 
 def render_usage_matrix_lines(
@@ -497,13 +509,13 @@ def render_usage_telemetry_lines(
         reset_tag = f" {cyan}(resets {rst_g5}){reset}" if rst_g5 and rst_g5 != "-" and g5_pct < 50 else ""
 
         sub_health = calculate_subscription_health(p.subscription_date)
-        sub_str = sub_health.human_remaining
+        sub_plain = format_compact_sub(sub_health)
+        sub_colored = format_colored_compact_sub(sub_health, use_color=use_color)
+        sub_pad = " " * max(0, 3 - len(sub_plain))
 
         status_tag = ""
         if getattr(usage, "quiescent", False) or usage.status == "quiescent":
             status_tag = f" {dim}[Idle]{reset}"
-        elif usage.cached:
-            status_tag = f" {dim}[Cached {format_age(usage.age_seconds)}]{reset}"
 
         color_g = get_color_for_percentage(float(g5_pct)) if use_color else ""
         color_c = get_color_for_percentage(float(c5_pct)) if use_color else ""
@@ -513,7 +525,7 @@ def render_usage_telemetry_lines(
             f"Gemini {g5_bar} {color_g}{g5_pct:3d}%{reset}  "
             f"Claude {c5_bar} {color_c}{c5_pct:3d}%{reset}  "
             f"{dim}Wk:{reset} {gw_pct:3d}%  "
-            f"{dim}Sub:{reset} {sub_str:<10}"
+            f"{dim}Sub:{reset} {sub_colored}{sub_pad}"
             f"{reset_tag}{status_tag}"
         )
 

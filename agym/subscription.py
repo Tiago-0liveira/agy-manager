@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import calendar
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 import re
 from typing import Callable
 
@@ -342,6 +342,59 @@ def format_subscription_cells(
         row_2_text = f"{label_date:<{width}}"
 
     return row_1_text, row_2_text
+
+
+def format_compact_sub(
+    health: SubscriptionHealth | None,
+    now: date | None = None,
+) -> str:
+    """Formats subscription remaining duration to at most 3 characters.
+
+    Examples:
+        - 1 month: '1mo'
+        - 6 months: '6mo'
+        - 18 months: '18m'
+        - 14 days: '14d'
+        - 1 day: '1d'
+        - Today / hours remaining: '20h'
+        - Expired: 'exp'
+        - Unset / unknown: '-'
+    """
+    if health is None or health.status == "unknown" or health.date is None:
+        return "-"
+    if health.status == "expired" or (health.days_remaining is not None and health.days_remaining < 0):
+        return "exp"
+    if health.days_remaining == 0:
+        now_dt = datetime.now(timezone.utc)
+        end_of_day = datetime(now_dt.year, now_dt.month, now_dt.day, 23, 59, 59, tzinfo=timezone.utc)
+        rem_hours = max(1, int((end_of_day - now_dt).total_seconds() // 3600))
+        return f"{rem_hours}h"
+    if health.days_remaining is not None:
+        if health.days_remaining < 30:
+            return f"{health.days_remaining}d"
+        if now is None:
+            now = datetime.now().astimezone().date()
+        m, _ = diff_months_days(now, health.date)
+        if m < 1:
+            m = 1
+        if m < 10:
+            return f"{m}mo"
+        return f"{m}m"
+    return "-"
+
+
+def format_colored_compact_sub(
+    health: SubscriptionHealth | None,
+    *,
+    use_color: bool = True,
+    now: date | None = None,
+) -> str:
+    """Returns the compact subscription string colored according to its health rank."""
+    compact = format_compact_sub(health, now=now)
+    if not use_color or health is None:
+        return compact
+    color = health.color_code
+    return f"{color}{compact}{COLOR_RESET}"
 
 
 def prompt_subscription_date(

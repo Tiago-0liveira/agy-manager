@@ -536,40 +536,40 @@ class TableAndBarStylingTests(unittest.TestCase):
     def test_short_reset_time_abbreviations(self) -> None:
         now = datetime(2026, 9, 21, 0, 0, 0, tzinfo=timezone.utc)
 
-        # 6d 21h -> 6d+
+        # 6d 21h -> 6d
         res_6d_plus = format_reset_time(now + timedelta(days=6, hours=21), now=now, short=True)
-        self.assertEqual(res_6d_plus, "6d+")
-        self.assertLessEqual(len(res_6d_plus), 5)
+        self.assertEqual(res_6d_plus, "6d")
+        self.assertLessEqual(len(res_6d_plus), 4)
 
         # 6d 0h -> 6d
         res_6d = format_reset_time(now + timedelta(days=6), now=now, short=True)
         self.assertEqual(res_6d, "6d")
-        self.assertLessEqual(len(res_6d), 5)
+        self.assertLessEqual(len(res_6d), 4)
 
-        # >= 3h: 4h 17m -> 4h+
+        # >= 3h: 4h 17m -> 4h
         res_4h_plus = format_reset_time(now + timedelta(hours=4, minutes=17), now=now, short=True)
-        self.assertEqual(res_4h_plus, "4h+")
-        self.assertLessEqual(len(res_4h_plus), 5)
+        self.assertEqual(res_4h_plus, "4h")
+        self.assertLessEqual(len(res_4h_plus), 4)
 
         # >= 3h: 3h 0m -> 3h
         res_3h = format_reset_time(now + timedelta(hours=3), now=now, short=True)
         self.assertEqual(res_3h, "3h")
-        self.assertLessEqual(len(res_3h), 5)
+        self.assertLessEqual(len(res_3h), 4)
 
-        # < 3h: show minutes too! (2h 59m -> 2h59m)
+        # < 3h: shorter format (2h 59m -> 2h)
         res_2h59m = format_reset_time(now + timedelta(hours=2, minutes=59), now=now, short=True)
-        self.assertEqual(res_2h59m, "2h59m")
-        self.assertLessEqual(len(res_2h59m), 5)
+        self.assertEqual(res_2h59m, "2h")
+        self.assertLessEqual(len(res_2h59m), 4)
 
-        # < 3h: show minutes too! (1h 15m -> 1h15m)
+        # < 3h: shorter format (1h 15m -> 1h)
         res_1h15m = format_reset_time(now + timedelta(hours=1, minutes=15), now=now, short=True)
-        self.assertEqual(res_1h15m, "1h15m")
-        self.assertLessEqual(len(res_1h15m), 5)
+        self.assertEqual(res_1h15m, "1h")
+        self.assertLessEqual(len(res_1h15m), 4)
 
-        # < 3h: show minutes too! (1h 5m -> 1h05m)
+        # < 3h: shorter format (1h 5m -> 1h)
         res_1h05m = format_reset_time(now + timedelta(hours=1, minutes=5), now=now, short=True)
-        self.assertEqual(res_1h05m, "1h05m")
-        self.assertLessEqual(len(res_1h05m), 5)
+        self.assertEqual(res_1h05m, "1h")
+        self.assertLessEqual(len(res_1h05m), 4)
 
         # less than 1 hour: exact minutes (45m)
         res_45m = format_reset_time(now + timedelta(minutes=45, seconds=30), now=now, short=True)
@@ -830,14 +830,15 @@ class CacheUsageIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(a2["cached"])
         self.assertEqual(a2["age_seconds"], 0.0)
 
-    def test_table_rendering_shows_cached_age(self) -> None:
+    def test_table_rendering_no_cached_part(self) -> None:
         from agym.usage import render_usage_table_lines
 
         p1 = Profile(name="p-cached", home=Path("/h1"), created_at="")
         u1 = parse_usage_response(SAMPLE_REAL_RESPONSE, "p-cached", cached=True, age_seconds=42.0)
         lines = render_usage_table_lines([p1], {"p-cached": u1}, use_color=False)
         rendered = "\n".join(lines)
-        self.assertIn("42s ago", rendered)
+        self.assertNotIn("42s ago", rendered)
+        self.assertNotIn("Cached", rendered)
 
     def test_cli_usage_refresh_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -925,7 +926,9 @@ class UsageGraphsTests(unittest.TestCase):
         grid_text = "\n".join(grid_lines)
         self.assertIn("alpha", grid_text)
         self.assertIn("beta", grid_text)
-        self.assertIn("Gemini 5h", grid_text)
+        self.assertIn("Gemini", grid_text)
+        self.assertIn("Claude & GPT", grid_text)
+        self.assertIn("Sub", grid_text)
 
         # 2. Matrix view (Option 2 - ultra dense)
         matrix_lines = render_usage_view_lines(
@@ -963,6 +966,49 @@ class UsageGraphsTests(unittest.TestCase):
 
         sorted_by_name = sort_profiles([p1, p2], completed, sort_by="name")
         self.assertEqual([p.name for p in sorted_by_name], ["alpha", "zebra"])
+
+        # Test sub sorting
+        p_exp = Profile(name="exp_prof", home=Path("/h3"), created_at="", subscription_date="2026-09-25")
+        p_safe = Profile(name="safe_prof", home=Path("/h4"), created_at="", subscription_date="2028-01-01")
+        p_none = Profile(name="none_prof", home=Path("/h5"), created_at="", subscription_date=None)
+        sorted_by_sub = sort_profiles([p_none, p_safe, p_exp], {}, sort_by="sub")
+        self.assertEqual([p.name for p in sorted_by_sub], ["exp_prof", "safe_prof", "none_prof"])
+
+    def test_format_compact_sub(self) -> None:
+        from datetime import date
+        from agym.subscription import calculate_subscription_health, format_compact_sub, format_colored_compact_sub
+
+        now = date(2026, 9, 21)
+        h_unknown = calculate_subscription_health(None, now=now)
+        self.assertEqual(format_compact_sub(h_unknown, now=now), "-")
+
+        h_exp = calculate_subscription_health("2020-01-01", now=now)
+        self.assertEqual(format_compact_sub(h_exp, now=now), "exp")
+
+        h_1d = calculate_subscription_health("2026-09-22", now=now)
+        self.assertEqual(format_compact_sub(h_1d, now=now), "1d")
+
+        h_14d = calculate_subscription_health("2026-10-05", now=now)
+        self.assertEqual(format_compact_sub(h_14d, now=now), "14d")
+
+        h_1mo = calculate_subscription_health("2026-10-25", now=now)
+        self.assertEqual(format_compact_sub(h_1mo, now=now), "1mo")
+
+        h_6mo = calculate_subscription_health("2027-03-21", now=now)
+        self.assertEqual(format_compact_sub(h_6mo, now=now), "6mo")
+
+        h_18m = calculate_subscription_health("2028-03-21", now=now)
+        self.assertEqual(format_compact_sub(h_18m, now=now), "18m")
+
+        # Verify <= 3 chars for all
+        for h in (h_unknown, h_exp, h_1d, h_14d, h_1mo, h_6mo, h_18m):
+            sub_str = format_compact_sub(h, now=now)
+            self.assertLessEqual(len(sub_str), 3)
+
+        # Colored version
+        colored = format_colored_compact_sub(h_18m, use_color=True, now=now)
+        self.assertIn("18m", colored)
+        self.assertIn("\033[", colored)
 
     def test_cli_view_and_sort_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

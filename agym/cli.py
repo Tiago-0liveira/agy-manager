@@ -480,9 +480,9 @@ def _usage(argv: list[str], store: ProfileStore) -> int:
     )
     parser.add_argument(
         "--sort",
-        choices=["default", "quota", "reset", "name"],
+        choices=["default", "quota", "reset", "name", "sub"],
         default="default",
-        help="Sort order for profiles (default, quota, reset, name)",
+        help="Sort order for profiles (default, quota, reset, name, sub)",
     )
     parser.add_argument(
         "--summary",
