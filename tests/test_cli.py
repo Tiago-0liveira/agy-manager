@@ -228,3 +228,78 @@ class CliTests(unittest.TestCase):
             text = out.getvalue()
             self.assertNotIn("created with", text)
             self.assertNotIn("1.2.7", text)
+    @mock.patch("agym.cli.resolve_agy")
+    @mock.patch("agym.cli.run_agy")
+    @mock.patch("agym.cli.persistent_profile_data_exists", return_value=True)
+    @mock.patch("agym.cli.ProfileStore")
+    def test_setup_with_subscription_date(
+        self,
+        Store: mock.Mock,
+        _exists: mock.Mock,
+        run: mock.Mock,
+        resolve: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(Path(tmp) / "config", Path(tmp) / "data")
+            Store.return_value = store
+            resolve.return_value = Path("/real/agy")
+            run.return_value = 0
+
+            code = cli.main(["setup", "my-prof", "--subscription-date", "14/03/2027"])
+            self.assertEqual(code, 0)
+            p = store.get("my-prof")
+            self.assertEqual(p.subscription_date, "2027-03-14")
+
+    @mock.patch("agym.cli.ProfileStore")
+    def test_edit_subscription_date(self, Store: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(Path(tmp) / "config", Path(tmp) / "data")
+            store.create("test-prof")
+            Store.return_value = store
+
+            # Update with flag
+            code = cli.main(["edit", "test-prof", "--subscription-date", "15/04/2027"])
+            self.assertEqual(code, 0)
+            self.assertEqual(store.get("test-prof").subscription_date, "2027-04-15")
+
+            # Clear with flag
+            code = cli.main(["edit", "test-prof", "--clear-subscription-date"])
+            self.assertEqual(code, 0)
+            self.assertIsNone(store.get("test-prof").subscription_date)
+
+            # Invalid date flag returns error 2
+            code = cli.main(["edit", "test-prof", "--subscription-date", "31/02/2027"])
+            self.assertEqual(code, 2)
+
+    @mock.patch("agym.cli.ProfileStore")
+    @mock.patch("agym.cli.prompt_subscription_date")
+    def test_edit_interactive(self, mock_prompt: mock.Mock, Store: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(Path(tmp) / "config", Path(tmp) / "data")
+            store.create("test-prof", subscription_date="2027-03-14")
+            Store.return_value = store
+
+            with mock.patch("sys.stdin.isatty", return_value=True):
+                mock_prompt.return_value = "2028-05-20"
+                code = cli.main(["edit", "test-prof"])
+                self.assertEqual(code, 0)
+                self.assertEqual(store.get("test-prof").subscription_date, "2028-05-20")
+
+    @mock.patch("agym.cli.ProfileStore")
+    @mock.patch("agym.cli.persistent_profile_data_exists", return_value=True)
+    def test_list_formatting(self, _exists: mock.Mock, Store: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(Path(tmp) / "config", Path(tmp) / "data")
+            store.create("p-with-date", subscription_date="2030-01-01")
+            store.create("p-no-date")
+            Store.return_value = store
+
+            import io
+            from unittest.mock import patch
+
+            with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+                code = cli.main(["list"])
+                self.assertEqual(code, 0)
+                out = mock_out.getvalue()
+                self.assertIn("p-with-date\tready; renews 01/01/2030", out)
+                self.assertIn("p-no-date\tready; subscription: unknown", out)

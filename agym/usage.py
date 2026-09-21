@@ -12,6 +12,7 @@ from typing import Any, Callable, Coroutine, Sequence
 
 from .launcher import build_profile_env, resolve_agy
 from .profiles import Profile, ProfileStore
+from .subscription import calculate_subscription_health, format_subscription_cells
 
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -25,9 +26,15 @@ COLOR_RANKS: list[tuple[float, str]] = [
     (0.0,  "\033[38;5;196m"),  # Rank 6: Red (< 10%)
 ]
 
+QUOTA_COLUMNS: list[tuple[str, str]] = [
+    ("gemini", "Gemini"),
+    ("claude", "Claude & GPT"),
+]
+
 TABLE_COLUMNS: list[tuple[str, str]] = [
     ("gemini", "Gemini"),
     ("claude", "Claude & GPT"),
+    ("subscription", "Subscription"),
 ]
 
 
@@ -59,6 +66,7 @@ class AccountUsage:
     status: str  # "success" | "error"
     groups: list[UsageGroup] = field(default_factory=list)
     error: str | None = None
+    subscription_date: str | None = None
 
 
 def parse_iso_datetime(raw: str | None) -> datetime | None:
@@ -198,33 +206,72 @@ def format_colored_bar(
     return f"{dim}[{reset}{color}{filled_str}{reset}{dim}{empty_str}]{reset}"
 
 
-def parse_usage_response(raw_output: str, account: str) -> AccountUsage:
+def parse_usage_response(
+    raw_output: str,
+    account: str,
+    subscription_date: str | None = None,
+) -> AccountUsage:
     if not raw_output or not raw_output.strip():
-        return AccountUsage(account=account, status="error", error="empty response from agy")
+        return AccountUsage(
+            account=account,
+            status="error",
+            error="empty response from agy",
+            subscription_date=subscription_date,
+        )
 
     try:
         payload = json.loads(raw_output)
     except (json.JSONDecodeError, ValueError) as exc:
-        return AccountUsage(account=account, status="error", error=f"malformed JSON response from agy: {exc}")
+        return AccountUsage(
+            account=account,
+            status="error",
+            error=f"malformed JSON response from agy: {exc}",
+            subscription_date=subscription_date,
+        )
 
     if not isinstance(payload, dict):
-        return AccountUsage(account=account, status="error", error="malformed JSON response from agy (not an object)")
+        return AccountUsage(
+            account=account,
+            status="error",
+            error="malformed JSON response from agy (not an object)",
+            subscription_date=subscription_date,
+        )
 
     status = payload.get("status")
     if status != "SUCCESS":
-        return AccountUsage(account=account, status="error", error=f"agy returned status: {status}")
+        return AccountUsage(
+            account=account,
+            status="error",
+            error=f"agy returned status: {status}",
+            subscription_date=subscription_date,
+        )
 
     command = payload.get("command")
     if not isinstance(command, dict) or command.get("name") != "usage":
-        return AccountUsage(account=account, status="error", error="missing or invalid usage command in agy response")
+        return AccountUsage(
+            account=account,
+            status="error",
+            error="missing or invalid usage command in agy response",
+            subscription_date=subscription_date,
+        )
 
     data = command.get("data")
     if not isinstance(data, dict):
-        return AccountUsage(account=account, status="error", error="missing command data in agy response")
+        return AccountUsage(
+            account=account,
+            status="error",
+            error="missing command data in agy response",
+            subscription_date=subscription_date,
+        )
 
     raw_groups = data.get("groups")
     if not isinstance(raw_groups, list):
-        return AccountUsage(account=account, status="error", error="missing groups list in usage data")
+        return AccountUsage(
+            account=account,
+            status="error",
+            error="missing groups list in usage data",
+            subscription_date=subscription_date,
+        )
 
     groups: list[UsageGroup] = []
     for g in raw_groups:
@@ -274,15 +321,39 @@ def parse_usage_response(raw_output: str, account: str) -> AccountUsage:
 
         groups.append(UsageGroup(name=g_name, description=g_desc, buckets=buckets))
 
-    return AccountUsage(account=account, status="success", groups=groups)
+    return AccountUsage(
+        account=account,
+        status="success",
+        groups=groups,
+        subscription_date=subscription_date,
+    )
 
 
 def account_usage_to_dict(usage: AccountUsage) -> dict[str, Any]:
+    if usage.subscription_date:
+        health = calculate_subscription_health(usage.subscription_date)
+        sub_dict: dict[str, Any] = {
+            "date": usage.subscription_date,
+            "days_remaining": health.days_remaining,
+            "human_remaining": health.human_remaining,
+            "rank": health.rank,
+            "status": health.status,
+        }
+    else:
+        sub_dict = {
+            "date": None,
+            "days_remaining": None,
+            "human_remaining": "unknown",
+            "rank": None,
+            "status": "unknown",
+        }
+
     if usage.status != "success":
         return {
             "account": usage.account,
             "status": "error",
             "error": usage.error or "unknown error",
+            "subscription": sub_dict,
         }
 
     groups_data: list[dict[str, Any]] = []
@@ -312,6 +383,7 @@ def account_usage_to_dict(usage: AccountUsage) -> dict[str, Any]:
     return {
         "account": usage.account,
         "status": "success",
+        "subscription": sub_dict,
         "groups": groups_data,
     }
 
@@ -413,7 +485,7 @@ def render_usage_table_lines(
     spinner_pad = 2 if spinner_char else 0
     acc_col_width = max(10, max([len(p.name) + spinner_pad for p in profiles], default=10))
 
-    total_quota_width = cell_width * len(TABLE_COLUMNS) + 3 * (len(TABLE_COLUMNS) - 1)
+    quota_area_width = cell_width * len(QUOTA_COLUMNS) + 3 * (len(QUOTA_COLUMNS) - 1)
 
     top_border = (
         "┌─"
@@ -445,6 +517,11 @@ def render_usage_table_lines(
     lines = [top_border, header_row, divider]
 
     for idx, p in enumerate(profiles):
+        sub_health = calculate_subscription_health(p.subscription_date)
+        sub_cell_1, sub_cell_2 = format_subscription_cells(
+            sub_health, width=cell_width, use_color=use_color
+        )
+
         if p.name in completed_map:
             usage = completed_map[p.name]
             if usage.status == "success":
@@ -457,7 +534,7 @@ def render_usage_table_lines(
                         use_color=use_color,
                         target_width=cell_width,
                     )
-                    for fam, _ in TABLE_COLUMNS
+                    for fam, _ in QUOTA_COLUMNS
                 ]
                 # Row 2: Week limit (below the 5h)
                 cells_wk = [
@@ -468,34 +545,34 @@ def render_usage_table_lines(
                         use_color=use_color,
                         target_width=cell_width,
                     )
-                    for fam, _ in TABLE_COLUMNS
+                    for fam, _ in QUOTA_COLUMNS
                 ]
-                row_1 = f"│ {usage.account:<{acc_col_width}} │ " + " │ ".join(cells_5h) + " │"
-                row_2 = f"│ {'':<{acc_col_width}} │ " + " │ ".join(cells_wk) + " │"
+                row_1 = f"│ {usage.account:<{acc_col_width}} │ " + " │ ".join(cells_5h + [sub_cell_1]) + " │"
+                row_2 = f"│ {'':<{acc_col_width}} │ " + " │ ".join(cells_wk + [sub_cell_2]) + " │"
                 lines.append(row_1)
                 lines.append(row_2)
             else:
                 err_msg = usage.error or "unknown error"
                 failed_text = f"✗ Failed: {err_msg}"
-                if len(failed_text) > total_quota_width:
-                    failed_text = failed_text[: total_quota_width - 3] + "..."
+                if len(failed_text) > quota_area_width:
+                    failed_text = failed_text[: quota_area_width - 3] + "..."
                 if use_color:
-                    failed_display = f"\033[91m{failed_text:<{total_quota_width}}\033[0m"
+                    failed_display = f"\033[91m{failed_text:<{quota_area_width}}\033[0m"
                 else:
-                    failed_display = f"{failed_text:<{total_quota_width}}"
-                row_1 = f"│ {usage.account:<{acc_col_width}} │ {failed_display} │"
-                row_2 = f"│ {'':<{acc_col_width}} │ {'':<{total_quota_width}} │"
+                    failed_display = f"{failed_text:<{quota_area_width}}"
+                row_1 = f"│ {usage.account:<{acc_col_width}} │ {failed_display} │ {sub_cell_1} │"
+                row_2 = f"│ {'':<{acc_col_width}} │ {'':<{quota_area_width}} │ {sub_cell_2} │"
                 lines.append(row_1)
                 lines.append(row_2)
         else:
             loading_text = "Loading..."
             if use_color:
-                loading_display = f"\033[90m{loading_text:<{total_quota_width}}\033[0m"
+                loading_display = f"\033[90m{loading_text:<{quota_area_width}}\033[0m"
             else:
-                loading_display = f"{loading_text:<{total_quota_width}}"
+                loading_display = f"{loading_text:<{quota_area_width}}"
             acc_str = f"{spinner_char} {p.name}" if spinner_char else p.name
-            row_1 = f"│ {acc_str:<{acc_col_width}} │ {loading_display} │"
-            row_2 = f"│ {'':<{acc_col_width}} │ {'':<{total_quota_width}} │"
+            row_1 = f"│ {acc_str:<{acc_col_width}} │ {loading_display} │ {sub_cell_1} │"
+            row_2 = f"│ {'':<{acc_col_width}} │ {'':<{quota_area_width}} │ {sub_cell_2} │"
             lines.append(row_1)
             lines.append(row_2)
 
@@ -590,6 +667,7 @@ async def fetch_account_usage_async(
                 account=profile.name,
                 status="error",
                 error=f"profile home directory does not exist: {profile.home}",
+                subscription_date=profile.subscription_date,
             )
 
         env = build_profile_env(profile.home)
@@ -611,12 +689,14 @@ async def fetch_account_usage_async(
                 account=profile.name,
                 status="error",
                 error=f"timed out after {timeout_str}",
+                subscription_date=profile.subscription_date,
             )
         except Exception as exc:
             return AccountUsage(
                 account=profile.name,
                 status="error",
                 error=f"failed to execute agy: {exc}",
+                subscription_date=profile.subscription_date,
             )
 
         if code != 0:
@@ -627,9 +707,14 @@ async def fetch_account_usage_async(
                 account=profile.name,
                 status="error",
                 error=f"agy exited with status {code}{detail}",
+                subscription_date=profile.subscription_date,
             )
 
-        return parse_usage_response(out, account=profile.name)
+        return parse_usage_response(
+            out,
+            account=profile.name,
+            subscription_date=profile.subscription_date,
+        )
 
 
 async def fetch_all_usage(

@@ -95,6 +95,60 @@ class ProfileTests(unittest.TestCase):
         self.assertFalse(p.settings.dangerously_skip_permissions)
         self.assertEqual(p.settings.validation_errors, ())
 
+    def test_reserved_profile_names(self) -> None:
+        for reserved in ["setup", "list", "remove", "doctor", "usage", "edit", "help"]:
+            with self.subTest(reserved=reserved), self.assertRaises(InvalidProfileName):
+                validate_profile_name(reserved)
+
+    def test_subscription_date_persistence_and_editing(self) -> None:
+        # Create with subscription date
+        p1 = self.store.create("with-date", subscription_date="2027-03-14")
+        self.assertEqual(p1.subscription_date, "2027-03-14")
+        self.assertEqual(self.store.get("with-date").subscription_date, "2027-03-14")
+
+        # Create without subscription date
+        p2 = self.store.create("no-date")
+        self.assertIsNone(p2.subscription_date)
+        self.assertIsNone(self.store.get("no-date").subscription_date)
+
+        # Update / add date to profile that had none
+        updated = self.store.set_subscription_date("no-date", "2026-12-01")
+        self.assertEqual(updated.subscription_date, "2026-12-01")
+        self.assertEqual(self.store.get("no-date").subscription_date, "2026-12-01")
+
+        # Edit existing date
+        updated2 = self.store.set_subscription_date("with-date", "2028-01-01")
+        self.assertEqual(updated2.subscription_date, "2028-01-01")
+        self.assertEqual(self.store.get("with-date").subscription_date, "2028-01-01")
+
+        # Clear date back to None
+        cleared = self.store.set_subscription_date("with-date", None)
+        self.assertIsNone(cleared.subscription_date)
+        self.assertIsNone(self.store.get("with-date").subscription_date)
+
+    def test_legacy_profile_config_compatibility(self) -> None:
+        # Simulate an older config.json written before this feature
+        legacy_data = {
+            "version": 1,
+            "profiles": {
+                "legacy-account": {
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "home": str(self.store.profiles_root / "legacy-account" / "home"),
+                    "agy_version": "agy 1.2.0",
+                }
+            },
+        }
+        self.store.config_path.parent.mkdir(parents=True, exist_ok=True)
+        self.store.config_path.write_text(json.dumps(legacy_data), encoding="utf-8")
+
+        p = self.store.get("legacy-account")
+        self.assertEqual(p.name, "legacy-account")
+        self.assertIsNone(p.subscription_date)
+
+        all_profiles = self.store.list()
+        self.assertEqual(len(all_profiles), 1)
+        self.assertIsNone(all_profiles[0].subscription_date)
+
     def test_explicit_settings_loading(self) -> None:
         data = {
             "version": 1,

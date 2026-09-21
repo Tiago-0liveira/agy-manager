@@ -28,6 +28,9 @@ class ProfileExists(ProfileError):
     pass
 
 
+RESERVED_NAMES = {"setup", "list", "remove", "doctor", "usage", "edit", "help", "config"}
+
+
 class ProfileNotFound(ProfileError):
     pass
 
@@ -96,6 +99,7 @@ class Profile:
     home: Path
     created_at: str
     settings: ProfileSettings = field(default_factory=ProfileSettings)
+    subscription_date: str | None = None
 
 
 def validate_profile_name(name: str) -> str:
@@ -183,7 +187,12 @@ class ProfileStore:
     def _save(self, data: dict[str, Any]) -> None:
         _write_json_private(self.config_path, data)
 
-    def create(self, name: str) -> Profile:
+    def create(
+        self,
+        name: str,
+        settings: ProfileSettings | None = None,
+        subscription_date: str | None = None,
+    ) -> Profile:
         validate_profile_name(name)
         data = self._load()
         if name in data["profiles"]:
@@ -203,12 +212,14 @@ class ProfileStore:
             name=name,
             home=home.resolve(),
             created_at=datetime.now(timezone.utc).isoformat(),
-            settings=ProfileSettings(),
+            settings=settings or ProfileSettings(),
+            subscription_date=subscription_date,
         )
         data["profiles"][name] = {
             "created_at": profile.created_at,
             "home": str(profile.home),
             "settings": profile.settings.to_dict(),
+            "subscription_date": profile.subscription_date,
         }
         try:
             self._save(data)
@@ -228,6 +239,7 @@ class ProfileStore:
             home=Path(raw["home"]),
             created_at=raw["created_at"],
             settings=ProfileSettings.from_dict(raw.get("settings")),
+            subscription_date=raw.get("subscription_date"),
         )
 
     def list(self) -> list[Profile]:
@@ -241,6 +253,7 @@ class ProfileStore:
                     home=Path(raw["home"]),
                     created_at=raw["created_at"],
                     settings=ProfileSettings.from_dict(raw.get("settings")),
+                    subscription_date=raw.get("subscription_date"),
                 )
             )
         return result
@@ -251,6 +264,15 @@ class ProfileStore:
         if name not in data["profiles"]:
             raise ProfileNotFound(f"profile not found: {name}")
         data["profiles"][name]["settings"] = settings.to_dict()
+        self._save(data)
+        return self.get(name)
+
+    def set_subscription_date(self, name: str, subscription_date: str | None) -> Profile:
+        validate_profile_name(name)
+        data = self._load()
+        if name not in data["profiles"]:
+            raise ProfileNotFound(f"profile not found: {name}")
+        data["profiles"][name]["subscription_date"] = subscription_date
         self._save(data)
         return self.get(name)
 

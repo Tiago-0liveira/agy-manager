@@ -24,10 +24,18 @@ from .profiles import (
     ProfileStore,
     validate_profile_name,
 )
+from .subscription import (
+    SubscriptionError,
+    calculate_subscription_health,
+    format_iso_date,
+    format_user_date,
+    prompt_subscription_date,
+)
 from .usage import run_usage
 
 USAGE = """usage:
-  agym setup <profile>
+  agym setup <profile> [--subscription-date DATE]
+  agym edit <profile> [--subscription-date DATE | --clear-subscription-date]
   agym <profile> [--] [agy args...]
   agym <profile> --auto-prompt "<prompt>"
   agym config <profile> [--model <model>|default] [-y|--dsp|--skip-perms|--[no-]dangerously-skip-permissions]
@@ -45,12 +53,27 @@ def _print_err(message: str) -> None:
 def _setup(argv: list[str], store: ProfileStore) -> int:
     parser = argparse.ArgumentParser(prog="agym setup", add_help=True)
     parser.add_argument("profile")
+    parser.add_argument(
+        "--subscription-date",
+        "-s",
+        help="subscription renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)",
+    )
     ns = parser.parse_args(argv)
     validate_profile_name(ns.profile)
 
+    subscription_date = None
+    if ns.subscription_date is not None:
+        try:
+            subscription_date = format_iso_date(ns.subscription_date)
+        except SubscriptionError as exc:
+            _print_err(str(exc))
+            return 2
+    elif sys.stdin.isatty():
+        subscription_date = prompt_subscription_date(existing=None)
+
     # Resolve the host binary before constructing or using the isolated HOME.
     agy = resolve_agy()
-    profile = store.create(ns.profile)
+    profile = store.create(ns.profile, subscription_date=subscription_date)
 
     print(f"Launching Antigravity to set up profile '{profile.name}'.")
     print(f"Profile home: {profile.home}")
@@ -137,6 +160,57 @@ def _config(argv: list[str], store: ProfileStore) -> int:
     return 0
 
 
+def _edit(argv: list[str], store: ProfileStore) -> int:
+    parser = argparse.ArgumentParser(prog="agym edit", add_help=True)
+    parser.add_argument("profile")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--subscription-date",
+        "-s",
+        help="subscription renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)",
+    )
+    group.add_argument(
+        "--clear-subscription-date",
+        action="store_true",
+        help="clear the stored subscription date",
+    )
+    ns = parser.parse_args(argv)
+    validate_profile_name(ns.profile)
+    profile = store.get(ns.profile)
+
+    if ns.clear_subscription_date:
+        store.set_subscription_date(profile.name, None)
+        print(f"Cleared subscription date for profile '{profile.name}'.")
+        return 0
+
+    if ns.subscription_date is not None:
+        try:
+            canonical = format_iso_date(ns.subscription_date)
+        except SubscriptionError as exc:
+            _print_err(str(exc))
+            return 2
+        store.set_subscription_date(profile.name, canonical)
+        print(f"Updated subscription date for profile '{profile.name}' to {format_user_date(canonical)}.")
+        return 0
+
+    # Interactive prompt if no flag supplied
+    if not sys.stdin.isatty():
+        _print_err("interactive editing requires a terminal; use --subscription-date or --clear-subscription-date")
+        return 2
+
+    new_date = prompt_subscription_date(existing=profile.subscription_date)
+    if new_date == profile.subscription_date:
+        print("Subscription date unchanged.")
+        return 0
+
+    store.set_subscription_date(profile.name, new_date)
+    if new_date is None:
+        print(f"Subscription date for profile '{profile.name}' cleared.")
+    else:
+        print(f"Updated subscription date for profile '{profile.name}' to {format_user_date(new_date)}.")
+    return 0
+
+
 def _list(argv: list[str], store: ProfileStore) -> int:
     if argv:
         raise ProfileError("'agym list' takes no arguments")
@@ -146,9 +220,20 @@ def _list(argv: list[str], store: ProfileStore) -> int:
         return 0
     for profile in profiles:
         state = "ready" if persistent_profile_data_exists(profile) else "no-state"
+        if profile.subscription_date:
+            health = calculate_subscription_health(profile.subscription_date)
+            date_disp = format_user_date(profile.subscription_date)
+            if health.status == "expired":
+                sub_info = f"; {health.human_remaining} ({date_disp})"
+            elif health.status == "critical" and health.days_remaining == 0:
+                sub_info = f"; expires today ({date_disp})"
+            else:
+                sub_info = f"; renews {date_disp} ({health.human_remaining})"
+        else:
+            sub_info = "; subscription: unknown"
         model_str = profile.settings.model or "default"
         perm_str = "skip" if profile.settings.dangerously_skip_permissions else "normal"
-        print(f"{profile.name}\t{state}\tmodel={model_str}\tpermissions={perm_str}")
+        print(f"{profile.name}\t{state}{sub_info}\tmodel={model_str}\tpermissions={perm_str}")
     return 0
 
 
@@ -269,6 +354,8 @@ def main(argv: list[str] | None = None) -> int:
             return _setup(rest, store)
         if command == "config":
             return _config(rest, store)
+        if command == "edit":
+            return _edit(rest, store)
         if command == "list":
             return _list(rest, store)
         if command == "usage":
@@ -278,7 +365,7 @@ def main(argv: list[str] | None = None) -> int:
         if command == "doctor":
             return _doctor(rest, store)
         return _launch(command, rest, store)
-    except (InvalidProfileName, ProfileExists, ProfileNotFound, ProfileError, AgyNotFound) as exc:
+    except (InvalidProfileName, ProfileExists, ProfileNotFound, ProfileError, AgyNotFound, SubscriptionError) as exc:
         _print_err(str(exc))
         return 2
     except KeyboardInterrupt:
