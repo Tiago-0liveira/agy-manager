@@ -104,6 +104,12 @@ def build_profile_env(
         if candidate.is_file():
             env["GIT_CONFIG_GLOBAL"] = str(candidate)
 
+    # Preserve the host's GitHub CLI config for credentials and gh CLI operations.
+    if "GH_CONFIG_DIR" not in env and host_home:
+        candidate_gh = Path(host_home) / ".config" / "gh"
+        if candidate_gh.is_dir():
+            env["GH_CONFIG_DIR"] = str(candidate_gh)
+
     return env
 
 
