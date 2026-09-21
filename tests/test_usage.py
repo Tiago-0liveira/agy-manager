@@ -853,3 +853,147 @@ class CacheUsageIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 mock_run.assert_called_once()
                 self.assertTrue(mock_run.call_args.kwargs["refresh"])
 
+
+class UsageGraphsTests(unittest.TestCase):
+    def test_smooth_fractional_bar_formatting(self) -> None:
+        from agym.usage_graphs import format_smooth_bar
+
+        # 0% empty
+        self.assertEqual(format_smooth_bar(0.0, 10, use_color=False), "[░░░░░░░░░░]")
+        # 100% full
+        self.assertEqual(format_smooth_bar(1.0, 10, use_color=False), "[██████████]")
+        # 50% half
+        self.assertEqual(format_smooth_bar(0.5, 10, use_color=False), "[█████░░░░░]")
+        # 5% should show a fractional block (▌), not empty!
+        self.assertEqual(format_smooth_bar(0.05, 10, use_color=False), "[▌░░░░░░░░░]")
+        # 84% should show 8 full blocks + fractional ▍ + empty
+        self.assertEqual(format_smooth_bar(0.84, 10, use_color=False), "[████████▍░]")
+
+    def test_sparkline_and_micro_bar(self) -> None:
+        from agym.usage_graphs import format_micro_bar, format_sparkline_glyph
+
+        # Sparkline glyphs
+        self.assertEqual(format_sparkline_glyph(0.0, use_color=False), " ")
+        self.assertEqual(format_sparkline_glyph(1.0, use_color=False), "█")
+
+        # Micro bar
+        self.assertEqual(format_micro_bar(1.0, 5, use_color=False), "▰▰▰▰▰")
+        self.assertEqual(format_micro_bar(0.0, 5, use_color=False), "▱▱▱▱▱")
+        self.assertEqual(format_micro_bar(0.6, 5, use_color=False), "▰▰▰▱▱")
+
+    def test_compute_fleet_telemetry(self) -> None:
+        from agym.usage import extract_quota_bucket
+        from agym.usage_graphs import compute_fleet_telemetry
+
+        u1 = parse_usage_response(SAMPLE_REAL_RESPONSE, "acc1")
+        u2 = parse_usage_response(SAMPLE_REAL_RESPONSE, "acc2")
+        u3 = AccountUsage(account="acc3", status="error", error="session expired")
+
+        telemetry = compute_fleet_telemetry({"acc1": u1, "acc2": u2, "acc3": u3}, extract_quota_bucket)
+        self.assertEqual(telemetry.total_accounts, 3)
+        self.assertGreater(telemetry.gemini_avg_pct, 50.0)
+        self.assertEqual(telemetry.claude_avg_pct, 100.0)
+        self.assertEqual(telemetry.ready_count, 2)
+        self.assertEqual(telemetry.depleted_count, 1)
+
+    def test_render_fleet_summary_banner(self) -> None:
+        from agym.usage import extract_quota_bucket
+        from agym.usage_graphs import compute_fleet_telemetry, render_fleet_summary_banner
+
+        u1 = parse_usage_response(SAMPLE_REAL_RESPONSE, "acc1")
+        telemetry = compute_fleet_telemetry({"acc1": u1}, extract_quota_bucket)
+        lines = render_fleet_summary_banner(telemetry, width=80, use_color=False)
+        self.assertGreater(len(lines), 2)
+        banner_text = "\n".join(lines)
+        self.assertIn("Fleet Capacity", banner_text)
+        self.assertIn("Gemini Pool", banner_text)
+        self.assertIn("Claude Pool", banner_text)
+
+    def test_render_views(self) -> None:
+        from agym.usage import render_usage_view_lines
+
+        p1 = Profile(name="alpha", home=Path("/h1"), created_at="")
+        p2 = Profile(name="beta", home=Path("/h2"), created_at="")
+        u1 = parse_usage_response(SAMPLE_REAL_RESPONSE, "alpha")
+        u2 = parse_usage_response(SAMPLE_REAL_RESPONSE, "beta")
+        completed = {"alpha": u1, "beta": u2}
+
+        # 1. Grid view (Option 2)
+        grid_lines = render_usage_view_lines(
+            [p1, p2], completed, view="grid", use_color=False, term_width=100
+        )
+        grid_text = "\n".join(grid_lines)
+        self.assertIn("alpha", grid_text)
+        self.assertIn("beta", grid_text)
+        self.assertIn("Gemini 5h", grid_text)
+
+        # 2. Matrix view (Option 2 - ultra dense)
+        matrix_lines = render_usage_view_lines(
+            [p1, p2], completed, view="matrix", use_color=False, term_width=100
+        )
+        matrix_text = "\n".join(matrix_lines)
+        self.assertIn("Fleet Heatmap Matrix", matrix_text)
+        self.assertIn("alpha", matrix_text)
+        self.assertIn("Legend:", matrix_text)
+
+        # 3. Telemetry view (Option 3 - executive tiers)
+        tele_lines = render_usage_view_lines(
+            [p1, p2], completed, view="telemetry", use_color=False, term_width=100
+        )
+        tele_text = "\n".join(tele_lines)
+        self.assertIn("READY TO USE", tele_text)
+        self.assertIn("Recommendation:", tele_text)
+
+        # 4. Table view (Option 1)
+        table_lines = render_usage_view_lines(
+            [p1, p2], completed, view="table", use_color=False, term_width=100
+        )
+        table_text = "\n".join(table_lines)
+        self.assertIn("Account", table_text)
+        self.assertIn("Gemini", table_text)
+
+    def test_profile_sorting(self) -> None:
+        from agym.usage import sort_profiles
+
+        p1 = Profile(name="zebra", home=Path("/h1"), created_at="")
+        p2 = Profile(name="alpha", home=Path("/h2"), created_at="")
+        u1 = parse_usage_response(SAMPLE_REAL_RESPONSE, "zebra")
+        u2 = parse_usage_response(SAMPLE_REAL_RESPONSE, "alpha")
+        completed = {"zebra": u1, "alpha": u2}
+
+        sorted_by_name = sort_profiles([p1, p2], completed, sort_by="name")
+        self.assertEqual([p.name for p in sorted_by_name], ["alpha", "zebra"])
+
+    def test_cli_view_and_sort_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = ProfileStore(config_root=tmp_path / "config", data_root=tmp_path / "data")
+            store.create("p1")
+
+            with mock.patch("agym.cli.ProfileStore", return_value=store), \
+                 mock.patch("agym.cli.resolve_agy", return_value=Path("/fake/agy")), \
+                 mock.patch("agym.cli.run_usage", return_value=[]) as mock_run:
+                code = cli.main(["usage", "--grid", "--sort", "quota", "--no-summary"])
+                self.assertEqual(code, 0)
+                mock_run.assert_called_once()
+                self.assertEqual(mock_run.call_args.kwargs["view"], "grid")
+                self.assertEqual(mock_run.call_args.kwargs["sort_by"], "quota")
+                self.assertFalse(mock_run.call_args.kwargs["include_summary"])
+
+            with mock.patch("agym.cli.ProfileStore", return_value=store), \
+                 mock.patch("agym.cli.resolve_agy", return_value=Path("/fake/agy")), \
+                 mock.patch("agym.cli.run_usage", return_value=[]) as mock_run:
+                code = cli.main(["usage", "-t"])
+                self.assertEqual(code, 0)
+                mock_run.assert_called_once()
+                self.assertEqual(mock_run.call_args.kwargs["view"], "telemetry")
+
+            with mock.patch("agym.cli.ProfileStore", return_value=store), \
+                 mock.patch("agym.cli.resolve_agy", return_value=Path("/fake/agy")), \
+                 mock.patch("agym.cli.run_usage", return_value=[]) as mock_run:
+                code = cli.main(["usage", "-m"])
+                self.assertEqual(code, 0)
+                mock_run.assert_called_once()
+                self.assertEqual(mock_run.call_args.kwargs["view"], "matrix")
+
+

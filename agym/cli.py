@@ -98,9 +98,15 @@ Command Options:
       --name, --rename NEW_NAME       Rename the profile to a new name
       -s, --subscription-date DATE    Set renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)
       --clear-subscription-date       Remove stored subscription date
-  agym usage [--json] [-f, --refresh] [--timeout SECONDS] [profiles...]
+  agym usage [--json] [-f, --refresh] [-v, --view {table,grid,matrix,telemetry}] [--sort {default,quota,reset,name}] [--timeout SECONDS] [profiles...]
       --json                          Output quota and subscription data in JSON format
       -f, --refresh                   Bypass cache and force live query
+      -v, --view VIEW                 Visual graph layout: table (default), grid, matrix, or telemetry
+      -g, --grid                      Shortcut for --view grid (multi-column card dashboard)
+      -m, --matrix                    Shortcut for --view matrix (ultra-dense heatmap for dozens of accounts)
+      -t, --telemetry                 Shortcut for --view telemetry (executive tiered view & recommendation)
+      --sort CRITERION                Sort accounts by: default, quota, reset, or name
+      --no-summary                    Hide top fleet capacity summary banner
       --timeout SECONDS               Per-profile query timeout in seconds (default: 30)
 
   agym tokens [--json] [-b, --breakdown] [-f, --refresh] [profiles...]
@@ -437,6 +443,56 @@ def _usage(argv: list[str], store: ProfileStore) -> int:
         help="Bypass cache and force live query",
     )
     parser.add_argument(
+        "--view",
+        "-v",
+        choices=["table", "grid", "matrix", "telemetry"],
+        default="table",
+        help="Visual graph layout style: table (default), grid, matrix, or telemetry",
+    )
+    parser.add_argument(
+        "--grid",
+        "-g",
+        action="store_const",
+        dest="view",
+        const="grid",
+        help="Shortcut for --view grid (multi-column card dashboard)",
+    )
+    parser.add_argument(
+        "--matrix",
+        "-m",
+        action="store_const",
+        dest="view",
+        const="matrix",
+        help="Shortcut for --view matrix (ultra-dense heatmap for dozens of accounts)",
+    )
+    parser.add_argument(
+        "--telemetry",
+        "-t",
+        action="store_const",
+        dest="view",
+        const="telemetry",
+        help="Shortcut for --view telemetry (executive tiered view & recommendations)",
+    )
+    parser.add_argument(
+        "--sort",
+        choices=["default", "quota", "reset", "name"],
+        default="default",
+        help="Sort order for profiles (default, quota, reset, name)",
+    )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        dest="include_summary",
+        default=None,
+        help="Show top fleet capacity summary banner",
+    )
+    parser.add_argument(
+        "--no-summary",
+        action="store_false",
+        dest="include_summary",
+        help="Hide top fleet capacity summary banner",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=30.0,
@@ -468,6 +524,12 @@ def _usage(argv: list[str], store: ProfileStore) -> int:
     }
     if ns.refresh:
         kwargs["refresh"] = True
+    if ns.view != "table":
+        kwargs["view"] = ns.view
+    if ns.sort != "default":
+        kwargs["sort_by"] = ns.sort
+    if ns.include_summary is not None:
+        kwargs["include_summary"] = ns.include_summary
     try:
         asyncio.run(run_usage(agy, profiles, **kwargs))
         return 0

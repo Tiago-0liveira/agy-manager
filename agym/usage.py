@@ -14,6 +14,17 @@ from .cache import CacheManager, TTL_USAGE_SECONDS, format_age, format_freshness
 from .launcher import build_profile_env, resolve_agy
 from .profiles import Profile, ProfileStore
 from .subscription import calculate_subscription_health, format_subscription_cells
+from .usage_graphs import (
+    FleetTelemetry,
+    compute_fleet_telemetry,
+    format_micro_bar,
+    format_smooth_bar,
+    format_sparkline_glyph,
+    render_fleet_summary_banner,
+    render_usage_grid_lines,
+    render_usage_matrix_lines,
+    render_usage_telemetry_lines,
+)
 from .wincred import (
     async_profile_credential_context,
     has_profile_token,
@@ -197,7 +208,10 @@ def format_colored_bar(
     width: int = 10,
     *,
     use_color: bool = True,
+    smooth: bool = False,
 ) -> str:
+    if smooth:
+        return format_smooth_bar(fraction, width=width, use_color=use_color)
     clamped = max(0.0, min(1.0, fraction))
     filled_count = round(clamped * width)
     filled_count = max(0, min(width, filled_count))
@@ -485,6 +499,7 @@ def format_quota_cell(
     bar_width: int = 10,
     *,
     use_color: bool = True,
+    smooth: bool = False,
     target_width: int = 27,
 ) -> str:
     content_width = target_width - len(prefix)
@@ -494,7 +509,9 @@ def format_quota_cell(
         prefix_disp = f"{dim}{prefix}{reset}" if prefix else ""
         return f"{prefix_disp}{'-':^{content_width}}"
 
-    bar = format_colored_bar(bucket.remaining_fraction, width=bar_width, use_color=use_color)
+    bar = format_colored_bar(
+        bucket.remaining_fraction, width=bar_width, use_color=use_color, smooth=smooth
+    )
     pct = bucket.percentage
     pct_str = f"{pct:3d}%"
     reset_str = format_short_reset_time(bucket.reset_time)
@@ -521,6 +538,7 @@ def render_usage_table_lines(
     *,
     spinner_char: str | None = None,
     use_color: bool = True,
+    smooth: bool = False,
     bar_width: int = 10,
 ) -> list[str]:
     # cell_width: prefix (4 chars: "5h: " / "Wk: ") + bar (12) + 1 + pct (4) + 1 + reset (5) = 27
@@ -575,6 +593,7 @@ def render_usage_table_lines(
                         prefix="5h: ",
                         bar_width=bar_width,
                         use_color=use_color,
+                        smooth=smooth,
                         target_width=cell_width,
                     )
                     for fam, _ in QUOTA_COLUMNS
@@ -586,6 +605,7 @@ def render_usage_table_lines(
                         prefix="Wk: ",
                         bar_width=bar_width,
                         use_color=use_color,
+                        smooth=smooth,
                         target_width=cell_width,
                     )
                     for fam, _ in QUOTA_COLUMNS
@@ -628,6 +648,111 @@ def render_usage_table_lines(
             lines.append(divider)
 
     lines.append(bottom_border)
+    return lines
+
+
+def sort_profiles(
+    profiles: Sequence[Profile],
+    completed_map: dict[str, AccountUsage],
+    sort_by: str = "default",
+) -> list[Profile]:
+    """Sorts profiles by name, quota capacity, or reset time."""
+    if sort_by == "name":
+        return sorted(profiles, key=lambda p: p.name.lower())
+    if sort_by == "quota":
+        def get_score(p: Profile) -> float:
+            u = completed_map.get(p.name)
+            if not u or u.status != "success":
+                return -1.0
+            b = extract_quota_bucket(u, "gemini", "5h")
+            return b.remaining_fraction if b else 1.0
+        return sorted(profiles, key=get_score, reverse=True)
+    if sort_by == "reset":
+        def get_reset_key(p: Profile) -> float:
+            u = completed_map.get(p.name)
+            if not u or u.status != "success":
+                return float("inf")
+            b = extract_quota_bucket(u, "gemini", "5h")
+            if b and b.reset_time:
+                return b.reset_time.timestamp()
+            return float("inf")
+        return sorted(profiles, key=get_reset_key)
+    return list(profiles)
+
+
+def render_usage_view_lines(
+    profiles: Sequence[Profile],
+    completed_map: dict[str, AccountUsage],
+    *,
+    view: str = "table",
+    sort_by: str = "default",
+    include_summary: bool = True,
+    spinner_char: str | None = None,
+    use_color: bool = True,
+    bar_width: int = 10,
+    term_width: int | None = None,
+) -> list[str]:
+    """Dispatches rendering to the appropriate view: table, grid, matrix, or telemetry."""
+    sorted_profs = sort_profiles(profiles, completed_map, sort_by=sort_by)
+    telemetry = compute_fleet_telemetry(completed_map, extract_quota_bucket)
+
+    lines: list[str] = []
+    # Prepend fleet summary banner for table, grid, matrix if summary is requested
+    if include_summary and len(completed_map) > 0 and view != "telemetry":
+        banner = render_fleet_summary_banner(telemetry, width=term_width or 80, use_color=use_color)
+        if banner:
+            lines.extend(banner)
+            lines.append("")
+
+    if view == "matrix":
+        lines.extend(
+            render_usage_matrix_lines(
+                sorted_profs,
+                completed_map,
+                extract_quota_bucket,
+                use_color=use_color,
+                term_width=term_width,
+            )
+        )
+    elif view == "grid":
+        lines.extend(
+            render_usage_grid_lines(
+                sorted_profs,
+                completed_map,
+                extract_quota_bucket,
+                format_short_reset_time,
+                use_color=use_color,
+                term_width=term_width,
+            )
+        )
+    elif view == "telemetry":
+        banner = render_fleet_summary_banner(telemetry, width=term_width or 80, use_color=use_color)
+        if banner:
+            lines.extend(banner)
+            lines.append("")
+        lines.extend(
+            render_usage_telemetry_lines(
+                sorted_profs,
+                completed_map,
+                extract_quota_bucket,
+                format_short_reset_time,
+                use_color=use_color,
+                term_width=term_width,
+            )
+        )
+    else:
+        # Default "table" view
+        lines.extend(
+            render_usage_table_lines(
+                sorted_profs,
+                completed_map,
+                spinner_char=spinner_char,
+                use_color=use_color,
+                smooth=use_color,
+                bar_width=bar_width,
+            )
+        )
+
     return lines
 
 
@@ -845,10 +970,19 @@ class ProgressiveUsageUI:
         profiles: Sequence[Profile],
         is_tty: bool | None = None,
         stdout: Any = None,
+        view: str = "table",
+        sort_by: str = "default",
+        include_summary: bool | None = None,
     ) -> None:
         self.profiles = list(profiles)
         self.stdout = sys.stdout if stdout is None else stdout
         self.is_tty = sys.stdout.isatty() if is_tty is None else is_tty
+        self.view = view
+        self.sort_by = sort_by
+        if include_summary is None:
+            self.include_summary = self.is_tty
+        else:
+            self.include_summary = include_summary
         self.completed: dict[str, AccountUsage] = {}
         self.spinner_idx = 0
         self.last_lines_count = 0
@@ -888,13 +1022,16 @@ class ProgressiveUsageUI:
 
     def _render_tty_frame(self, spinner_char: str) -> list[str]:
         lines: list[str] = [self._render_title(), ""]
-        table_lines = render_usage_table_lines(
+        view_lines = render_usage_view_lines(
             self.profiles,
             self.completed,
+            view=self.view,
+            sort_by=self.sort_by,
+            include_summary=self.include_summary,
             spinner_char=spinner_char,
             use_color=True,
         )
-        lines.extend(table_lines)
+        lines.extend(view_lines)
         return lines
 
     def render_tty(self, spinner_char: str) -> None:
@@ -931,15 +1068,18 @@ class ProgressiveUsageUI:
     def finish(self, usages: Sequence[AccountUsage]) -> None:
         self._stop_event.set()
         completed_map = {u.account: u for u in usages}
-        table_lines = render_usage_table_lines(
+        view_lines = render_usage_view_lines(
             self.profiles,
             completed_map,
+            view=self.view,
+            sort_by=self.sort_by,
+            include_summary=self.include_summary,
             spinner_char=None,
             use_color=self.is_tty,
         )
         title = self._render_title()
         if self.is_tty:
-            lines = [title, ""] + table_lines
+            lines = [title, ""] + view_lines
             out: list[str] = []
             if self.last_lines_count > 0:
                 out.append(f"\033[{self.last_lines_count}A\r")
@@ -949,7 +1089,7 @@ class ProgressiveUsageUI:
             self._safe_write("".join(out))
             self.stdout.flush()
         else:
-            lines = [title, ""] + table_lines + [""]
+            lines = [title, ""] + view_lines + [""]
             self._safe_write("\n".join(lines))
             self.stdout.flush()
 
@@ -962,6 +1102,9 @@ async def run_usage(
     refresh: bool = False,
     timeout: float = 30.0,
     concurrency_limit: int = 8,
+    view: str = "table",
+    sort_by: str = "default",
+    include_summary: bool | None = None,
     cache_manager: CacheManager | None = None,
     is_tty: bool | None = None,
     stdout: Any = None,
@@ -1003,7 +1146,14 @@ async def run_usage(
 
     tty_mode = sys.stdout.isatty() if is_tty is None else is_tty
     if need_live_query and tty_mode:
-        ui = ProgressiveUsageUI(profiles, is_tty=tty_mode, stdout=out)
+        ui = ProgressiveUsageUI(
+            profiles,
+            is_tty=tty_mode,
+            stdout=out,
+            view=view,
+            sort_by=sort_by,
+            include_summary=include_summary,
+        )
         spinner_task = asyncio.create_task(ui.spinner_loop())
         usages_result: list[AccountUsage] = []
         try:
@@ -1022,7 +1172,14 @@ async def run_usage(
             await spinner_task
         return usages_result
 
-    ui = ProgressiveUsageUI(profiles, is_tty=tty_mode, stdout=out)
+    ui = ProgressiveUsageUI(
+        profiles,
+        is_tty=tty_mode,
+        stdout=out,
+        view=view,
+        sort_by=sort_by,
+        include_summary=include_summary,
+    )
     usages_result = await fetch_all_usage(
         agy_path,
         profiles,
