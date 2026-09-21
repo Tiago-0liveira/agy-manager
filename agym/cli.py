@@ -480,9 +480,9 @@ def _usage(argv: list[str], store: ProfileStore) -> int:
     )
     parser.add_argument(
         "--sort",
-        choices=["default", "quota", "reset", "name", "sub"],
-        default="default",
-        help="Sort order for profiles (default, quota, reset, name, sub)",
+        choices=["usage", "quota", "reset", "name", "sub", "default"],
+        default="usage",
+        help="Sort order for profiles (default: usage; options: usage, quota, reset, name, sub, default)",
     )
     parser.add_argument(
         "--summary",
@@ -531,7 +531,7 @@ def _usage(argv: list[str], store: ProfileStore) -> int:
         kwargs["refresh"] = True
     if ns.view != "table":
         kwargs["view"] = ns.view
-    if ns.sort != "default":
+    if ns.sort != "usage":
         kwargs["sort_by"] = ns.sort
     if ns.include_summary is not None:
         kwargs["include_summary"] = ns.include_summary

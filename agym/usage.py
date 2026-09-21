@@ -649,19 +649,22 @@ def render_usage_table_lines(
 def sort_profiles(
     profiles: Sequence[Profile],
     completed_map: dict[str, AccountUsage],
-    sort_by: str = "default",
+    sort_by: str = "usage",
 ) -> list[Profile]:
-    """Sorts profiles by name, quota capacity, or reset time."""
-    if sort_by == "name":
-        return sorted(profiles, key=lambda p: p.name.lower())
-    if sort_by == "quota":
-        def get_score(p: Profile) -> float:
+    """Sorts profiles by usage/quota, name, reset time, subscription, or default store order."""
+    if sort_by in ("usage", "quota"):
+        def get_score(p: Profile) -> tuple[float, float]:
             u = completed_map.get(p.name)
             if not u or u.status != "success":
-                return -1.0
-            b = extract_quota_bucket(u, "gemini", "5h")
-            return b.remaining_fraction if b else 1.0
+                return (-1.0, -1.0)
+            b_5h = extract_quota_bucket(u, "gemini", "5h")
+            b_wk = extract_quota_bucket(u, "gemini", "week")
+            score_5h = b_5h.remaining_fraction if b_5h else 1.0
+            score_wk = b_wk.remaining_fraction if b_wk else 1.0
+            return (score_5h, score_wk)
         return sorted(profiles, key=get_score, reverse=True)
+    if sort_by == "name":
+        return sorted(profiles, key=lambda p: p.name.lower())
     if sort_by == "reset":
         def get_reset_key(p: Profile) -> float:
             u = completed_map.get(p.name)
@@ -687,7 +690,7 @@ def render_usage_view_lines(
     completed_map: dict[str, AccountUsage],
     *,
     view: str = "table",
-    sort_by: str = "default",
+    sort_by: str = "usage",
     include_summary: bool = True,
     spinner_char: str | None = None,
     use_color: bool = True,
@@ -973,7 +976,7 @@ class ProgressiveUsageUI:
         is_tty: bool | None = None,
         stdout: Any = None,
         view: str = "table",
-        sort_by: str = "default",
+        sort_by: str = "usage",
         include_summary: bool | None = None,
     ) -> None:
         self.profiles = list(profiles)
@@ -1099,7 +1102,7 @@ async def run_usage(
     timeout: float = 30.0,
     concurrency_limit: int = 8,
     view: str = "table",
-    sort_by: str = "default",
+    sort_by: str = "usage",
     include_summary: bool | None = None,
     cache_manager: CacheManager | None = None,
     is_tty: bool | None = None,

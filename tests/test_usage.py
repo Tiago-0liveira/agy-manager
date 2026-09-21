@@ -926,9 +926,15 @@ class UsageGraphsTests(unittest.TestCase):
         grid_text = "\n".join(grid_lines)
         self.assertIn("alpha", grid_text)
         self.assertIn("beta", grid_text)
-        self.assertIn("Gemini", grid_text)
-        self.assertIn("Claude & GPT", grid_text)
+        self.assertIn("Gemini 5h", grid_text)
+        self.assertIn("Gemini Wk", grid_text)
         self.assertIn("Sub", grid_text)
+        # Claude & GPT is omitted from the grid table body
+        body = grid_text.split("Account")[1]
+        self.assertNotIn("Claude & GPT", body)
+        # Exactly 1 line per account
+        alpha_lines = [l for l in grid_lines if "alpha" in l]
+        self.assertEqual(len(alpha_lines), 1)
 
         # 2. Matrix view (Option 2 - ultra dense)
         matrix_lines = render_usage_view_lines(
@@ -973,6 +979,28 @@ class UsageGraphsTests(unittest.TestCase):
         p_none = Profile(name="none_prof", home=Path("/h5"), created_at="", subscription_date=None)
         sorted_by_sub = sort_profiles([p_none, p_safe, p_exp], {}, sort_by="sub")
         self.assertEqual([p.name for p in sorted_by_sub], ["exp_prof", "safe_prof", "none_prof"])
+
+        # Test default sorting by usage
+        u_low = AccountUsage(
+            account="low_prof",
+            status="success",
+            groups=[
+                UsageGroup(
+                    name="Gemini",
+                    description=None,
+                    buckets=[UsageBucket(id="g5", name="5h", window="5h", remaining_fraction=0.10, reset_time=None)],
+                )
+            ],
+        )
+        p_low = Profile(name="low_prof", home=Path("/hl"), created_at="")
+        p_high = Profile(name="high_prof", home=Path("/hh"), created_at="")
+        completed_usage = {"low_prof": u_low, "high_prof": u1}
+        # Default sort (no sort_by argument) should sort by usage descending
+        sorted_default = sort_profiles([p_low, p_high], completed_usage)
+        self.assertEqual([p.name for p in sorted_default], ["high_prof", "low_prof"])
+        # Explicit sort_by="usage"
+        sorted_usage = sort_profiles([p_low, p_high], completed_usage, sort_by="usage")
+        self.assertEqual([p.name for p in sorted_usage], ["high_prof", "low_prof"])
 
     def test_format_compact_sub(self) -> None:
         from datetime import date

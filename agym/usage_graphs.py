@@ -305,9 +305,10 @@ def render_usage_grid_lines(
     use_color: bool = True,
     term_width: int | None = None,
 ) -> list[str]:
-    """Renders Option 2: Simple borderless columnar view with Subscription time remaining."""
+    """Renders Option 2: Simple borderless layout (1 account per line, Gemini 5h & Wk, Sub)."""
     acc_col_width = max(10, max([len(p.name) for p in profiles], default=10))
     cell_width = 26
+    quota_area = cell_width * 2 + 2
 
     dim = "\033[90m" if use_color else ""
     reset = "\033[0m" if use_color else ""
@@ -316,8 +317,8 @@ def render_usage_grid_lines(
 
     header = (
         f"{bold}{'Account':<{acc_col_width}}{reset}  "
-        f"{bold}{'Gemini':<{cell_width}}{reset}  "
-        f"{bold}{'Claude & GPT':<{cell_width}}{reset}  "
+        f"{bold}{'Gemini 5h':<{cell_width}}{reset}  "
+        f"{bold}{'Gemini Wk':<{cell_width}}{reset}  "
         f"{bold}Sub{reset}"
     )
     lines: list[str] = [header]
@@ -329,40 +330,28 @@ def render_usage_grid_lines(
         sub_pad = " " * max(0, 3 - len(sub_plain))
 
         if p.name not in completed_map:
-            row_1 = f"{p.name:<{acc_col_width}}  {dim}{'Loading...':<{cell_width}}{reset}  {'':<{cell_width}}  {sub_badge}{sub_pad}"
-            row_2 = f"{'':<{acc_col_width}}  {'':<{cell_width}}  {'':<{cell_width}}     "
-            lines.append(row_1)
-            lines.append(row_2)
+            row = f"{p.name:<{acc_col_width}}  {dim}{'Loading...':<{quota_area}}{reset}  {sub_badge}{sub_pad}"
+            lines.append(row)
             continue
 
         usage = completed_map[p.name]
         if usage.status != "success" and not (usage.status == "quiescent" and usage.groups):
             err_msg = usage.error or "failed"
             failed_text = f"✗ Failed: {err_msg}"
-            quota_area = cell_width * 2 + 2
             if len(failed_text) > quota_area:
                 failed_text = failed_text[: quota_area - 3] + "..."
             disp_err = f"{red}{failed_text:<{quota_area}}{reset}" if use_color else f"{failed_text:<{quota_area}}"
-            row_1 = f"{p.name:<{acc_col_width}}  {disp_err}  {sub_badge}{sub_pad}"
-            row_2 = f"{'':<{acc_col_width}}  {'':<{cell_width}}  {'':<{cell_width}}     "
-            lines.append(row_1)
-            lines.append(row_2)
+            row = f"{p.name:<{acc_col_width}}  {disp_err}  {sub_badge}{sub_pad}"
+            lines.append(row)
             continue
 
         b_g5 = extract_bucket_fn(usage, "gemini", "5h")
-        b_c5 = extract_bucket_fn(usage, "claude", "5h")
-        g5_cell = format_quota_cell_simple(b_g5, prefix="5h: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
-        c5_cell = format_quota_cell_simple(b_c5, prefix="5h: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
-
         b_gw = extract_bucket_fn(usage, "gemini", "week")
-        b_cw = extract_bucket_fn(usage, "claude", "week")
+        g5_cell = format_quota_cell_simple(b_g5, prefix="5h: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
         gw_cell = format_quota_cell_simple(b_gw, prefix="Wk: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
-        cw_cell = format_quota_cell_simple(b_cw, prefix="Wk: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
 
-        row_1 = f"{p.name:<{acc_col_width}}  {g5_cell}  {c5_cell}  {sub_badge}{sub_pad}"
-        row_2 = f"{'':<{acc_col_width}}  {gw_cell}  {cw_cell}     "
-        lines.append(row_1)
-        lines.append(row_2)
+        row = f"{p.name:<{acc_col_width}}  {g5_cell}  {gw_cell}  {sub_badge}{sub_pad}"
+        lines.append(row)
 
     return lines
 
