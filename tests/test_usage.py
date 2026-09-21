@@ -723,3 +723,109 @@ class SubscriptionUsageIntegrationTests(unittest.TestCase):
         self.assertIsNone(acc2["subscription"]["days_remaining"])
         self.assertEqual(acc2["subscription"]["status"], "unknown")
 
+
+class CacheUsageIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_usage_caching_and_force_refresh(self) -> None:
+        from agym.cache import CacheManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            home = tmp_path / "home"
+            home.mkdir(parents=True, exist_ok=True)
+            p = Profile(name="personal", home=home, created_at="")
+            cache_mgr = CacheManager(cache_root=tmp_path / "cache")
+            sem = asyncio.Semaphore(1)
+
+            call_count = 0
+
+            async def mock_runner(argv: list[str], env: dict[str, str], timeout: float) -> tuple[int, str, str]:
+                nonlocal call_count
+                call_count += 1
+                return 0, SAMPLE_REAL_RESPONSE, ""
+
+            # 1. First fetch: live execution, populates cache
+            u1 = await fetch_account_usage_async(
+                Path("/fake/agy"),
+                p,
+                sem,
+                cache_manager=cache_mgr,
+                runner=mock_runner,
+            )
+            self.assertEqual(call_count, 1)
+            self.assertFalse(u1.cached)
+            self.assertEqual(u1.status, "success")
+
+            # 2. Second fetch within 60s: served from cache, runner NOT called
+            u2 = await fetch_account_usage_async(
+                Path("/fake/agy"),
+                p,
+                sem,
+                force_refresh=False,
+                cache_manager=cache_mgr,
+                runner=mock_runner,
+            )
+            self.assertEqual(call_count, 1)
+            self.assertTrue(u2.cached)
+            self.assertGreaterEqual(u2.age_seconds, 0.0)
+
+            # 3. Third fetch with force_refresh=True: runner called again
+            u3 = await fetch_account_usage_async(
+                Path("/fake/agy"),
+                p,
+                sem,
+                force_refresh=True,
+                cache_manager=cache_mgr,
+                runner=mock_runner,
+            )
+            self.assertEqual(call_count, 2)
+            self.assertFalse(u3.cached)
+
+    def test_json_payload_includes_cache_freshness(self) -> None:
+        u_cached = parse_usage_response(
+            SAMPLE_REAL_RESPONSE,
+            "p-cached",
+            cached=True,
+            age_seconds=42.5,
+            cached_at="2026-09-21T02:00:00Z",
+        )
+        u_live = parse_usage_response(
+            SAMPLE_REAL_RESPONSE,
+            "p-live",
+            cached=False,
+            age_seconds=0.0,
+        )
+        payload = usage_payload_to_dict([u_cached, u_live])
+        a1 = payload["accounts"][0]
+        self.assertEqual(a1["account"], "p-cached")
+        self.assertTrue(a1["cached"])
+        self.assertEqual(a1["age_seconds"], 42.5)
+        self.assertEqual(a1["cached_at"], "2026-09-21T02:00:00Z")
+
+        a2 = payload["accounts"][1]
+        self.assertEqual(a2["account"], "p-live")
+        self.assertFalse(a2["cached"])
+        self.assertEqual(a2["age_seconds"], 0.0)
+
+    def test_table_rendering_shows_cached_age(self) -> None:
+        from agym.usage import render_usage_table_lines
+
+        p1 = Profile(name="p-cached", home=Path("/h1"), created_at="")
+        u1 = parse_usage_response(SAMPLE_REAL_RESPONSE, "p-cached", cached=True, age_seconds=42.0)
+        lines = render_usage_table_lines([p1], {"p-cached": u1}, use_color=False)
+        rendered = "\n".join(lines)
+        self.assertIn("42s ago", rendered)
+
+    def test_cli_usage_refresh_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = ProfileStore(config_root=tmp_path / "config", data_root=tmp_path / "data")
+            store.create("personal")
+
+            with mock.patch("agym.cli.ProfileStore", return_value=store), \
+                 mock.patch("agym.cli.resolve_agy", return_value=Path("/fake/agy")), \
+                 mock.patch("agym.cli.run_usage", return_value=[]) as mock_run:
+                code = cli.main(["usage", "-f"])
+                self.assertEqual(code, 0)
+                mock_run.assert_called_once()
+                self.assertTrue(mock_run.call_args.kwargs["refresh"])
+

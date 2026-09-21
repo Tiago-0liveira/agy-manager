@@ -1,0 +1,360 @@
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from .profiles import _chmod_private_dir, _default_data_root
+
+# Default TTL policies
+TTL_USAGE_SECONDS = 60.0      # 1 minute for live quota
+TTL_TOKENS_SECONDS = 600.0    # 10 minutes for token usage tracking
+
+
+def format_age(seconds: float) -> str:
+    """Formats age in seconds into human-readable text."""
+    if seconds < 1.0:
+        return "just now"
+    secs = int(seconds)
+    if secs < 60:
+        return f"{secs}s ago"
+    minutes = secs // 60
+    rem_secs = secs % 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    rem_mins = minutes % 60
+    if hours < 24:
+        return f"{hours}h {rem_mins}m ago" if rem_mins > 0 else f"{hours}h ago"
+    days = hours // 24
+    return f"{days}d ago"
+
+
+def format_freshness_badge(
+    cached: bool,
+    age_seconds: float = 0.0,
+    *,
+    use_color: bool = True,
+) -> str:
+    """Returns a badge like 'Live' or 'Cached 42s ago' with subtle ANSI formatting."""
+    if not cached:
+        if use_color:
+            return "\033[32mLive\033[0m"
+        return "Live"
+
+    age_str = format_age(age_seconds)
+    text = f"Cached {age_str}"
+    if use_color:
+        return f"\033[90m{text}\033[0m"
+    return text
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _chmod_private_dir(path.parent)
+    fd, tmp_name = tempfile.mkstemp(prefix=".cache.", suffix=".tmp", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        if os.name != "nt":
+            tmp.chmod(0o600)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+class CacheManager:
+    """Manages multi-tier cached responses for agym."""
+
+    def __init__(self, cache_root: Path | None = None) -> None:
+        if cache_root is None:
+            self.cache_root = _default_data_root() / "cache"
+        else:
+            self.cache_root = Path(cache_root)
+
+        self.usage_dir = self.cache_root / "usage"
+        self.tokens_dir = self.cache_root / "tokens"
+
+    def _ensure_dirs(self) -> None:
+        self.cache_root.mkdir(parents=True, exist_ok=True)
+        self.usage_dir.mkdir(parents=True, exist_ok=True)
+        self.tokens_dir.mkdir(parents=True, exist_ok=True)
+        _chmod_private_dir(self.cache_root)
+        _chmod_private_dir(self.usage_dir)
+        _chmod_private_dir(self.tokens_dir)
+
+    def _get_entry(
+        self,
+        filepath: Path,
+        max_age: float,
+        now: datetime | None = None,
+    ) -> tuple[dict[str, Any], float, str] | None:
+        """Reads a cache file, checks TTL, and handles corrupted files gracefully."""
+        if not filepath.exists():
+            return None
+
+        if now is None:
+            now = datetime.now(timezone.utc)
+        elif now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+
+        try:
+            with filepath.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            # Corrupted cache file: treat as miss
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        cached_timestamp = payload.get("cached_timestamp")
+        if not isinstance(cached_timestamp, (int, float)):
+            return None
+
+        age = now.timestamp() - float(cached_timestamp)
+        if age < 0:
+            age = 0.0
+
+        if age > max_age:
+            return None
+
+        cached_at = str(payload.get("cached_at", ""))
+        return payload, age, cached_at
+
+    # --- Quota Usage Cache ---
+
+    def get_usage(
+        self,
+        profile_name: str,
+        max_age: float = TTL_USAGE_SECONDS,
+        now: datetime | None = None,
+    ) -> tuple[dict[str, Any], str, float, str] | None:
+        """Retrieves cached quota usage data if valid within max_age.
+
+        Returns (parsed_data, raw_output, age_seconds, cached_at) or None on miss.
+        """
+        filepath = self.usage_dir / f"{profile_name}.json"
+        entry = self._get_entry(filepath, max_age, now=now)
+        if entry is None:
+            return None
+
+        payload, age, cached_at = entry
+        parsed_data = payload.get("parsed_data")
+        raw_output = payload.get("raw_output", "")
+        if not isinstance(parsed_data, dict):
+            return None
+        return parsed_data, str(raw_output), age, cached_at
+
+    def set_usage(
+        self,
+        profile_name: str,
+        parsed_data: dict[str, Any],
+        raw_output: str,
+        now: datetime | None = None,
+    ) -> None:
+        """Saves quota usage to cache atomically with private permissions."""
+        self._ensure_dirs()
+        if now is None:
+            now = datetime.now(timezone.utc)
+        elif now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+
+        payload = {
+            "version": 1,
+            "profile": profile_name,
+            "cached_at": now.isoformat(),
+            "cached_timestamp": now.timestamp(),
+            "data_type": "usage",
+            "raw_output": raw_output,
+            "parsed_data": parsed_data,
+        }
+        filepath = self.usage_dir / f"{profile_name}.json"
+        _write_json_atomic(filepath, payload)
+
+    # --- Token Usage Cache & Ledger ---
+
+    def get_tokens(
+        self,
+        profile_name: str,
+        max_age: float = TTL_TOKENS_SECONDS,
+        now: datetime | None = None,
+    ) -> tuple[dict[str, Any], float, str] | None:
+        """Retrieves cached token usage data if valid within max_age.
+
+        Returns (payload, age_seconds, cached_at) or None on miss.
+        """
+        filepath = self.tokens_dir / f"{profile_name}.json"
+        entry = self._get_entry(filepath, max_age, now=now)
+        if entry is None:
+            return None
+        payload, age, cached_at = entry
+        return payload, age, cached_at
+
+    def load_cumulative_ledger(self, profile_name: str) -> dict[str, Any]:
+        """Loads the cumulative token ledger for a profile, or default structure if none."""
+        filepath = self.tokens_dir / f"{profile_name}.json"
+        if not filepath.exists():
+            return {
+                "version": 1,
+                "profile": profile_name,
+                "cumulative": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "thinking_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "total_tokens": 0,
+                    "snapshot_count": 0,
+                },
+                "snapshots": [],
+            }
+        try:
+            with filepath.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+                if isinstance(data, dict) and "cumulative" in data:
+                    return data
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        return {
+            "version": 1,
+            "profile": profile_name,
+            "cumulative": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "thinking_tokens": 0,
+                "cache_read_tokens": 0,
+                "total_tokens": 0,
+                "snapshot_count": 0,
+            },
+            "snapshots": [],
+        }
+
+    def record_token_snapshot(
+        self,
+        profile_name: str,
+        snapshot: dict[str, int],
+        now: datetime | None = None,
+        source: str = "query",
+    ) -> dict[str, Any]:
+        """Records a new token snapshot and recomputes cumulative totals."""
+        self._ensure_dirs()
+        if now is None:
+            now = datetime.now(timezone.utc)
+        elif now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+
+        data = self.load_cumulative_ledger(profile_name)
+        inp = int(snapshot.get("input_tokens", 0))
+        out = int(snapshot.get("output_tokens", 0))
+        thk = int(snapshot.get("thinking_tokens", 0))
+        crd = int(snapshot.get("cache_read_tokens", 0))
+        tot = int(snapshot.get("total_tokens", inp + out + thk + crd))
+
+        # Check if identical to last snapshot to avoid duplicate zero or redundant updates
+        snapshots = data.get("snapshots", [])
+        should_record = True
+        if snapshots:
+            last = snapshots[-1]
+            if (
+                last.get("input_tokens") == inp
+                and last.get("output_tokens") == out
+                and last.get("thinking_tokens") == thk
+                and last.get("cache_read_tokens") == crd
+                and last.get("total_tokens") == tot
+                and tot == 0
+            ):
+                # Don't keep piling up empty 0-token snapshots repeatedly
+                should_record = False
+
+        if should_record and tot > 0:
+            snapshots.append(
+                {
+                    "timestamp": now.isoformat(),
+                    "source": source,
+                    "input_tokens": inp,
+                    "output_tokens": out,
+                    "thinking_tokens": thk,
+                    "cache_read_tokens": crd,
+                    "total_tokens": tot,
+                }
+            )
+            # Keep history to max 500 snapshots
+            if len(snapshots) > 500:
+                snapshots = snapshots[-500:]
+            data["snapshots"] = snapshots
+
+            # Recompute cumulative
+            cum = data.setdefault("cumulative", {})
+            cum["input_tokens"] = int(cum.get("input_tokens", 0)) + inp
+            cum["output_tokens"] = int(cum.get("output_tokens", 0)) + out
+            cum["thinking_tokens"] = int(cum.get("thinking_tokens", 0)) + thk
+            cum["cache_read_tokens"] = int(cum.get("cache_read_tokens", 0)) + crd
+            cum["total_tokens"] = int(cum.get("total_tokens", 0)) + tot
+            cum["snapshot_count"] = len(snapshots)
+
+        data["cached_at"] = now.isoformat()
+        data["cached_timestamp"] = now.timestamp()
+        data["data_type"] = "tokens"
+        data["latest_snapshot"] = {
+            "timestamp": now.isoformat(),
+            "source": source,
+            "input_tokens": inp,
+            "output_tokens": out,
+            "thinking_tokens": thk,
+            "cache_read_tokens": crd,
+            "total_tokens": tot,
+        }
+
+        filepath = self.tokens_dir / f"{profile_name}.json"
+        _write_json_atomic(filepath, data)
+        return data
+
+    def set_tokens(
+        self,
+        profile_name: str,
+        cumulative_tokens: dict[str, int],
+        latest_snapshot: dict[str, int] | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """Sets tokens cache directly."""
+        self._ensure_dirs()
+        if now is None:
+            now = datetime.now(timezone.utc)
+        elif now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+
+        data = self.load_cumulative_ledger(profile_name)
+        data["cached_at"] = now.isoformat()
+        data["cached_timestamp"] = now.timestamp()
+        data["cumulative"] = cumulative_tokens
+        if latest_snapshot is not None:
+            data["latest_snapshot"] = latest_snapshot
+        filepath = self.tokens_dir / f"{profile_name}.json"
+        _write_json_atomic(filepath, data)
+
+    def clear(self, profile_name: str | None = None) -> None:
+        """Clears cache files for a specific profile or all profiles."""
+        if profile_name:
+            u_path = self.usage_dir / f"{profile_name}.json"
+            t_path = self.tokens_dir / f"{profile_name}.json"
+            if u_path.exists():
+                u_path.unlink()
+            if t_path.exists():
+                t_path.unlink()
+        else:
+            if self.usage_dir.exists():
+                for f in self.usage_dir.glob("*.json"):
+                    f.unlink()
+            if self.tokens_dir.exists():
+                for f in self.tokens_dir.glob("*.json"):
+                    f.unlink()
