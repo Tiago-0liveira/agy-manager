@@ -25,6 +25,7 @@ RESERVED_NAMES = {
     "edit",
     "help",
     "config",
+    "statusline",
     "rotate",
     "rename",
     "mv",
@@ -41,6 +42,8 @@ class InvalidProfileName(ProfileError):
 
 class ProfileExists(ProfileError):
     pass
+
+
 class ProfileNotFound(ProfileError):
     pass
 

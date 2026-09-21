@@ -51,6 +51,7 @@ def build_profile_env(
     profile_home: Path,
     base_env: Mapping[str, str] | None = None,
     system: str | None = None,
+    profile_name: str | None = None,
 ) -> dict[str, str]:
     from .profiles import _default_config_root, _default_data_root
 
@@ -60,6 +61,8 @@ def build_profile_env(
 
     env["GEMINI_FORCE_FILE_STORAGE"] = "true"
     env["HOME"] = home
+    if profile_name:
+        env["AGYM_PROFILE"] = profile_name
 
     target_system = system or platform.system()
     if target_system == "Windows":
@@ -324,7 +327,7 @@ def run_agy(
             f"invalid settings for profile '{profile.name}': {', '.join(profile.settings.validation_errors)}"
         )
     cleanup_profile_locks(profile.home)
-    env = build_profile_env(profile.home)
+    env = build_profile_env(profile.home, profile_name=profile.name)
     cmd_args = build_agy_args(profile, passthrough_args=args, env=env)
     with profile_credential_context(profile.home, is_setup=is_setup):
         return exec_agy_interactive(
@@ -422,7 +425,7 @@ def run_auto_prompt(
         return 1
 
     cleanup_profile_locks(profile.home)
-    env = build_profile_env(profile.home)
+    env = build_profile_env(profile.home, profile_name=profile.name)
     stage1_prompt = build_stage1_prompt(user_prompt)
     stage1_args = build_agy_args(
         profile,

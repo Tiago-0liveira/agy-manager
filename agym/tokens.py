@@ -337,7 +337,7 @@ async def fetch_account_tokens_async(
 
         turn_usage = TokenUsage()
         if runner is not None:
-            env = build_profile_env(profile.home)
+            env = build_profile_env(profile.home, profile_name=profile.name)
             argv = [
                 str(agy_path),
                 "--dangerously-skip-permissions",

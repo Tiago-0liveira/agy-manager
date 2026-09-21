@@ -70,6 +70,9 @@ agym tokens
 agym tokens personal
 agym tokens --json
 agym tokens --refresh
+agym statusline
+agym statusline personal --preview
+agym statusline --sync
 agym doctor
 agym doctor personal
 agym remove personal
@@ -138,6 +141,30 @@ agym tokens --refresh
 - **Composition Breakdown Table (`--breakdown` / `-b`)**: Clean, beautifully formatted tabular breakdown displaying Total, Input, Output, Think, Cache, and Hit % per profile with a Fleet Total aggregate row.
 - **Fleet Summary Card**: Displays fleet-wide token consumption, top consuming profile, average tokens per account, prompt cache hit ratio, and data cache status.
 - **Non-TTY Fallback**: Automatically adapts to piped environments (`agym tokens | cat`) using clean ASCII blocks and no escape codes.
+
+### Persistent Antigravity Statusline
+
+`agym` provides an integrated statusline for Antigravity that renders the active account name, active model, live quota, and context window usage at all times at the bottom of the terminal:
+
+```bash
+# Check statusline installation and preview statusline across profiles
+agym statusline
+
+# Preview statusline rendering for a specific profile
+agym statusline --preview personal
+
+# Manually synchronize and install statusline across all registered profiles
+agym statusline --sync
+
+# Enable or disable statusline across all profiles
+agym statusline --enable
+agym statusline --disable
+```
+
+- **Automatic Multi-Account Configuration**: Setting up an account via `agym setup <profile>` automatically installs the statusline runner and synchronizes the `statusLine` configuration across all registered accounts in their isolated `settings.json`.
+- **Live & Cached Quota**: Seamlessly reads live bucket quota streamed by `agy` on state changes, falling back to `agym`'s usage cache when uninitialized.
+- **Adaptive Layout**: Automatically detects terminal width and adjusts between full (≥ 105 cols), standard (≥ 75 cols), compact (≥ 55 cols), and minimal layouts.
+- **Zero Overhead**: Written in standard library Python without external dependencies, executing in ~15-30ms with robust error suppression.
 
 ### Multi-Tier Caching
 
