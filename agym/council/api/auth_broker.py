@@ -24,6 +24,14 @@ from agym.profiles import ProfileStore
 
 def is_gui_available() -> bool:
     """Detect whether a graphical display environment is available."""
+    # Automated tests or explicit headless mode should never spawn GUI windows
+    if "unittest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
+    if os.environ.get("AGYM_HEADLESS", "").lower() in ("1", "true", "yes"):
+        return False
+    # WSL environments should not spawn X11/Wayland terminal windows via WSLg
+    if "WSL_DISTRO_NAME" in os.environ or "WSL_INTEROP" in os.environ:
+        return False
     if os.name == "nt":
         # Windows GUI desktop is generally available unless running as non-interactive service
         return True

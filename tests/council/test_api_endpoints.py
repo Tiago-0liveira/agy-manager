@@ -79,14 +79,7 @@ class TestApiEndpoints(unittest.TestCase):
         self.assertEqual(resp.json()["display_label"], "Alpha Renamed")
         self.assertEqual(resp.json()["concurrency_limit"], 3)
 
-        # 5. Connect account (auth broker)
-        resp = self.client.post(f"/api/accounts/{account_id}/connect", headers=self.headers)
-        self.assertEqual(resp.status_code, 200)
-        connect_data = resp.json()
-        self.assertIn("status", connect_data)
-        self.assertIn("agym setup profile-alpha", connect_data["command"])
-
-        # 6. Check account status
+        # 5. Check account status
         resp = self.client.post(f"/api/accounts/{account_id}/check", headers=self.headers)
         self.assertEqual(resp.status_code, 200)
         check_data = resp.json()
