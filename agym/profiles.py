@@ -241,6 +241,14 @@ class ProfileStore:
             raise
         return profile
 
+    def exists(self, name: str) -> bool:
+        try:
+            validate_profile_name(name)
+        except InvalidProfileName:
+            return False
+        data = self._load()
+        return name in data.get("profiles", {})
+
     def get(self, name: str) -> Profile:
         validate_profile_name(name)
         data = self._load()

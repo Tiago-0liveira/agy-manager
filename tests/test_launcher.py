@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+os.environ["AGYM_DISABLE_WINCRED"] = "1"
 import tempfile
 import unittest
 from pathlib import Path

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .profiles import Profile, ProfileError
+from .wincred import has_profile_token, profile_credential_context
 
 logger = logging.getLogger("agym.launcher")
 
@@ -316,6 +317,7 @@ def run_agy(
     args: Sequence[str] = (),
     *,
     replace_process: bool = False,
+    is_setup: bool = False,
 ) -> int:
     if profile.settings.validation_errors:
         raise ProfileError(
@@ -324,12 +326,13 @@ def run_agy(
     cleanup_profile_locks(profile.home)
     env = build_profile_env(profile.home)
     cmd_args = build_agy_args(profile, passthrough_args=args, env=env)
-    return exec_agy_interactive(
-        agy_path=agy_path,
-        env=env,
-        args=cmd_args,
-        replace_process=replace_process,
-    )
+    with profile_credential_context(profile.home, is_setup=is_setup):
+        return exec_agy_interactive(
+            agy_path=agy_path,
+            env=env,
+            args=cmd_args,
+            replace_process=replace_process,
+        )
 
 
 def build_stage1_prompt(user_prompt: str) -> str:
@@ -431,7 +434,8 @@ def run_auto_prompt(
     spinner = Spinner(f"Generating implementation plan with profile '{profile.name}'")
     spinner.start()
     try:
-        proc = run_agy_capture(agy_path=agy_path, env=env, args=stage1_args)
+        with profile_credential_context(profile.home):
+            proc = run_agy_capture(agy_path=agy_path, env=env, args=stage1_args)
     finally:
         spinner.stop()
 
@@ -466,15 +470,18 @@ def run_auto_prompt(
         passthrough_args=extra_args,
         env=env,
     )
-    return exec_agy_interactive(
-        agy_path=agy_path,
-        env=env,
-        args=stage2_args,
-        replace_process=replace_process,
-    )
+    with profile_credential_context(profile.home):
+        return exec_agy_interactive(
+            agy_path=agy_path,
+            env=env,
+            args=stage2_args,
+            replace_process=replace_process,
+        )
 
 
 def persistent_profile_data_exists(profile: Profile) -> bool:
+    if has_profile_token(profile.home):
+        return True
     gemini = profile.home / ".gemini"
     if not gemini.is_dir():
         return False

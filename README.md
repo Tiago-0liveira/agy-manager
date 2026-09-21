@@ -12,7 +12,7 @@ GEMINI_FORCE_FILE_STORAGE=true \
 agy
 ```
 
-On Windows, it redirects `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `LOCALAPPDATA`, and `APPDATA` to the profile folder, pre-creates application data subdirectories, and cleans up stale Chromium singleton locks (`SingletonLock`, `lockfile`) before launch to prevent silent fallback to the default host profile. The real `agy` executable is resolved from the host `PATH` before the profile environment is constructed. The process keeps the caller's current working directory and inherits the terminal directly.
+On Windows, it redirects `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `LOCALAPPDATA`, and `APPDATA` to the profile folder, pre-creates application data subdirectories, cleans up stale Chromium singleton locks (`SingletonLock`, `lockfile`), and isolates Windows Credential Manager authentication (`gemini:antigravity`) per profile so that each profile authenticates and operates with its own distinct Google account without credential collisions. The real `agy` executable is resolved from the host `PATH` before the profile environment is constructed. The process keeps the caller's current working directory and inherits the terminal directly.
 
 > Important: the target machine must pass the OAuth isolation proof in [`docs/manual-integration.md`](docs/manual-integration.md). `agym` cannot prove a real Google login in unit tests.
 
@@ -35,6 +35,7 @@ pip install .
 ```bash
 agym setup personal
 agym setup work
+agym setup work --reauth               # Re-authenticate an existing profile with a fresh sign-in flow
 
 agym personal
 agym work

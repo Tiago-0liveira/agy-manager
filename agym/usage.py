@@ -14,6 +14,7 @@ from .cache import CacheManager, TTL_USAGE_SECONDS, format_age, format_freshness
 from .launcher import build_profile_env, resolve_agy
 from .profiles import Profile, ProfileStore
 from .subscription import calculate_subscription_health, format_subscription_cells
+from .wincred import profile_credential_context
 
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -738,9 +739,12 @@ async def fetch_account_usage_async(
             "json",
         ]
 
-        run_fn = runner or _default_subprocess_runner
         try:
-            code, out, err = await asyncio.wait_for(run_fn(argv, env, timeout), timeout=timeout)
+            if runner is not None:
+                code, out, err = await asyncio.wait_for(runner(argv, env, timeout), timeout=timeout)
+            else:
+                with profile_credential_context(profile.home):
+                    code, out, err = await asyncio.wait_for(_default_subprocess_runner(argv, env, timeout), timeout=timeout)
         except asyncio.TimeoutError:
             timeout_str = f"{int(timeout)}s" if timeout.is_integer() else f"{timeout}s"
             return AccountUsage(

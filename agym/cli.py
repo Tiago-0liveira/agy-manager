@@ -35,6 +35,7 @@ from .subscription import (
 )
 from .tokens import run_tokens
 from .usage import run_usage
+from .wincred import get_profile_email
 
 USAGE = """agym — Explicit isolated-profile manager for Google Antigravity CLI
 
@@ -79,8 +80,9 @@ General Options:
   -h, --help                          Show this help message and exit
 
 Command Options:
-  agym setup <profile> [-s, --subscription-date DATE]
+  agym setup <profile> [-s, --subscription-date DATE] [-f, --reauth]
       -s, --subscription-date DATE    Renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)
+      -f, --reauth, --force           Re-authenticate an existing profile with a fresh sign-in flow
 
   agym config <profile> [--model MODEL] [-y|--dsp|--skip-perms|--[no-]dangerously-skip-permissions]
       --model MODEL                   Set default model (or 'default' to clear)
@@ -135,6 +137,14 @@ def _setup(argv: list[str], store: ProfileStore) -> int:
         metavar="DATE",
         help="Subscription renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)",
     )
+    parser.add_argument(
+        "--reauth",
+        "--force",
+        "-f",
+        action="store_true",
+        dest="reauth",
+        help="Re-authenticate an existing profile with a fresh Google sign-in flow",
+    )
     ns = parser.parse_args(argv)
     validate_profile_name(ns.profile)
 
@@ -150,12 +160,22 @@ def _setup(argv: list[str], store: ProfileStore) -> int:
 
     # Resolve the host binary before constructing or using the isolated HOME.
     agy = resolve_agy()
-    profile = store.create(ns.profile, subscription_date=subscription_date)
+    if store.exists(ns.profile):
+        if ns.reauth:
+            profile = store.get(ns.profile)
+            if ns.subscription_date is not None:
+                store.set_subscription_date(profile.name, subscription_date)
+                profile = store.get(ns.profile)
+            print(f"Re-authenticating profile '{profile.name}'.")
+        else:
+            raise ProfileExists(f"profile already exists: {ns.profile} (use --reauth to re-authenticate)")
+    else:
+        profile = store.create(ns.profile, subscription_date=subscription_date)
 
     print(f"Launching Antigravity to set up profile '{profile.name}'.")
     print(f"Profile home: {profile.home}")
     print("Complete the normal Google sign-in flow, then exit Antigravity.")
-    code = run_agy(agy, profile, replace_process=False)
+    code = run_agy(agy, profile, replace_process=False, is_setup=True)
     if code != 0:
         _print_err(f"agy exited with status {code}; profile was kept for inspection/retry")
         return code
@@ -167,7 +187,9 @@ def _setup(argv: list[str], store: ProfileStore) -> int:
         _print_err("run 'agym doctor %s' and the manual integration test before relying on this profile" % profile.name)
         return 1
 
-    print(f"Profile '{profile.name}' is ready (persistent Antigravity state detected).")
+    email = get_profile_email(profile.home)
+    auth_info = f" ({email})" if email else ""
+    print(f"Profile '{profile.name}' is ready (persistent Antigravity state detected{auth_info}).")
     return 0
 
 
