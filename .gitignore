@@ -71,3 +71,9 @@ venv.bak/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Node / Web
+node_modules/
+
+# Agent scratch directories
+.agents/

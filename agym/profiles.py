@@ -7,10 +7,17 @@ import re
 import shutil
 import stat
 import tempfile
+import threading
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 RESERVED_NAMES = {
@@ -207,12 +214,84 @@ def _write_json_private(path: Path, payload: dict[str, Any]) -> None:
             tmp.unlink()
 
 
+class _LockState:
+    def __init__(self) -> None:
+        self.rlock = threading.RLock()
+        self.depth = 0
+        self.file: Any = None
+
+
+_LOCKS: dict[Path, _LockState] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _get_lock_state(lock_path: Path) -> _LockState:
+    resolved = lock_path.resolve()
+    with _LOCKS_GUARD:
+        state = _LOCKS.get(resolved)
+        if state is None:
+            state = _LockState()
+            _LOCKS[resolved] = state
+        return state
+
+
+@contextmanager
+def _profile_lock(lock_path: Path) -> Iterator[None]:
+    state = _get_lock_state(lock_path)
+    state.rlock.acquire()
+    try:
+        if state.depth == 0:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            _chmod_private_dir(lock_path.parent)
+            f = open(lock_path, "a+", encoding="utf-8")
+            try:
+                if os.name == "nt":
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    try:
+                        os.chmod(f.fileno(), 0o600)
+                    except OSError:
+                        pass
+                    try:
+                        lock_path.chmod(0o600)
+                    except OSError:
+                        pass
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            except BaseException:
+                f.close()
+                raise
+            state.file = f
+        state.depth += 1
+        try:
+            yield
+        finally:
+            state.depth -= 1
+            if state.depth == 0:
+                f = state.file
+                state.file = None
+                try:
+                    if os.name == "nt":
+                        f.seek(0)
+                        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                finally:
+                    f.close()
+    finally:
+        state.rlock.release()
+
+
 class ProfileStore:
     def __init__(self, config_root: Path | None = None, data_root: Path | None = None) -> None:
         self.config_root = Path(config_root) if config_root else _default_config_root()
         self.data_root = Path(data_root) if data_root else _default_data_root()
         self.config_path = self.config_root / "config.json"
+        self.lock_path = self.config_root / "config.lock"
         self.profiles_root = self.data_root / "profiles"
+
+    def _profile_lock(self, lock_path: Path | None = None) -> Iterator[None]:
+        return _profile_lock(lock_path or self.lock_path)
 
     def _load(self) -> dict[str, Any]:
         if not self.config_path.exists():
@@ -235,40 +314,41 @@ class ProfileStore:
         settings: ProfileSettings | None = None,
         subscription_date: str | None = None,
     ) -> Profile:
-        validate_profile_name(name)
-        data = self._load()
-        if name in data["profiles"]:
-            raise ProfileExists(f"profile already exists: {name}")
+        with self._profile_lock():
+            validate_profile_name(name)
+            data = self._load()
+            if name in data["profiles"]:
+                raise ProfileExists(f"profile already exists: {name}")
 
-        self.profiles_root.mkdir(parents=True, exist_ok=True)
-        _chmod_private_dir(self.data_root)
-        _chmod_private_dir(self.profiles_root)
+            self.profiles_root.mkdir(parents=True, exist_ok=True)
+            _chmod_private_dir(self.data_root)
+            _chmod_private_dir(self.profiles_root)
 
-        profile_dir = self.profiles_root / name
-        home = profile_dir / "home"
-        home.mkdir(parents=True, exist_ok=False)
-        _chmod_private_dir(profile_dir)
-        _chmod_private_dir(home)
+            profile_dir = self.profiles_root / name
+            home = profile_dir / "home"
+            home.mkdir(parents=True, exist_ok=False)
+            _chmod_private_dir(profile_dir)
+            _chmod_private_dir(home)
 
-        profile = Profile(
-            name=name,
-            home=home.resolve(),
-            created_at=datetime.now(timezone.utc).isoformat(),
-            settings=settings or ProfileSettings(),
-            subscription_date=subscription_date,
-        )
-        data["profiles"][name] = {
-            "created_at": profile.created_at,
-            "home": str(profile.home),
-            "settings": profile.settings.to_dict(),
-            "subscription_date": profile.subscription_date,
-        }
-        try:
-            self._save(data)
-        except Exception:
-            shutil.rmtree(profile_dir, ignore_errors=True)
-            raise
-        return profile
+            profile = Profile(
+                name=name,
+                home=home.resolve(),
+                created_at=datetime.now(timezone.utc).isoformat(),
+                settings=settings or ProfileSettings(),
+                subscription_date=subscription_date,
+            )
+            data["profiles"][name] = {
+                "created_at": profile.created_at,
+                "home": str(profile.home),
+                "settings": profile.settings.to_dict(),
+                "subscription_date": profile.subscription_date,
+            }
+            try:
+                self._save(data)
+            except Exception:
+                shutil.rmtree(profile_dir, ignore_errors=True)
+                raise
+            return profile
 
     def exists(self, name: str) -> bool:
         try:
@@ -309,22 +389,24 @@ class ProfileStore:
         return result
 
     def update_settings(self, name: str, settings: ProfileSettings) -> Profile:
-        validate_profile_name(name)
-        data = self._load()
-        if name not in data["profiles"]:
-            raise ProfileNotFound(f"profile not found: {name}")
-        data["profiles"][name]["settings"] = settings.to_dict()
-        self._save(data)
-        return self.get(name)
+        with self._profile_lock():
+            validate_profile_name(name)
+            data = self._load()
+            if name not in data["profiles"]:
+                raise ProfileNotFound(f"profile not found: {name}")
+            data["profiles"][name]["settings"] = settings.to_dict()
+            self._save(data)
+            return self.get(name)
 
     def set_subscription_date(self, name: str, subscription_date: str | None) -> Profile:
-        validate_profile_name(name)
-        data = self._load()
-        if name not in data["profiles"]:
-            raise ProfileNotFound(f"profile not found: {name}")
-        data["profiles"][name]["subscription_date"] = subscription_date
-        self._save(data)
-        return self.get(name)
+        with self._profile_lock():
+            validate_profile_name(name)
+            data = self._load()
+            if name not in data["profiles"]:
+                raise ProfileNotFound(f"profile not found: {name}")
+            data["profiles"][name]["subscription_date"] = subscription_date
+            self._save(data)
+            return self.get(name)
 
     def rename(self, old_name: str, new_name: str) -> Profile:
         validate_profile_name(old_name)
@@ -416,21 +498,22 @@ class ProfileStore:
         return self.get(new_name)
 
     def remove(self, name: str) -> Path:
-        profile = self.get(name)
-        data = self._load()
-        profile_dir = self.profiles_root / name
+        with self._profile_lock():
+            profile = self.get(name)
+            data = self._load()
+            profile_dir = self.profiles_root / name
 
-        # Refuse to delete anything that does not resolve directly beneath our profiles root.
-        expected = profile_dir.resolve()
-        actual_parent = expected.parent
-        if actual_parent != self.profiles_root.resolve():
-            raise ProfileError(f"refusing unsafe profile path: {expected}")
+            # Refuse to delete anything that does not resolve directly beneath our profiles root.
+            expected = profile_dir.resolve()
+            actual_parent = expected.parent
+            if actual_parent != self.profiles_root.resolve():
+                raise ProfileError(f"refusing unsafe profile path: {expected}")
 
-        if profile_dir.exists():
-            shutil.rmtree(profile_dir)
-        data["profiles"].pop(name, None)
-        self._save(data)
-        return expected
+            if profile_dir.exists():
+                shutil.rmtree(profile_dir)
+            data["profiles"].pop(name, None)
+            self._save(data)
+            return expected
 
     def profile_dir(self, name: str) -> Path:
         validate_profile_name(name)

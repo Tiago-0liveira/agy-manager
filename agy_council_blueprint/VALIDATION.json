@@ -1,0 +1,50 @@
+{
+  "scope": "Design packet consistency only; no production schema/provider/application test",
+  "examples": {
+    "quick_council.json": {
+      "workers": 3,
+      "stages": 3,
+      "base_model_calls": 6,
+      "live_bindings_verified": false,
+      "configuration_checks": "PASS"
+    },
+    "research_and_design.json": {
+      "workers": 4,
+      "stages": 6,
+      "base_model_calls": 15,
+      "live_bindings_verified": false,
+      "configuration_checks": "PASS"
+    },
+    "review_and_revise.json": {
+      "workers": 2,
+      "stages": 5,
+      "base_model_calls": 5,
+      "live_bindings_verified": false,
+      "configuration_checks": "PASS"
+    }
+  },
+  "negative_cases": [
+    {
+      "case": "duplicate_worker",
+      "rejected": true
+    },
+    {
+      "case": "missing_actor",
+      "rejected": true
+    },
+    {
+      "case": "future_input",
+      "rejected": true
+    },
+    {
+      "case": "invalid_budget",
+      "rejected": true
+    }
+  ],
+  "remaining": [
+    "Account/model/input binding",
+    "Actual application implementation",
+    "CLI protocol and OAuth isolation tests",
+    "Windows process lifecycle tests"
+  ]
+}

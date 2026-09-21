@@ -1,0 +1,202 @@
+{
+  "schema_version": 1,
+  "draft": true,
+  "inputs": [
+    {
+      "id": "brief",
+      "description": "User objective, constraints and intended deliverable.",
+      "required": true
+    },
+    {
+      "id": "evidence",
+      "description": "Released source evidence, definitions, provenance and known limitations.",
+      "required": true
+    }
+  ],
+  "limits": {
+    "global_concurrency": 4,
+    "per_account_concurrency": 1,
+    "max_model_calls": 24,
+    "max_retries_per_task": 1,
+    "max_wall_seconds": 7200,
+    "automatic_account_switching": false
+  },
+  "execution_mode": "supplied_evidence",
+  "name": "Research and design",
+  "goal": "Investigate the supplied evidence and propose a defensible new design direction or conclude that evidence is insufficient.",
+  "workers": [
+    {
+      "id": "lead",
+      "name": "Lead investigator",
+      "account_ref": "profile-1",
+      "model": "<choose-discovered-model>",
+      "role": "coordinator",
+      "instructions": "Separate observed facts from interpretations and preserve dissent.",
+      "task": "Organize the evidence and synthesize the final recommendation."
+    },
+    {
+      "id": "falsifier",
+      "name": "Falsifier",
+      "account_ref": "profile-2",
+      "model": "<choose-discovered-model>",
+      "role": "reviewer",
+      "instructions": "Find testable alternative explanations and decisive defects, without requiring impossible certainty.",
+      "task": "Challenge measurement, causal claims and proposed mechanisms."
+    },
+    {
+      "id": "designer_a",
+      "name": "Designer A",
+      "account_ref": "profile-3",
+      "model": "<choose-discovered-model>",
+      "role": "designer",
+      "instructions": "Develop mechanisms from evidence rather than familiar defaults.",
+      "task": "Form an independent diagnosis, then propose distinct design concepts."
+    },
+    {
+      "id": "designer_b",
+      "name": "Designer B",
+      "account_ref": "profile-4",
+      "model": "<choose-discovered-model>",
+      "role": "designer",
+      "instructions": "Consider competing mechanisms independently and make uncertainty explicit.",
+      "task": "Form an independent diagnosis and alternative design concepts."
+    }
+  ],
+  "stages": [
+    {
+      "id": "diagnoses",
+      "kind": "independent",
+      "workers": [
+        "lead",
+        "falsifier",
+        "designer_a",
+        "designer_b"
+      ],
+      "input_stages": [],
+      "instruction": "Explain what the evidence establishes, competing explanations, contradictions and falsifiers. Do not design a replacement yet.",
+      "context": "fresh",
+      "release": "after_all_required",
+      "failure_policy": "needs_attention",
+      "required_sections": [
+        "findings",
+        "evidence_or_assumptions",
+        "uncertainties",
+        "next_action"
+      ]
+    },
+    {
+      "id": "requirements",
+      "kind": "critique",
+      "workers": [
+        "lead",
+        "falsifier"
+      ],
+      "input_stages": [
+        "diagnoses"
+      ],
+      "instruction": "Compare diagnoses and derive supported requirements. Name missing decisive measurements; do not claim they have been performed.",
+      "context": "continue",
+      "release": "after_all_required",
+      "failure_policy": "needs_attention",
+      "required_sections": [
+        "findings",
+        "evidence_or_assumptions",
+        "uncertainties",
+        "next_action"
+      ]
+    },
+    {
+      "id": "concepts",
+      "kind": "independent",
+      "workers": [
+        "designer_a",
+        "designer_b"
+      ],
+      "input_stages": [
+        "diagnoses",
+        "requirements"
+      ],
+      "instruction": "Independently propose up to two materially different concepts with mechanisms, observables, failure cases and minimal falsification experiments. Do not inspect peer drafts.",
+      "context": "continue",
+      "release": "after_all_required",
+      "failure_policy": "needs_attention",
+      "required_sections": [
+        "findings",
+        "evidence_or_assumptions",
+        "uncertainties",
+        "next_action"
+      ]
+    },
+    {
+      "id": "cross_review",
+      "kind": "critique",
+      "workers": [
+        "lead",
+        "falsifier",
+        "designer_a",
+        "designer_b"
+      ],
+      "input_stages": [
+        "requirements",
+        "concepts"
+      ],
+      "instruction": "Critique every concept fairly. Architects focus on the other architect's cards. Identify strongest cases, material objections and distinguishing tests.",
+      "context": "continue",
+      "release": "after_all_required",
+      "failure_policy": "needs_attention",
+      "required_sections": [
+        "findings",
+        "evidence_or_assumptions",
+        "uncertainties",
+        "next_action"
+      ]
+    },
+    {
+      "id": "revisions",
+      "kind": "revise",
+      "workers": [
+        "designer_a",
+        "designer_b"
+      ],
+      "input_stages": [
+        "concepts",
+        "cross_review"
+      ],
+      "instruction": "Make one documented response/revision. Do not claim proposed experiments were executed or create an untested compromise.",
+      "context": "continue",
+      "release": "after_all_required",
+      "failure_policy": "needs_attention",
+      "required_sections": [
+        "findings",
+        "evidence_or_assumptions",
+        "uncertainties",
+        "next_action"
+      ]
+    },
+    {
+      "id": "dossier",
+      "kind": "synthesize",
+      "workers": [
+        "lead"
+      ],
+      "input_stages": [
+        "diagnoses",
+        "requirements",
+        "concepts",
+        "cross_review",
+        "revisions"
+      ],
+      "instruction": "Recommend a bounded next direction, at most one reserve with a distinguishing test, or no recommendation. Preserve dissent and distinguish plausibility from validation.",
+      "context": "continue",
+      "release": "after_all_required",
+      "failure_policy": "needs_attention",
+      "required_sections": [
+        "findings",
+        "evidence_or_assumptions",
+        "uncertainties",
+        "next_action"
+      ]
+    }
+  ],
+  "final_stage": "dossier"
+}

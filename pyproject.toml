@@ -12,9 +12,22 @@ license = {text = "MIT"}
 authors = [{name = "agym contributors"}]
 dependencies = []
 
+[project.optional-dependencies]
+council = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic",
+    "aiofiles",
+]
+
 [project.scripts]
 agym = "agym.cli:main"
 agym-statusline = "agym.statusline:main"
+agym-council = "agym.council.cli:main"
 
-[tool.setuptools]
-packages = ["agym"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agym*"]
+
+[tool.setuptools.package-data]
+"agym.council" = ["presets/*.json", "web_dist/**/*"]
