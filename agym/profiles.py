@@ -36,6 +36,7 @@ RESERVED_NAMES = {
     "rotate",
     "rename",
     "mv",
+    "auto-pr",
 }
 
 

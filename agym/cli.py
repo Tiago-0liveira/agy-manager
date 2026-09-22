@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .cache import CacheManager
 from .diagnostics import doctor_lines
+from .git.auto_pr import AutoPrError, handle_auto_pr, parse_auto_pr_args
 from .launcher import (
     ALL_PERMISSIONS_ALIASES,
     AgyNotFound,
@@ -44,6 +45,7 @@ Usage:
   agym <command> [arguments...]
   agym <profile> [--] [agy args...]
   agym <profile> --auto-prompt "<prompt>"
+  agym <profile> --auto-pr [-b <branch>] [--title <title>] [--body <body>] [--draft] [--no-push]
   agym rotate [--file <file>] [--status] [--reset] [--simulate [N]] [-- [agy args...]]
   agym config <profile> [--model <model>|default] [-y|--dsp|--skip-perms|--[no-]dangerously-skip-permissions]
 
@@ -59,6 +61,7 @@ Commands:
   statusline                          Manage and preview statusline across all registered profiles
   remove <profile>                    Delete a profile and its isolated data
   doctor [profile]                    Check environment, executable, permissions, and state
+  auto-pr [profile]                   Create a pull request from current branch into base branch
 
 Launching Antigravity:
   agym <profile>                      Launch Antigravity under the specified profile.
@@ -78,6 +81,9 @@ Launching Antigravity:
   agym <profile> --auto-prompt "<prompt>"
                                       Two-stage prompt workflow: run non-interactively to generate
                                       a plan, then continue interactively in the same profile session.
+
+  agym <profile> --auto-pr            Automated pull request creation: inspects commits and diff,
+                                      pushes current branch, and opens a PR via GitHub CLI.
 
 General Options:
   -h, --help                          Show this help message and exit
@@ -129,11 +135,22 @@ Command Options:
   agym remove <profile> [-y, --yes]
       -y, --yes                       Delete without interactive confirmation prompt
 
+  agym <profile> --auto-pr [-b, --base BRANCH] [--title TITLE] [--body BODY] [--draft] [--no-push] [-n]
+      -b, --base BRANCH               Target base branch for PR (default: main)
+      --title TITLE                   Custom PR title (auto-generated from commits if omitted)
+      --body BODY                     Custom PR description (auto-generated from diff if omitted)
+      --draft                         Create pull request as a draft
+      --no-push                       Skip pushing current branch to origin before PR creation
+      -n, --dry-run                   Preview PR creation without pushing or creating a PR
+
 Examples:
   agym setup personal                 Create profile and authenticate with Google
   agym setup work -s 14/03/2027       Create profile with known subscription renewal date
   agym personal                       Open an interactive Antigravity session
   agym personal -p "write tests"      Run non-interactive Antigravity command
+  agym personal --auto-pr             Create PR from current branch into main
+  agym work --auto-pr -b develop      Create PR targeting develop branch
+  agym work --auto-pr --draft         Create draft PR from current branch
   agym rename personal main           Rename profile 'personal' to 'main'
   agym rename jmcar AI1               Rename profile 'jmcar' to 'AI1'
   agym list                           Check status and renewal timeline of all profiles
@@ -831,11 +848,73 @@ def _parse_auto_prompt(args: list[str]) -> tuple[str | None, list[str]]:
     return None, args
 
 
+def _is_auto_pr(args: list[str]) -> bool:
+    if not args:
+        return False
+    pre_separator = []
+    for arg in args:
+        if arg == "--":
+            break
+        pre_separator.append(arg)
+    return any(arg == "--auto-pr" or arg.startswith("--auto-pr=") for arg in pre_separator)
+
+
+def _auto_pr(argv: list[str], store: ProfileStore) -> int:
+    if any(arg in {"-h", "--help"} for arg in argv):
+        parse_auto_pr_args(["--help"])
+        return 0
+
+    profile_name = None
+    remaining_argv = []
+    if argv and not argv[0].startswith("-"):
+        profile_name = argv[0]
+        remaining_argv = argv[1:]
+    else:
+        profiles = store.list()
+        if len(profiles) == 1:
+            profile_name = profiles[0].name
+            remaining_argv = argv
+        elif not profiles:
+            raise ProfileError("no profiles configured. Run 'agym setup <profile>' first.")
+        else:
+            raise ProfileError("profile name is required for auto-pr. Usage: agym <profile> --auto-pr [-b <base>]")
+
+    validate_profile_name(profile_name)
+    profile = store.get(profile_name)
+    if not any(arg == "--auto-pr" or arg.startswith("--auto-pr=") for arg in remaining_argv):
+        remaining_argv = ["--auto-pr"] + remaining_argv
+    ns = parse_auto_pr_args(remaining_argv)
+    return handle_auto_pr(
+        profile=profile,
+        base_branch=ns.base,
+        title=ns.title,
+        body=ns.body,
+        draft=ns.draft,
+        no_push=ns.no_push,
+        dry_run=ns.dry_run,
+        store=store,
+    )
+
+
 def _launch(profile_name: str, argv: list[str], store: ProfileStore) -> int:
     validate_profile_name(profile_name)
+    profile = store.get(profile_name)
+
+    if _is_auto_pr(argv):
+        ns = parse_auto_pr_args(argv)
+        return handle_auto_pr(
+            profile=profile,
+            base_branch=ns.base,
+            title=ns.title,
+            body=ns.body,
+            draft=ns.draft,
+            no_push=ns.no_push,
+            dry_run=ns.dry_run,
+            store=store,
+        )
+
     # Resolve before environment construction so PATH lookup uses the host environment.
     agy = resolve_agy()
-    profile = store.get(profile_name)
 
     auto_prompt, rest = _parse_auto_prompt(argv)
     if auto_prompt is not None:
@@ -890,8 +969,10 @@ def main(argv: list[str] | None = None) -> int:
             return _remove(rest, store)
         if command == "doctor":
             return _doctor(rest, store)
+        if command in {"auto-pr", "--auto-pr"}:
+            return _auto_pr(rest, store)
         return _launch(command, rest, store)
-    except (InvalidProfileName, ProfileExists, ProfileNotFound, ProfileError, AgyNotFound, SubscriptionError) as exc:
+    except (InvalidProfileName, ProfileExists, ProfileNotFound, ProfileError, AgyNotFound, SubscriptionError, AutoPrError) as exc:
         _print_err(str(exc))
         return 2
     except KeyboardInterrupt:
