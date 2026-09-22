@@ -23,6 +23,7 @@ from agym.statusline import (
     format_vcs_tag,
     get_profile_settings_path,
     get_rank_color,
+    get_statusline_command,
     get_statusline_script_path,
     get_statusline_status,
     install_statusline_script,
@@ -34,6 +35,7 @@ from agym.statusline import (
     resolve_context_window,
     resolve_git_vcs,
     resolve_model_display,
+    resolve_python_executable,
     resolve_quota,
     sync_all_profiles,
     sync_profile_statusline,
@@ -356,11 +358,15 @@ class InstallationAndSyncTests(unittest.TestCase):
     def test_install_statusline_script(self) -> None:
         script_path = install_statusline_script(self.data_root)
         self.assertTrue(script_path.is_file())
-        if os.name != "nt":
+        if sys.platform != "win32" and os.name != "nt":
             mode = script_path.stat().st_mode
             self.assertTrue(bool(mode & 0o111), "Script should be executable")
-        content = script_path.read_text()
-        self.assertIn("from agym.statusline import main", content)
+            content = script_path.read_text()
+            self.assertIn("from agym.statusline import main", content)
+        else:
+            py_target = script_path.parent / "statusline.py"
+            self.assertTrue(py_target.is_file())
+            self.assertIn("from agym.statusline import main", py_target.read_text())
 
     def test_sync_profile_statusline_preserves_existing_settings(self) -> None:
         profile = self.store.create("work")
@@ -386,12 +392,46 @@ class InstallationAndSyncTests(unittest.TestCase):
         # Check statusLine was added
         self.assertIn("statusLine", new_data)
         self.assertEqual(new_data["statusLine"]["type"], "command")
-        self.assertEqual(new_data["statusLine"]["command"], str(script_path.resolve()))
+        if sys.platform == "win32" or os.name == "nt":
+            pythonw = resolve_python_executable(gui=True)
+            expected_cmd = f'"{pythonw}" "{(script_path.parent / "statusline.py").resolve()}"'
+        else:
+            expected_cmd = str(script_path.resolve())
+        self.assertEqual(new_data["statusLine"]["command"], expected_cmd)
         self.assertTrue(new_data["statusLine"]["enabled"])
 
         # Subsequent sync without changes should return False (idempotent)
         updated2 = sync_profile_statusline(profile.home, script_path, enabled=True)
         self.assertFalse(updated2)
+
+    def test_resolve_python_executable_windows_gui(self) -> None:
+        with patch("sys.platform", "win32"), patch("os.name", "nt"):
+            with patch("pathlib.Path.is_file", return_value=True):
+                resolved = resolve_python_executable(gui=True)
+                self.assertEqual(resolved.name.lower(), "pythonw.exe")
+
+    def test_resolve_python_executable_windows_console(self) -> None:
+        with patch("sys.platform", "win32"), patch("os.name", "nt"):
+            resolved = resolve_python_executable(gui=False)
+            self.assertEqual(resolved, Path(sys.executable).resolve())
+
+    def test_resolve_python_executable_posix(self) -> None:
+        with patch("sys.platform", "linux"):
+            resolved = resolve_python_executable(gui=True)
+            self.assertEqual(resolved, Path(sys.executable).resolve())
+
+    def test_get_statusline_command_windows(self) -> None:
+        with patch("sys.platform", "win32"):
+            cmd = get_statusline_command(self.data_root)
+            self.assertTrue(cmd.startswith('"'))
+            self.assertIn("statusline.py", cmd)
+            self.assertIn("pythonw", cmd.lower())
+
+    def test_get_statusline_command_posix(self) -> None:
+        with patch("sys.platform", "linux"):
+            cmd = get_statusline_command(self.data_root)
+            expected = str((self.data_root / "bin" / "statusline").resolve())
+            self.assertEqual(cmd, expected)
 
     def test_sync_all_profiles(self) -> None:
         p1 = self.store.create("acc1")
@@ -516,9 +556,10 @@ class CliStatuslineCommandTests(unittest.TestCase):
         self.assertIn("5h: 80%", output)
 
     def test_statusline_main_exception_safe_fallback(self) -> None:
+        stdin = io.StringIO("")
         stdout = io.StringIO()
         with patch("agym.statusline.render_statusline", side_effect=RuntimeError("unexpected crash")):
-            with patch("sys.stdout", stdout):
+            with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
                 with patch.dict(os.environ, {"AGYM_PROFILE": "safe_profile"}):
                     code = statusline_main()
         self.assertEqual(code, 0)

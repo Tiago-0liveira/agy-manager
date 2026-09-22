@@ -601,10 +601,29 @@ def render_statusline(
     return f"{account_tag}{sep}{quota_5h_tag}"
 
 
+def resolve_python_executable(gui: bool = False) -> Path:
+    current = Path(sys.executable).resolve()
+    if gui and sys.platform == "win32":
+        candidate = current.with_name("pythonw.exe")
+        if candidate.is_file():
+            return candidate
+    return current
+
+
 def get_statusline_script_path(data_root: Path | None = None) -> Path:
     root = Path(data_root) if data_root else _default_data_root()
-    ext = ".cmd" if sys.platform == "win32" or os.name == "nt" else ""
+    ext = ".cmd" if sys.platform == "win32" else ""
     return root / "bin" / f"statusline{ext}"
+
+
+def get_statusline_command(data_root: Path | None = None) -> str:
+    root = Path(data_root) if data_root else _default_data_root()
+    if sys.platform == "win32":
+        pythonw = resolve_python_executable(gui=True)
+        py_script = root / "bin" / "statusline.py"
+        return f'"{pythonw}" "{py_script.resolve()}"'
+    script_path = root / "bin" / "statusline"
+    return str(script_path.resolve())
 
 
 def install_statusline_script(data_root: Path | None = None) -> Path:
@@ -615,7 +634,7 @@ def install_statusline_script(data_root: Path | None = None) -> Path:
     python_bin = sys.executable
     package_root = str(Path(__file__).resolve().parent.parent)
 
-    is_windows = sys.platform == "win32" or os.name == "nt"
+    is_windows = sys.platform == "win32"
     py_target = script_path.parent / "statusline.py" if is_windows else script_path
     content = (
         f"#!{python_bin}\n"
@@ -641,9 +660,10 @@ def install_statusline_script(data_root: Path | None = None) -> Path:
             tmp.unlink()
 
     if is_windows:
+        pythonw_bin = resolve_python_executable(gui=True)
         cmd_content = (
             "@echo off\r\n"
-            f'"{python_bin}" "%~dp0statusline.py" %*\r\n'
+            f'"{pythonw_bin}" "%~dp0statusline.py" %*\r\n'
         )
         fd_cmd, tmp_cmd_name = tempfile.mkstemp(prefix=".statusline_cmd.", suffix=".tmp", dir=script_path.parent)
         tmp_cmd = Path(tmp_cmd_name)
@@ -664,8 +684,9 @@ def get_profile_settings_path(profile_home: Path) -> Path:
 
 def sync_profile_statusline(
     profile_home: Path,
-    script_path: Path,
+    script_path: Path | None = None,
     enabled: bool = True,
+    command: str | None = None,
 ) -> bool:
     settings_file = get_profile_settings_path(profile_home)
     settings_file.parent.mkdir(parents=True, exist_ok=True)
@@ -681,9 +702,21 @@ def sync_profile_statusline(
         except Exception:
             existing = {}
 
+    if command is not None:
+        target_command = command
+    elif script_path is not None:
+        if sys.platform == "win32":
+            pythonw = resolve_python_executable(gui=True)
+            py_target = script_path.parent / "statusline.py" if script_path.suffix.lower() == ".cmd" else script_path
+            target_command = f'"{pythonw}" "{py_target.resolve()}"'
+        else:
+            target_command = str(script_path.resolve())
+    else:
+        target_command = get_statusline_command()
+
     statusline_cfg = {
         "type": "command",
-        "command": str(script_path.resolve()),
+        "command": target_command,
         "enabled": enabled,
     }
 
@@ -749,27 +782,29 @@ def get_statusline_status(store: ProfileStore) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     if sys.platform == "win32":
         for stream in (sys.stdout, sys.stderr, sys.stdin):
-            if hasattr(stream, "reconfigure"):
+            if stream is not None and hasattr(stream, "reconfigure"):
                 try:
                     stream.reconfigure(encoding="utf-8", errors="replace")
                 except Exception:
                     pass
     try:
         raw = ""
-        if not sys.stdin.isatty():
+        if sys.stdin is not None and not getattr(sys.stdin, "isatty", lambda: False)():
             try:
                 raw = sys.stdin.read()
             except Exception:
                 raw = ""
         payload = json.loads(raw) if raw.strip() else {}
         output = render_statusline(payload)
-        sys.stdout.write(output + "\n")
-        sys.stdout.flush()
+        if sys.stdout is not None:
+            sys.stdout.write(output + "\n")
+            sys.stdout.flush()
         return 0
     except Exception:
         profile = os.environ.get("AGYM_PROFILE", "antigravity")
-        sys.stdout.write(f"[{profile}]\n")
-        sys.stdout.flush()
+        if sys.stdout is not None:
+            sys.stdout.write(f"[{profile}]\n")
+            sys.stdout.flush()
         return 0
 
 
