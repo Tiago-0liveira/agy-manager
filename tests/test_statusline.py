@@ -626,23 +626,36 @@ class StatuslineVCSTests(unittest.TestCase):
         self.assertIsNone(parse_git_head("   \n"))
 
     def test_format_vcs_tag(self) -> None:
-        vcs_wt = VCSInfo(branch="feat/statusline", worktree="statusline")
+        vcs_wt = VCSInfo(branch="feat/statusline", worktree="statusline", directory="wt_dir")
         formatted_color = format_vcs_tag(vcs_wt, include_worktree=True, no_color=False)
-        self.assertIn("🌿 feat/statusline", formatted_color)
-        self.assertIn("[statusline]", formatted_color)
+        self.assertIn("🌳 🌿 feat/statusline", formatted_color)
         self.assertIn("\033[38;5;75m", formatted_color)
 
         formatted_no_color = format_vcs_tag(vcs_wt, include_worktree=True, no_color=True)
-        self.assertEqual(formatted_no_color, "🌿 feat/statusline [statusline]")
+        self.assertEqual(formatted_no_color, "🌳 🌿 feat/statusline")
 
         formatted_no_wt = format_vcs_tag(vcs_wt, include_worktree=False, no_color=True)
         self.assertEqual(formatted_no_wt, "🌿 feat/statusline")
+
+        # Normal repository with directory
+        vcs_repo = VCSInfo(branch="main", directory="my-project")
+        self.assertEqual(format_vcs_tag(vcs_repo, no_color=True), "my-project 🌿 main")
+        formatted_repo_color = format_vcs_tag(vcs_repo, no_color=False)
+        self.assertIn("my-project", formatted_repo_color)
+        self.assertIn("🌿 main", formatted_repo_color)
+
+        # Directory truncation
+        long_dir = VCSInfo(branch="main", directory="very-long-project-folder")
+        self.assertEqual(format_vcs_tag(long_dir, max_dir_len=14, no_color=True), "very-long-pro… 🌿 main")
+
+        # Directory disabled
+        self.assertEqual(format_vcs_tag(vcs_repo, include_directory=False, no_color=True), "🌿 main")
 
         # None inputs
         self.assertIsNone(format_vcs_tag(None))
         self.assertIsNone(format_vcs_tag(VCSInfo()))
 
-        # Truncation
+        # Branch Truncation
         long_vcs = VCSInfo(branch="feature/very-long-branch-name", worktree=None)
         truncated = format_vcs_tag(long_vcs, include_worktree=False, max_branch_len=14, no_color=True)
         self.assertEqual(truncated, "🌿 feature/very-…")
@@ -656,6 +669,7 @@ class StatuslineVCSTests(unittest.TestCase):
         vcs = resolve_git_vcs(cwd=repo_dir)
         self.assertEqual(vcs.branch, "main")
         self.assertIsNone(vcs.worktree)
+        self.assertEqual(vcs.directory, "standard_repo")
 
     def test_resolve_git_vcs_linked_worktree(self) -> None:
         main_git = self.tmp_dir / "main_repo" / ".git"
@@ -750,7 +764,7 @@ class StatuslineVCSTests(unittest.TestCase):
             "quota": {"gemini-5h": {"remaining_fraction": 0.85}},
         }
 
-        # Wide terminal: includes [worktree]
+        # Wide terminal in worktree: includes worktree icon
         wide_line = render_statusline(
             payload,
             profile_name="tiagoliv",
@@ -759,10 +773,25 @@ class StatuslineVCSTests(unittest.TestCase):
             cwd=wt_dir,
         )
         self.assertIn("👤 tiagoliv", wide_line)
-        self.assertIn("🌿 feat/statusline [my-feature-wt]", wide_line)
+        self.assertIn("🌳 🌿 feat/statusline", wide_line)
         self.assertIn("5h: [█████░] 85%", wide_line)
 
-        # Narrower terminal (70 columns): includes branch only
+        # Standard repository (non-worktree): includes current directory before branch
+        repo_dir = self.tmp_dir / "standard_repo"
+        git_dir = repo_dir / ".git"
+        git_dir.mkdir(parents=True, exist_ok=True)
+        (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
+        repo_line = render_statusline(
+            payload,
+            profile_name="tiagoliv",
+            terminal_width=110,
+            no_color=True,
+            cwd=repo_dir,
+        )
+        self.assertIn("👤 tiagoliv", repo_line)
+        self.assertIn("standard_repo 🌿 main", repo_line)
+
+        # Narrower terminal (70 columns): worktree icon still included
         narrow_line = render_statusline(
             payload,
             profile_name="tiagoliv",
@@ -771,8 +800,7 @@ class StatuslineVCSTests(unittest.TestCase):
             cwd=wt_dir,
         )
         self.assertIn("👤 tiagoliv", narrow_line)
-        self.assertIn("🌿 feat/statusline", narrow_line)
-        self.assertNotIn("[my-feature-wt]", narrow_line)
+        self.assertIn("🌳 🌿 feat/statusline", narrow_line)
 
         # Ultra compact terminal (50 columns): omits vcs tag
         ultra_line = render_statusline(

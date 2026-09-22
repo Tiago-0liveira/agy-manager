@@ -306,6 +306,7 @@ def resolve_context_window(payload: dict[str, Any] | None = None) -> ContextWind
 class VCSInfo:
     branch: str | None = None
     worktree: str | None = None
+    directory: str | None = None
 
 
 def parse_git_head(head_content: str | None) -> str | None:
@@ -343,6 +344,7 @@ def resolve_git_vcs(
 
     branch: str | None = None
     worktree: str | None = None
+    directory: str | None = None
 
     # Check if payload explicitly provides VCS metadata without an explicit cwd
     has_explicit_cwd = (
@@ -355,12 +357,9 @@ def resolve_git_vcs(
     payload_git = payload.get("git") if isinstance(payload.get("git"), dict) else {}
     payload_branch = payload_vcs.get("branch") or payload_git.get("branch") or payload.get("branch")
     payload_worktree = payload_vcs.get("worktree") or payload_git.get("worktree") or payload.get("worktree")
-
-    if not has_explicit_cwd and payload_branch:
-        return VCSInfo(
-            branch=str(payload_branch).strip(),
-            worktree=str(payload_worktree).strip() if payload_worktree else None,
-        )
+    payload_dir = payload_vcs.get("directory") or payload_git.get("directory") or payload.get("directory")
+    if payload_dir:
+        directory = str(payload_dir).strip()
 
     # Determine directory to inspect
     target_dir: Path | None = None
@@ -394,6 +393,16 @@ def resolve_git_vcs(
             target_dir = Path.cwd().resolve()
         except Exception:
             target_dir = None
+
+    if directory is None and target_dir is not None and target_dir.name:
+        directory = target_dir.name
+
+    if not has_explicit_cwd and payload_branch:
+        return VCSInfo(
+            branch=str(payload_branch).strip(),
+            worktree=str(payload_worktree).strip() if payload_worktree else None,
+            directory=directory,
+        )
 
     # Inspect disk
     if target_dir is not None:
@@ -438,13 +447,15 @@ def resolve_git_vcs(
     if worktree is None and payload_worktree:
         worktree = str(payload_worktree).strip()
 
-    return VCSInfo(branch=branch, worktree=worktree)
+    return VCSInfo(branch=branch, worktree=worktree, directory=directory)
 
 
 def format_vcs_tag(
     vcs: VCSInfo | None,
     include_worktree: bool = True,
+    include_directory: bool = True,
     max_branch_len: int | None = None,
+    max_dir_len: int | None = None,
     no_color: bool = False,
 ) -> str | None:
     if not vcs or not vcs.branch:
@@ -455,13 +466,27 @@ def format_vcs_tag(
         branch = branch[: max_branch_len - 1] + "…"
 
     blue = BLUE if not no_color else ""
-    dark_gray = DARK_GRAY if not no_color else ""
+    gray = GRAY if not no_color else ""
     reset = RESET if not no_color else ""
 
-    if include_worktree and vcs.worktree:
+    # Inside worktree: show compact worktree icon before the branch
+    if vcs.worktree:
+        if include_worktree:
+            if no_color:
+                return f"🌳 🌿 {branch}"
+            return f"{blue}🌳 🌿 {branch}{reset}"
         if no_color:
-            return f"🌿 {branch} [{vcs.worktree}]"
-        return f"{blue}🌿 {branch} {dark_gray}[{vcs.worktree}]{reset}"
+            return f"🌿 {branch}"
+        return f"{blue}🌿 {branch}{reset}"
+
+    # Normal repository: show current directory (last directory of path) before branch name
+    if include_directory and vcs.directory:
+        dir_name = vcs.directory
+        if max_dir_len and len(dir_name) > max_dir_len:
+            dir_name = dir_name[: max_dir_len - 1] + "…"
+        if no_color:
+            return f"{dir_name} 🌿 {branch}"
+        return f"{gray}{dir_name} {blue}🌿 {branch}{reset}"
 
     if no_color:
         return f"🌿 {branch}"
@@ -505,12 +530,16 @@ def render_statusline(
     account_tag = f"{bold}{cyan}👤 {account}{reset}"
 
     # VCS tag
-    include_worktree = terminal_width >= 75
-    max_branch = None if terminal_width >= 75 else 18
+    include_worktree = terminal_width >= 55
+    include_directory = terminal_width >= 65
+    max_branch = None if terminal_width >= 85 else 16
+    max_dir = None if terminal_width >= 85 else 14
     vcs_tag = format_vcs_tag(
         vcs,
         include_worktree=include_worktree,
+        include_directory=include_directory,
         max_branch_len=max_branch,
+        max_dir_len=max_dir,
         no_color=no_color,
     )
 
