@@ -224,24 +224,44 @@ def load_profile_token(profile_home: Path | str) -> tuple[str, bytes] | None:
 
 def has_profile_token(profile_home: Path | str) -> bool:
     """Checks if a valid token file exists for the given profile home."""
-    return load_profile_token(profile_home) is not None
+    if load_profile_token(profile_home) is not None:
+        return True
+    oauth_token_path = Path(profile_home).resolve() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+    return oauth_token_path.is_file()
 
 
 def get_profile_email(profile_home: Path | str) -> str | None:
     """Returns the authenticated email associated with this profile, if recorded."""
     token_path = get_profile_token_path(profile_home)
-    if not token_path.is_file():
-        return None
-    try:
-        with open(token_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            if data.get("email"):
-                return str(data["email"])
-            blob = data.get("blob", "")
-            return extract_email_from_blob(blob)
-    except Exception:
-        pass
+    if token_path.is_file():
+        try:
+            with open(token_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                if data.get("email"):
+                    return str(data["email"])
+                blob = data.get("blob", "")
+                email = extract_email_from_blob(blob)
+                if email:
+                    return email
+        except Exception:
+            pass
+
+    # Fallback to antigravity-oauth-token (used by native agy CLI on macOS/Linux)
+    oauth_token_path = Path(profile_home).resolve() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+    if oauth_token_path.is_file():
+        try:
+            with open(oauth_token_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                if data.get("email"):
+                    return str(data["email"])
+                email = extract_email_from_blob(json.dumps(data))
+                if email:
+                    return email
+        except Exception:
+            pass
+
     return None
 
 
@@ -326,19 +346,34 @@ def profile_credential_context(
     *,
     is_setup: bool = False,
 ) -> Generator[None, None, None]:
-    """Context manager ensuring safe, isolated Windows Credential Manager access for a profile.
+    """Context manager ensuring safe, isolated OS credential store access for a profile.
 
-    Synchronizes credentials before launch and captures updated tokens on exit.
+    - On Windows: synchronizes isolated token to/from Windows Credential Manager.
+    - On macOS: configures and synchronizes isolated login keychain to prevent 'Keychain Not Found' popups.
     """
-    if not is_windows_platform():
-        yield
+    if is_windows_platform():
+        sync_credentials_before_launch(profile_home, is_setup=is_setup)
+        try:
+            yield
+        finally:
+            sync_credentials_after_launch(profile_home, is_setup=is_setup)
         return
 
-    sync_credentials_before_launch(profile_home, is_setup=is_setup)
-    try:
-        yield
-    finally:
-        sync_credentials_after_launch(profile_home, is_setup=is_setup)
+    from .maccred import (
+        is_darwin_platform,
+        sync_mac_credentials_after_launch,
+        sync_mac_credentials_before_launch,
+    )
+
+    if is_darwin_platform():
+        sync_mac_credentials_before_launch(profile_home, is_setup=is_setup)
+        try:
+            yield
+        finally:
+            sync_mac_credentials_after_launch(profile_home, is_setup=is_setup)
+        return
+
+    yield
 
 
 @asynccontextmanager
@@ -347,14 +382,13 @@ async def async_profile_credential_context(
     *,
     is_setup: bool = False,
 ) -> AsyncGenerator[None, None]:
-    """Async context manager ensuring serialized, isolated Windows Credential Manager access.
-
-    Serializes concurrent tasks on Windows to prevent race conditions on gemini:antigravity.
-    """
-    if not is_windows_platform():
-        yield
+    """Async context manager ensuring isolated credential store access for a profile."""
+    if is_windows_platform():
+        async with get_wincred_async_lock():
+            with profile_credential_context(profile_home, is_setup=is_setup):
+                yield
         return
 
-    async with get_wincred_async_lock():
-        with profile_credential_context(profile_home, is_setup=is_setup):
-            yield
+    with profile_credential_context(profile_home, is_setup=is_setup):
+        yield
+
