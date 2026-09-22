@@ -100,6 +100,7 @@ def parse_iso_datetime(raw: str | None) -> datetime | None:
     cleaned = raw.strip()
     if cleaned.endswith("Z") or cleaned.endswith("z"):
         cleaned = cleaned[:-1] + "+00:00"
+    cleaned = re.sub(r"(\.\d{6})\d+", r"\1", cleaned)
     try:
         dt = datetime.fromisoformat(cleaned)
         if dt.tzinfo is None:
@@ -865,7 +866,7 @@ async def fetch_account_usage_async(
 async def fetch_all_usage(
     agy_path: Path,
     profiles: Sequence[Profile],
-    concurrency_limit: int = 8,
+    concurrency_limit: int = 12,
     timeout: float = 30.0,
     force_refresh: bool = False,
     cache_manager: CacheManager | None = None,
@@ -1040,7 +1041,7 @@ async def run_usage(
     json_mode: bool = False,
     refresh: bool = False,
     timeout: float = 30.0,
-    concurrency_limit: int = 8,
+    concurrency_limit: int = 12,
     view: str = "table",
     sort_by: str = "usage",
     show_claude: bool = False,
@@ -1142,7 +1143,7 @@ async def fetch_and_cache_usage_async(
     *,
     agy_path: Path | None = None,
     cache_manager: CacheManager | None = None,
-    concurrency_limit: int = 8,
+    concurrency_limit: int = 12,
     timeout: float = 30.0,
     runner: Callable[..., Coroutine[Any, Any, tuple[int, str, str]]] | None = None,
     on_progress: Callable[[AccountUsage], None] | None = None,

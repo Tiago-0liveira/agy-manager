@@ -175,6 +175,31 @@ class WincredUnitTests(unittest.TestCase):
         self.assertTrue(has_profile_token(self.home))
         self.assertEqual(get_profile_email(self.home), "charlie@example.com")
 
+    def test_load_profile_token_native_linux_format(self) -> None:
+        native_dir = self.home / ".gemini" / "antigravity-cli"
+        native_dir.mkdir(parents=True, exist_ok=True)
+        native_file = native_dir / "antigravity-oauth-token"
+        token_payload = {
+            "token": {
+                "access_token": "ya29.native_tok",
+                "refresh_token": "native_refresh",
+                "expiry": "2026-09-22T20:00:00Z",
+            },
+            "auth_method": "consumer",
+            "email": "linux_user@example.com",
+        }
+        native_file.write_text(json.dumps(token_payload), encoding="utf-8")
+
+        self.assertTrue(has_profile_token(self.home))
+        self.assertEqual(get_profile_email(self.home), "linux_user@example.com")
+
+        loaded = load_profile_token(self.home)
+        self.assertIsNotNone(loaded)
+        user, raw_blob = loaded  # type: ignore
+        self.assertEqual(user, DEFAULT_USER)
+        data = json.loads(raw_blob.decode("utf-8"))
+        self.assertEqual(data["token"]["access_token"], "ya29.native_tok")
+
 
 if __name__ == "__main__":
     unittest.main()
