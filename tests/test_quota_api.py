@@ -1,0 +1,291 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest import mock
+
+from agym.profiles import Profile
+from agym.quota_api import (
+    OAUTH_TOKEN_URL,
+    fetch_quota_direct_async,
+    get_oauth_client_credentials,
+    get_valid_access_token_async,
+    is_token_expired,
+    load_profile_token_data,
+    normalize_api_quota_response,
+    query_quota_api_async,
+    refresh_oauth_token_async,
+    update_profile_tokens,
+)
+from agym.usage import AccountUsage, fetch_account_usage_async
+from agym.wincred import save_profile_token
+
+SAMPLE_GOOGLE_API_RESPONSE = {
+    "groups": [
+        {
+            "displayName": "Gemini Models",
+            "description": "Models within this group: Gemini Flash, Gemini Pro",
+            "buckets": [
+                {
+                    "bucketId": "gemini-weekly",
+                    "displayName": "Weekly Limit Remaining",
+                    "window": "weekly",
+                    "resetTime": "2026-09-27T22:17:44Z",
+                    "description": "You have used some of your weekly limit, it will fully refresh in 5 days.",
+                    "remainingFraction": 0.625,
+                },
+                {
+                    "bucketId": "gemini-5h",
+                    "displayName": "Five Hour Limit Remaining",
+                    "window": "5h",
+                    "resetTime": "2026-09-22T16:23:37Z",
+                    "remainingFraction": 0.95,
+                },
+            ],
+        },
+        {
+            "displayName": "Claude and GPT models",
+            "description": "Models within this group: Claude Opus, Claude Sonnet",
+            "buckets": [
+                {
+                    "bucketId": "3p-weekly",
+                    "displayName": "Weekly Limit Remaining",
+                    "window": "weekly",
+                    "resetTime": "2026-09-29T11:23:37Z",
+                    "remainingFraction": 1.0,
+                }
+            ],
+        },
+    ]
+}
+
+
+class QuotaApiUnitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp_dir.name)
+        self.profile = Profile(name="test_user", home=self.home, created_at="2026-01-01T00:00:00Z")
+
+    def tearDown(self) -> None:
+        self.tmp_dir.cleanup()
+
+    def _setup_token_file(
+        self,
+        access_token: str = "test_access_token",
+        refresh_token: str = "test_refresh_token",
+        expiry: str | None = "2026-09-22T15:00:00Z",
+    ) -> None:
+        blob_dict = {
+            "token": {
+                "access_token": access_token,
+                "token_type": "Bearer",
+                "refresh_token": refresh_token,
+                "expiry": expiry,
+            },
+            "auth_method": "consumer",
+            "id_token": "mock_id_token",
+        }
+        save_profile_token(
+            profile_home=self.home,
+            username="antigravity",
+            blob=json.dumps(blob_dict),
+        )
+
+    def test_normalize_api_quota_response(self) -> None:
+        usage, synthetic_json = normalize_api_quota_response(
+            SAMPLE_GOOGLE_API_RESPONSE,
+            account="test_user",
+            subscription_date="2027-01-01",
+        )
+
+        self.assertEqual(usage.account, "test_user")
+        self.assertEqual(usage.status, "success")
+        self.assertEqual(usage.subscription_date, "2027-01-01")
+        self.assertEqual(len(usage.groups), 2)
+
+        gemini_group = usage.groups[0]
+        self.assertEqual(gemini_group.name, "Gemini Models")
+        self.assertEqual(len(gemini_group.buckets), 2)
+
+        weekly_bucket = gemini_group.buckets[0]
+        self.assertEqual(weekly_bucket.id, "gemini-weekly")
+        self.assertEqual(weekly_bucket.name, "Weekly Limit Remaining")
+        self.assertEqual(weekly_bucket.window, "weekly")
+        self.assertEqual(weekly_bucket.percentage, 62)
+        self.assertAlmostEqual(weekly_bucket.remaining_fraction, 0.625)
+        self.assertEqual(weekly_bucket.reset_time_raw, "2026-09-27T22:17:44Z")
+
+        synth = json.loads(synthetic_json)
+        self.assertEqual(synth.get("status"), "SUCCESS")
+        self.assertEqual(synth.get("command", {}).get("name"), "usage")
+
+    def test_is_token_expired(self) -> None:
+        self.assertTrue(is_token_expired(None))
+        self.assertTrue(is_token_expired(""))
+
+        # Past time is expired
+        past = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        self.assertTrue(is_token_expired(past))
+
+        # Time within 30s is treated as expired (buffer_seconds=60)
+        near_future = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()
+        self.assertTrue(is_token_expired(near_future, buffer_seconds=60.0))
+
+        # Time in far future is not expired
+        far_future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+        self.assertFalse(is_token_expired(far_future))
+
+    def test_load_and_update_profile_token_data(self) -> None:
+        self._setup_token_file(access_token="tok_1", refresh_token="ref_1")
+        data = load_profile_token_data(self.home)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["access_token"], "tok_1")
+        self.assertEqual(data["refresh_token"], "ref_1")
+
+        # Update tokens
+        new_exp = datetime.now(timezone.utc) + timedelta(hours=1)
+        ok = update_profile_tokens(self.home, "tok_2", new_exp, "ref_2")
+        self.assertTrue(ok)
+
+        data2 = load_profile_token_data(self.home)
+        self.assertEqual(data2["access_token"], "tok_2")
+        self.assertEqual(data2["refresh_token"], "ref_2")
+        self.assertEqual(data2["expiry"], new_exp.isoformat())
+
+    @mock.patch("agym.quota_api._http_post_sync")
+    def test_refresh_oauth_token_async(self, mock_post: mock.Mock) -> None:
+        mock_post.return_value = (
+            200,
+            json.dumps({"access_token": "refreshed_tok", "expires_in": 3600}),
+        )
+
+        async def _run() -> None:
+            token, expiry = await refresh_oauth_token_async("test_refresh")
+            self.assertEqual(token, "refreshed_tok")
+            self.assertGreater(expiry, datetime.now(timezone.utc))
+
+        asyncio.run(_run())
+
+    @mock.patch("agym.quota_api.refresh_oauth_token_async")
+    def test_get_valid_access_token_refreshes_when_expired(
+        self, mock_refresh: mock.Mock
+    ) -> None:
+        past = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        self._setup_token_file(access_token="old_token", expiry=past)
+        future_exp = datetime.now(timezone.utc) + timedelta(hours=1)
+        mock_refresh.return_value = ("new_token", future_exp)
+
+        async def _run() -> None:
+            tok = await get_valid_access_token_async(self.home)
+            self.assertEqual(tok, "new_token")
+
+        asyncio.run(_run())
+        mock_refresh.assert_called_once_with("test_refresh_token", timeout=10.0)
+
+        # Check that updated token was persisted
+        updated = load_profile_token_data(self.home)
+        self.assertEqual(updated["access_token"], "new_token")
+
+    @mock.patch("agym.quota_api._http_post_sync")
+    def test_query_quota_api_async_success(self, mock_post: mock.Mock) -> None:
+        mock_post.return_value = (200, json.dumps(SAMPLE_GOOGLE_API_RESPONSE))
+
+        async def _run() -> None:
+            data = await query_quota_api_async("test_token")
+            self.assertIn("groups", data)
+            self.assertEqual(len(data["groups"]), 2)
+
+        asyncio.run(_run())
+
+    @mock.patch("agym.quota_api._http_post_sync")
+    def test_query_quota_api_async_retries_on_429(self, mock_post: mock.Mock) -> None:
+        # First call returns 429, second call returns 200
+        mock_post.side_effect = [
+            (429, "Too Many Requests"),
+            (200, json.dumps(SAMPLE_GOOGLE_API_RESPONSE)),
+        ]
+
+        async def _run() -> None:
+            with mock.patch("asyncio.sleep", new_callable=mock.AsyncMock):
+                data = await query_quota_api_async("test_token")
+                self.assertIn("groups", data)
+
+        asyncio.run(_run())
+        self.assertEqual(mock_post.call_count, 2)
+
+    @mock.patch("agym.quota_api._http_post_sync")
+    def test_query_quota_api_async_fallback_host(self, mock_post: mock.Mock) -> None:
+        # First host returns 500, second host returns 200
+        mock_post.side_effect = [
+            (500, "Internal Server Error"),
+            (200, json.dumps(SAMPLE_GOOGLE_API_RESPONSE)),
+        ]
+
+        async def _run() -> None:
+            data = await query_quota_api_async("test_token")
+            self.assertIn("groups", data)
+
+        asyncio.run(_run())
+        self.assertEqual(mock_post.call_count, 2)
+
+    def test_fetch_quota_direct_async_returns_none_without_token(self) -> None:
+        async def _run() -> None:
+            res = await fetch_quota_direct_async(self.profile)
+            self.assertIsNone(res)
+
+        asyncio.run(_run())
+
+    @mock.patch("agym.usage.fetch_quota_direct_async")
+    def test_fetch_account_usage_async_fast_path(self, mock_direct: mock.Mock) -> None:
+        self._setup_token_file()
+        usage, synth_out = normalize_api_quota_response(SAMPLE_GOOGLE_API_RESPONSE, "test_user")
+        mock_direct.return_value = (usage, synth_out)
+
+        async def _run() -> None:
+            sem = asyncio.Semaphore(1)
+            result = await fetch_account_usage_async(
+                agy_path=Path("/bin/agy"),
+                profile=self.profile,
+                semaphore=sem,
+            )
+            self.assertEqual(result.status, "success")
+            self.assertEqual(result.account, "test_user")
+            self.assertEqual(len(result.groups), 2)
+
+        asyncio.run(_run())
+        mock_direct.assert_called_once()
+
+    @mock.patch("agym.usage.fetch_quota_direct_async", return_value=None)
+    def test_fetch_account_usage_async_falls_back_to_subprocess(
+        self, mock_direct: mock.Mock
+    ) -> None:
+        self._setup_token_file()
+
+        async def mock_runner(argv: list[str], env: dict[str, str], timeout: float) -> tuple[int, str, str]:
+            return 0, json.dumps({"status": "SUCCESS", "command": {"name": "usage", "data": {"groups": []}}}), ""
+
+        async def _run() -> None:
+            sem = asyncio.Semaphore(1)
+            # When runner is provided, it goes through runner
+            result = await fetch_account_usage_async(
+                agy_path=Path("/bin/agy"),
+                profile=self.profile,
+                semaphore=sem,
+                runner=mock_runner,
+            )
+            self.assertEqual(result.status, "success")
+
+        asyncio.run(_run())
+
+    def test_get_oauth_client_credentials(self) -> None:
+        cid, sec = get_oauth_client_credentials()
+        self.assertTrue(len(cid) > 10)
+        self.assertTrue(len(sec) > 10)
+
+
+if __name__ == "__main__":
+    unittest.main()
