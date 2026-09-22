@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 from agym.cli import _statusline, main as cli_main
 from agym.profiles import ProfileSettings, ProfileStore
 from agym.statusline import (
+    _get_short_path,
     AccountQuotaInfo,
     BucketQuota,
     extract_payload_quota,
@@ -392,9 +393,8 @@ class InstallationAndSyncTests(unittest.TestCase):
         # Check statusLine was added
         self.assertIn("statusLine", new_data)
         self.assertEqual(new_data["statusLine"]["type"], "command")
-        if sys.platform == "win32" or os.name == "nt":
-            pythonw = resolve_python_executable(gui=True)
-            expected_cmd = f'"{pythonw}" "{(script_path.parent / "statusline.py").resolve()}"'
+        if sys.platform == "win32":
+            expected_cmd = str(_get_short_path(script_path))
         else:
             expected_cmd = str(script_path.resolve())
         self.assertEqual(new_data["statusLine"]["command"], expected_cmd)
@@ -423,9 +423,8 @@ class InstallationAndSyncTests(unittest.TestCase):
     def test_get_statusline_command_windows(self) -> None:
         with patch("sys.platform", "win32"):
             cmd = get_statusline_command(self.data_root)
-            self.assertTrue(cmd.startswith('"'))
-            self.assertIn("statusline.py", cmd)
-            self.assertIn("pythonw", cmd.lower())
+            self.assertTrue(cmd.endswith("statusline.cmd") or cmd.endswith("STATUS~1.CMD"))
+            self.assertNotIn('"', cmd)
 
     def test_get_statusline_command_posix(self) -> None:
         with patch("sys.platform", "linux"):

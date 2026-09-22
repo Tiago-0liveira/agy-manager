@@ -639,6 +639,23 @@ def resolve_python_executable(gui: bool = False) -> Path:
     return current
 
 
+def _get_short_path(path: Path) -> Path:
+    if sys.platform != "win32":
+        return path
+    resolved = path.resolve()
+    if " " not in str(resolved):
+        return resolved
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(500)
+        res = ctypes.windll.kernel32.GetShortPathNameW(str(resolved), buf, 500)
+        if res > 0 and buf.value:
+            return Path(buf.value)
+    except Exception:
+        pass
+    return resolved
+
+
 def get_statusline_script_path(data_root: Path | None = None) -> Path:
     root = Path(data_root) if data_root else _default_data_root()
     ext = ".cmd" if sys.platform == "win32" else ""
@@ -646,12 +663,9 @@ def get_statusline_script_path(data_root: Path | None = None) -> Path:
 
 
 def get_statusline_command(data_root: Path | None = None) -> str:
-    root = Path(data_root) if data_root else _default_data_root()
+    script_path = get_statusline_script_path(data_root)
     if sys.platform == "win32":
-        pythonw = resolve_python_executable(gui=True)
-        py_script = root / "bin" / "statusline.py"
-        return f'"{pythonw}" "{py_script.resolve()}"'
-    script_path = root / "bin" / "statusline"
+        return str(_get_short_path(script_path))
     return str(script_path.resolve())
 
 
@@ -735,9 +749,8 @@ def sync_profile_statusline(
         target_command = command
     elif script_path is not None:
         if sys.platform == "win32":
-            pythonw = resolve_python_executable(gui=True)
-            py_target = script_path.parent / "statusline.py" if script_path.suffix.lower() == ".cmd" else script_path
-            target_command = f'"{pythonw}" "{py_target.resolve()}"'
+            cmd_script = script_path if script_path.suffix.lower() == ".cmd" else script_path.with_suffix(".cmd")
+            target_command = str(_get_short_path(cmd_script))
         else:
             target_command = str(script_path.resolve())
     else:
