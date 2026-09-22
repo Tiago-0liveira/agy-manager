@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import sys
@@ -13,6 +14,7 @@ from typing import Any, Callable, Coroutine, Sequence
 from .cache import CacheManager, TTL_USAGE_SECONDS, USAGE_CACHE_TTL_SECONDS, format_age, format_freshness_badge
 from .launcher import build_profile_env, resolve_agy
 from .profiles import Profile, ProfileStore
+from .quota_api import fetch_quota_direct_async
 from .subscription import calculate_subscription_health, format_subscription_cells
 from .usage_graphs import (
     FleetTelemetry,
@@ -31,6 +33,8 @@ from .wincred import (
     is_windows_platform,
     profile_credential_context,
 )
+
+logger = logging.getLogger("agym.usage")
 
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -768,15 +772,33 @@ async def fetch_account_usage_async(
             if cached_usage.status == "success":
                 return cached_usage
 
-    async with semaphore:
-        if not profile.home.exists():
-            return AccountUsage(
-                account=profile.name,
-                status="error",
-                error=f"profile home directory does not exist: {profile.home}",
-                subscription_date=profile.subscription_date,
-            )
+    if not profile.home.exists():
+        return AccountUsage(
+            account=profile.name,
+            status="error",
+            error=f"profile home directory does not exist: {profile.home}",
+            subscription_date=profile.subscription_date,
+        )
 
+    # Fast path: Direct Cloud Code Quota API (runs in parallel across all profiles without wincred lock)
+    if runner is None and has_profile_token(profile.home):
+        async with semaphore:
+            try:
+                direct_res = await fetch_quota_direct_async(profile, timeout=min(timeout, 15.0))
+                if direct_res is not None:
+                    usage, raw_out = direct_res
+                    if usage.status == "success":
+                        if cache_manager is not None:
+                            cache_manager.set_usage(profile.name, account_usage_to_dict(usage), raw_out)
+                        return usage
+            except Exception as exc:
+                logger.debug(
+                    "Direct quota API query failed for profile '%s', falling back to agy subprocess: %s",
+                    profile.name,
+                    exc,
+                )
+
+    async with semaphore:
         if runner is None and is_windows_platform() and not has_profile_token(profile.home):
             return AccountUsage(
                 account=profile.name,
