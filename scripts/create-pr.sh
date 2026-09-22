@@ -83,6 +83,10 @@ fi
 # -----------------------------------------------------------------------------
 # Determine Base Branch
 # -----------------------------------------------------------------------------
+if [[ "$DRY_RUN" == "false" ]]; then
+  git fetch origin --prune &>/dev/null || true
+fi
+
 if [[ -z "$TARGET_BASE" ]]; then
   # Prefer feat/usage-graphs if it exists and is not the current branch, otherwise default repo branch
   if [[ "$CURRENT_BRANCH" != "feat/usage-graphs" ]] && git rev-parse --verify origin/feat/usage-graphs &> /dev/null; then
