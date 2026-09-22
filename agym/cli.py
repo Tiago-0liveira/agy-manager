@@ -44,6 +44,7 @@ USAGE = """agym — Explicit isolated-profile manager for Google Antigravity CLI
 
 Usage:
   agym <command> [arguments...]
+  agym all [--] [agy args...]
   agym <profile> [--] [agy args...]
   agym <profile> --auto-prompt "<prompt>"
   agym <profile> --auto-pr [-b <branch>] [--title <title>] [--body <body>] [--draft] [--no-push]
@@ -52,6 +53,7 @@ Usage:
   agym config <profile> [--model <model>|default] [-y|--dsp|--skip-perms|--[no-]dangerously-skip-permissions]
 
 Commands:
+  all [--] [agy args...]              Launch all configured profiles simultaneously in terminal panes
   setup <profile>                     Create a new profile and complete Google sign-in
   config <profile>                    Configure profile model and permission settings
   edit <profile>                      Edit profile settings (e.g. subscription renewal date, rename)
@@ -67,6 +69,9 @@ Commands:
   auto-pr [profile]                   Create a pull request from current branch into base branch
 
 Launching Antigravity:
+  agym all [agy args...]              Launch all configured profiles simultaneously in evenly
+                                      subdivided terminal panes across Windows, Linux, and macOS.
+
   agym <profile>                      Launch Antigravity under the specified profile.
                                       Replaces the current process on POSIX, preserving native
                                       terminal, TTY, working directory, and signal handling.
@@ -976,6 +981,11 @@ def _auto_pr(argv: list[str], store: ProfileStore) -> int:
     )
 
 
+def _all(argv: list[str], store: ProfileStore) -> int:
+    from .panes.runner import run_all
+    return run_all(argv, store)
+
+
 def _launch(profile_name: str, argv: list[str], store: ProfileStore) -> int:
     validate_profile_name(profile_name)
     profile = store.get(profile_name)
@@ -1027,6 +1037,8 @@ def main(argv: list[str] | None = None) -> int:
     store = ProfileStore()
     command, rest = args[0], args[1:]
     try:
+        if command == "all":
+            return _all(rest, store)
         if command == "setup":
             return _setup(rest, store)
         if command == "config":
