@@ -109,35 +109,50 @@ def _http_post_sync(
 
 
 def load_profile_token_data(profile_home: Path | str) -> dict[str, Any] | None:
-    """Loads and decodes the inner OAuth token data from profile token.json."""
+    """Loads and decodes the inner OAuth token data from profile token.json or antigravity-oauth-token."""
     token_path = get_profile_token_path(profile_home)
-    if not token_path.is_file():
-        return None
-    try:
-        with open(token_path, "r", encoding="utf-8") as f:
-            outer = json.load(f)
-        if not isinstance(outer, dict):
-            return None
-        blob_raw = outer.get("blob", "")
-        if not blob_raw:
-            return None
-        blob_data = json.loads(blob_raw) if isinstance(blob_raw, str) else blob_raw
-        if not isinstance(blob_data, dict):
-            return None
-        token_info = blob_data.get("token")
-        if not isinstance(token_info, dict):
-            return None
-        return {
-            "outer": outer,
-            "blob": blob_data,
-            "access_token": token_info.get("access_token"),
-            "refresh_token": token_info.get("refresh_token"),
-            "expiry": token_info.get("expiry"),
-            "username": outer.get("username", DEFAULT_USER),
-        }
-    except Exception as exc:
-        logger.debug("Could not parse profile token data at %s: %s", token_path, exc)
-        return None
+    if token_path.is_file():
+        try:
+            with open(token_path, "r", encoding="utf-8") as f:
+                outer = json.load(f)
+            if isinstance(outer, dict):
+                blob_raw = outer.get("blob", "")
+                if blob_raw:
+                    blob_data = json.loads(blob_raw) if isinstance(blob_raw, str) else blob_raw
+                    if isinstance(blob_data, dict):
+                        token_info = blob_data.get("token")
+                        if isinstance(token_info, dict):
+                            return {
+                                "outer": outer,
+                                "blob": blob_data,
+                                "access_token": token_info.get("access_token"),
+                                "refresh_token": token_info.get("refresh_token"),
+                                "expiry": token_info.get("expiry"),
+                                "username": outer.get("username", DEFAULT_USER),
+                            }
+        except Exception as exc:
+            logger.debug("Could not parse profile token data at %s: %s", token_path, exc)
+
+    oauth_path = Path(profile_home).resolve() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+    if oauth_path.is_file():
+        try:
+            with open(oauth_path, "r", encoding="utf-8") as f:
+                oauth_data = json.load(f)
+            if isinstance(oauth_data, dict):
+                token_info = oauth_data.get("token")
+                if isinstance(token_info, dict):
+                    return {
+                        "outer": oauth_data,
+                        "blob": oauth_data,
+                        "access_token": token_info.get("access_token"),
+                        "refresh_token": token_info.get("refresh_token"),
+                        "expiry": token_info.get("expiry"),
+                        "username": DEFAULT_USER,
+                    }
+        except Exception as exc:
+            logger.debug("Could not parse antigravity-oauth-token at %s: %s", oauth_path, exc)
+
+    return None
 
 
 def update_profile_tokens(
