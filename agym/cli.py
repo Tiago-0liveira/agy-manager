@@ -6,7 +6,7 @@ import json
 import sys
 from pathlib import Path
 
-from .cache import CacheManager
+from .cache import CacheManager, USAGE_CACHE_TTL_SECONDS
 from .diagnostics import doctor_lines
 from .git.auto_pr import AutoPrError, handle_auto_pr, parse_auto_pr_args
 from .launcher import (
@@ -17,6 +17,7 @@ from .launcher import (
     run_agy,
     run_auto_prompt,
 )
+from .picker import prepare_accounts_for_picker, run_picker
 from .profiles import (
     InvalidProfileName,
     ProfileError,
@@ -36,7 +37,7 @@ from .subscription import (
 )
 from .statusline import get_statusline_status, render_statusline, sync_all_profiles
 from .tokens import run_tokens
-from .usage import run_usage
+from .usage import fetch_and_cache_usage, run_usage
 from .wincred import get_profile_email
 
 USAGE = """agym — Explicit isolated-profile manager for Google Antigravity CLI
@@ -46,6 +47,7 @@ Usage:
   agym <profile> [--] [agy args...]
   agym <profile> --auto-prompt "<prompt>"
   agym <profile> --auto-pr [-b <branch>] [--title <title>] [--body <body>] [--draft] [--no-push]
+  agym select [-f|--fresh] [-- [agy args...]]
   agym rotate [--file <file>] [--status] [--reset] [--simulate [N]] [-- [agy args...]]
   agym config <profile> [--model <model>|default] [-y|--dsp|--skip-perms|--[no-]dangerously-skip-permissions]
 
@@ -55,6 +57,7 @@ Commands:
   edit <profile>                      Edit profile settings (e.g. subscription renewal date, rename)
   rename <profile> <new-name>         Rename a profile and its isolated directory (alias: mv)
   list                                List all configured profiles and subscription status
+  select                              Interactively select account by quota health and launch (alias: pick)
   rotate                              Rotate through accounts/profiles sequentially and launch
   usage [profiles...]                 Show live model quota usage and subscription health
   tokens [profiles...]                Show token consumption graphs and fleet summary (aliases: token, token-usage)
@@ -132,6 +135,9 @@ Command Options:
       --enable                        Enable statusline for all profiles
       --disable                       Disable statusline for all profiles
 
+  agym select [-f, --fresh] [-- [agy args...]]
+      -f, --fresh                     Force fetch fresh usage data, ignoring 5-minute cache (alias: pick)
+
   agym remove <profile> [-y, --yes]
       -y, --yes                       Delete without interactive confirmation prompt
 
@@ -146,6 +152,8 @@ Command Options:
 Examples:
   agym setup personal                 Create profile and authenticate with Google
   agym setup work -s 14/03/2027       Create profile with known subscription renewal date
+  agym select                         Interactively pick an account based on quota health
+  agym select -f                      Force live refresh of quotas before selection
   agym personal                       Open an interactive Antigravity session
   agym personal -p "write tests"      Run non-interactive Antigravity command
   agym personal --auto-pr             Create PR from current branch into main
@@ -829,6 +837,78 @@ def _statusline(argv: list[str], store: ProfileStore) -> int:
     return 0
 
 
+def _select(
+    argv: list[str],
+    store: ProfileStore,
+    *,
+    cache_manager: CacheManager | None = None,
+    agy_path: Path | None = None,
+    runner: Any = None,
+    key_reader: Any = None,
+    stdout: Any = None,
+    stdin: Any = None,
+) -> int:
+    parser = argparse.ArgumentParser(
+        prog="agym select",
+        description="Interactively select an account based on cached 5h quota and launch Antigravity.",
+        add_help=True,
+    )
+    parser.add_argument(
+        "-f",
+        "--fresh",
+        action="store_true",
+        help="Force fetch fresh usage data, ignoring 5-minute cache",
+    )
+    ns, passthrough = parser.parse_known_args(argv)
+    if passthrough and passthrough[0] == "--":
+        passthrough = passthrough[1:]
+
+    profiles = store.list()
+    out = stdout if stdout is not None else sys.stdout
+    if not profiles:
+        out.write("No profiles configured. Run 'agym setup <profile>' first.\n")
+        out.flush()
+        return 0
+
+    cm = cache_manager if cache_manager is not None else CacheManager()
+
+    needs_live = ns.fresh or any(
+        cm.get_usage(p.name, max_age=USAGE_CACHE_TTL_SECONDS) is None
+        for p in profiles
+    )
+
+    if needs_live:
+        out.write("Fetching fresh usage data...\n")
+        out.flush()
+
+    usages = fetch_and_cache_usage(
+        profiles=profiles,
+        force=ns.fresh,
+        agy_path=agy_path,
+        cache_manager=cm,
+        runner=runner,
+    )
+
+    use_color = hasattr(out, "isatty") and out.isatty()
+    items = prepare_accounts_for_picker(usages, use_color=use_color)
+
+    selected = run_picker(
+        items,
+        stdout=out,
+        stdin=stdin,
+        use_color=use_color,
+        key_reader=key_reader,
+    )
+
+    if selected is None:
+        return 0
+
+    out.write(f"Opening agy with account '{selected}'...\n")
+    out.flush()
+
+    return _launch(selected, passthrough, store)
+
+
 def _parse_auto_prompt(args: list[str]) -> tuple[str | None, list[str]]:
     if not args:
         return None, args
@@ -957,6 +1037,8 @@ def main(argv: list[str] | None = None) -> int:
             return _rename(rest, store)
         if command == "list":
             return _list(rest, store)
+        if command in {"select", "pick"}:
+            return _select(rest, store)
         if command == "rotate":
             return _rotate(rest, store)
         if command == "usage":
