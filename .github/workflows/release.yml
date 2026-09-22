@@ -1,0 +1,180 @@
+name: Automated Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    name: Reconcile Release Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version_step.outputs.version }}
+      tag_name: ${{ steps.version_step.outputs.tag_name }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Calculate Unique Release Version
+        id: version_step
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/release_version.py
+
+  test:
+    name: Verify Tests Before Release
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Core Test Suite
+        run: |
+          python -m unittest tests/test_auto_pr.py tests/test_cache.py tests/test_cli.py tests/test_diagnostics.py tests/test_host_safety.py tests/test_launcher.py tests/test_picker.py tests/test_profiles.py tests/test_quota_api.py tests/test_rotator.py tests/test_statusline.py tests/test_subscription.py tests/test_tokens.py tests/test_usage.py tests/test_wincred.py tests/council/test_packaging.py
+
+  build-wheel:
+    name: Build Wheel and Source Tarball
+    needs: [version, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Sync Reconciled Version
+        run: |
+          python -c "
+          import re, pathlib
+          ver = '${{ needs.version.outputs.version }}'
+          p = pathlib.Path('agym/__init__.py')
+          p.write_text(re.sub(r'__version__\s*=\s*[\"\\\'][^\"\\\']+[\"\\\']', f'__version__ = \"{ver}\"', p.read_text()))
+          p2 = pathlib.Path('pyproject.toml')
+          p2.write_text(re.sub(r'version\s*=\s*[\"\\\'][^\"\\\']+[\"\\\']', f'version = \"{ver}\"', p2.read_text()))
+          "
+
+      - name: Install build tool
+        run: pip install --upgrade build
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Upload Python packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/*
+
+  build-standalone:
+    name: Build Standalone Executables (${{ matrix.os }})
+    needs: [version, test]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: agym-windows-amd64.exe
+            dist_path: dist/agym.exe
+            target_name: agym-windows-amd64.exe
+          - os: ubuntu-latest
+            artifact_name: agym-linux-amd64
+            dist_path: dist/agym
+            target_name: agym-linux-amd64
+          - os: macos-latest
+            artifact_name: agym-darwin-arm64
+            dist_path: dist/agym
+            target_name: agym-darwin-arm64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Sync Reconciled Version
+        shell: bash
+        run: |
+          python -c "
+          import re, pathlib
+          ver = '${{ needs.version.outputs.version }}'
+          p = pathlib.Path('agym/__init__.py')
+          p.write_text(re.sub(r'__version__\s*=\s*[\"\\\'][^\"\\\']+[\"\\\']', f'__version__ = \"{ver}\"', p.read_text()))
+          p2 = pathlib.Path('pyproject.toml')
+          p2.write_text(re.sub(r'version\s*=\s*[\"\\\'][^\"\\\']+[\"\\\']', f'version = \"{ver}\"', p2.read_text()))
+          "
+
+      - name: Install PyInstaller
+        run: pip install --upgrade pyinstaller
+
+      - name: Build standalone executable
+        run: |
+          pyinstaller --onefile --name agym --clean agym/__main__.py
+
+      - name: Rename executable
+        shell: bash
+        run: |
+          mkdir -p release_bin
+          cp "${{ matrix.dist_path }}" "release_bin/${{ matrix.target_name }}"
+
+      - name: Upload Standalone Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-${{ matrix.os }}
+          path: release_bin/*
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [version, build-wheel, build-standalone]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_artifacts
+
+      - name: Flatten release assets
+        run: |
+          mkdir -p release_assets
+          find all_artifacts -type f -exec cp {} release_assets/ \;
+          ls -la release_assets/
+
+      - name: Create GitHub Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag_name }}
+          name: agym ${{ needs.version.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: release_assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

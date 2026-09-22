@@ -1,0 +1,32 @@
+name: CI Test Suite
+
+on:
+  push:
+    branches-ignore:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }} - Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run Core Test Suite (Zero Dependencies)
+        run: |
+          python -m unittest tests/test_auto_pr.py tests/test_cache.py tests/test_cli.py tests/test_diagnostics.py tests/test_host_safety.py tests/test_launcher.py tests/test_picker.py tests/test_profiles.py tests/test_quota_api.py tests/test_rotator.py tests/test_statusline.py tests/test_subscription.py tests/test_tokens.py tests/test_usage.py tests/test_wincred.py tests/council/test_packaging.py
