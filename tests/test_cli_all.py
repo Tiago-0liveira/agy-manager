@@ -165,5 +165,79 @@ class CliAllCommandTests(unittest.TestCase):
         )
 
 
+    @mock.patch("agym.cli.ProfileStore")
+    @mock.patch("agym.panes.runner.detect_backend")
+    def test_all_count_option_limits_profiles(
+        self, detect_mock: mock.Mock, Store: mock.Mock
+    ) -> None:
+        self.store.create("p1")
+        self.store.create("p2")
+        self.store.create("p3")
+        self.store.create("p4")
+        Store.return_value = self.store
+
+        mock_backend = MockBackend(exit_code=0)
+        detect_mock.return_value = mock_backend
+
+        code = cli.main(["all", "-n", "2"])
+        self.assertEqual(code, 0)
+        self.assertEqual(mock_backend.called_with["profiles"], ["p1", "p2"])
+        self.assertEqual(mock_backend.called_with["plan"].total_panes, 2)
+
+    @mock.patch("agym.cli.ProfileStore")
+    @mock.patch("agym.panes.runner.detect_backend")
+    def test_all_cwd_option_sets_target_directory(
+        self, detect_mock: mock.Mock, Store: mock.Mock
+    ) -> None:
+        self.store.create("p1")
+        self.store.create("p2")
+        Store.return_value = self.store
+
+        mock_backend = MockBackend(exit_code=0)
+        detect_mock.return_value = mock_backend
+
+        target_dir = Path(self.tmp.name)
+        code = cli.main(["all", "-C", str(target_dir)])
+        self.assertEqual(code, 0)
+        self.assertEqual(mock_backend.called_with["cwd"], str(target_dir.resolve()))
+
+    @mock.patch("agym.cli.ProfileStore")
+    @mock.patch("agym.panes.runner.detect_backend")
+    def test_all_profiles_subset_selection(
+        self, detect_mock: mock.Mock, Store: mock.Mock
+    ) -> None:
+        self.store.create("p1")
+        self.store.create("p2")
+        self.store.create("p3")
+        Store.return_value = self.store
+
+        mock_backend = MockBackend(exit_code=0)
+        detect_mock.return_value = mock_backend
+
+        code = cli.main(["all", "--profiles", "p3,p1"])
+        self.assertEqual(code, 0)
+        self.assertEqual(mock_backend.called_with["profiles"], ["p3", "p1"])
+
+    @mock.patch("agym.cli.ProfileStore")
+    @mock.patch("agym.panes.runner.detect_backend")
+    def test_all_dsp_and_combined_options(
+        self, detect_mock: mock.Mock, Store: mock.Mock
+    ) -> None:
+        self.store.create("p1")
+        self.store.create("p2")
+        self.store.create("p3")
+        Store.return_value = self.store
+
+        mock_backend = MockBackend(exit_code=0)
+        detect_mock.return_value = mock_backend
+
+        target_dir = Path(self.tmp.name)
+        code = cli.main(["all", "-n", "2", "-C", str(target_dir), "--dsp"])
+        self.assertEqual(code, 0)
+        self.assertEqual(mock_backend.called_with["profiles"], ["p1", "p2"])
+        self.assertEqual(mock_backend.called_with["cwd"], str(target_dir.resolve()))
+        self.assertEqual(mock_backend.called_with["passthrough_args"], ["--dsp"])
+
+
 if __name__ == "__main__":
     unittest.main()

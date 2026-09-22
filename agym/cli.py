@@ -44,7 +44,7 @@ USAGE = """agym — Explicit isolated-profile manager for Google Antigravity CLI
 
 Usage:
   agym <command> [arguments...]
-  agym all [--] [agy args...]
+  agym all [options] [--] [agy args...]
   agym <profile> [--] [agy args...]
   agym <profile> --auto-prompt "<prompt>"
   agym <profile> --auto-pr [-b <branch>] [--title <title>] [--body <body>] [--draft] [--no-push]
@@ -53,7 +53,7 @@ Usage:
   agym config <profile> [--model <model>|default] [-y|--dsp|--skip-perms|--[no-]dangerously-skip-permissions]
 
 Commands:
-  all [--] [agy args...]              Launch all configured profiles simultaneously in terminal panes
+  all [options] [--] [agy args...]    Launch configured profiles simultaneously in terminal panes
   setup <profile>                     Create a new profile and complete Google sign-in
   config <profile>                    Configure profile model and permission settings
   edit <profile>                      Edit profile settings (e.g. subscription renewal date, rename)

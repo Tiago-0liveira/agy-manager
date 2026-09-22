@@ -93,8 +93,20 @@ agym remove work --yes
 # Launch all accounts in evenly subdivided panes
 agym all
 
-# Forward Antigravity options to all launched instances
-agym all -- -p "review latest PR diff"
+# Auto-approve permissions for all instances with --dsp (or -y)
+agym all --dsp
+
+# Limit how many profiles to launch (e.g. first 4 profiles in a 2x2 grid)
+agym all -n 4
+
+# Open all panes in a specific project directory (-C / --cwd)
+agym all -C /path/to/my-repo
+
+# Launch a specific subset of profiles by name
+agym all --profiles personal,work
+
+# Combine options and forward custom Antigravity flags
+agym all -n 4 -C /path/to/project --dsp -- -p "fleet review"
 ```
 
 #### Core Behavior & Profile Isolation
