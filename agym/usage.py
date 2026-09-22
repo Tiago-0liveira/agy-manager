@@ -14,6 +14,17 @@ from .cache import CacheManager, TTL_USAGE_SECONDS, format_age, format_freshness
 from .launcher import build_profile_env, resolve_agy
 from .profiles import Profile, ProfileStore
 from .subscription import calculate_subscription_health, format_subscription_cells
+from .usage_graphs import (
+    FleetTelemetry,
+    compute_fleet_telemetry,
+    format_micro_bar,
+    format_smooth_bar,
+    format_sparkline_glyph,
+    render_fleet_summary_banner,
+    render_usage_grid_lines,
+    render_usage_matrix_lines,
+    render_usage_telemetry_lines,
+)
 from .wincred import (
     async_profile_credential_context,
     has_profile_token,
@@ -98,13 +109,13 @@ def format_short_reset_time(dt: datetime | None, now: datetime | None = None) ->
     """Formats reset time into an abbreviated string.
 
     Examples:
-        - 6d 21h -> "6d+"
+        - 6d 21h -> "6d"
         - 6d 0h  -> "6d"
-        - 4h 17m -> "4h+"
+        - 4h 17m -> "4h"
         - 3h 0m  -> "3h"
-        - 2h 59m -> "2h59m" (less than 3h shows minutes too)
-        - 1h 15m -> "1h15m" (less than 3h shows minutes too)
-        - 1h 5m  -> "1h05m" (less than 3h shows minutes too)
+        - 2h 59m -> "2h"
+        - 1h 15m -> "1h"
+        - 1h 5m  -> "1h"
         - 45m    -> "45m"
         - 9m     -> "9m"
         - <1m    -> "<1m"
@@ -132,11 +143,9 @@ def format_short_reset_time(dt: datetime | None, now: datetime | None = None) ->
     minutes = rem // 60
 
     if days > 0:
-        return f"{days}d+" if hours > 0 else f"{days}d"
-    if hours >= 3:
-        return f"{hours}h+" if minutes > 0 else f"{hours}h"
+        return f"{days}d"
     if hours > 0:
-        return f"{hours}h{minutes:02d}m" if minutes > 0 else f"{hours}h"
+        return f"{hours}h"
     if minutes > 0:
         return f"{minutes}m"
     return "<1m"
@@ -197,7 +206,10 @@ def format_colored_bar(
     width: int = 10,
     *,
     use_color: bool = True,
+    smooth: bool = False,
 ) -> str:
+    if smooth:
+        return format_smooth_bar(fraction, width=width, use_color=use_color)
     clamped = max(0.0, min(1.0, fraction))
     filled_count = round(clamped * width)
     filled_count = max(0, min(width, filled_count))
@@ -485,6 +497,7 @@ def format_quota_cell(
     bar_width: int = 10,
     *,
     use_color: bool = True,
+    smooth: bool = False,
     target_width: int = 27,
 ) -> str:
     content_width = target_width - len(prefix)
@@ -494,7 +507,9 @@ def format_quota_cell(
         prefix_disp = f"{dim}{prefix}{reset}" if prefix else ""
         return f"{prefix_disp}{'-':^{content_width}}"
 
-    bar = format_colored_bar(bucket.remaining_fraction, width=bar_width, use_color=use_color)
+    bar = format_colored_bar(
+        bucket.remaining_fraction, width=bar_width, use_color=use_color, smooth=smooth
+    )
     pct = bucket.percentage
     pct_str = f"{pct:3d}%"
     reset_str = format_short_reset_time(bucket.reset_time)
@@ -519,115 +534,141 @@ def render_usage_table_lines(
     profiles: Sequence[Profile],
     completed_map: dict[str, AccountUsage],
     *,
+    show_claude: bool = False,
+    spinner_char: str | None = None,
+    use_color: bool = True,
+    smooth: bool = False,
+    bar_width: int = 10,
+    term_width: int | None = None,
+) -> list[str]:
+    """Default usage view: borderless layout (Gemini 5h & Wk, optional Claude, Sub)."""
+    return render_usage_grid_lines(
+        profiles,
+        completed_map,
+        extract_quota_bucket,
+        format_short_reset_time,
+        show_claude=show_claude,
+        use_color=use_color,
+        term_width=term_width,
+    )
+
+
+def sort_profiles(
+    profiles: Sequence[Profile],
+    completed_map: dict[str, AccountUsage],
+    sort_by: str = "usage",
+) -> list[Profile]:
+    """Sorts profiles by usage/quota, name, reset time, subscription, or default store order."""
+    if sort_by in ("usage", "quota"):
+        def get_score(p: Profile) -> tuple[float, float]:
+            u = completed_map.get(p.name)
+            if not u or u.status != "success":
+                return (-1.0, -1.0)
+            b_5h = extract_quota_bucket(u, "gemini", "5h")
+            b_wk = extract_quota_bucket(u, "gemini", "week")
+            score_5h = b_5h.remaining_fraction if b_5h else 1.0
+            score_wk = b_wk.remaining_fraction if b_wk else 1.0
+            return (score_5h, score_wk)
+        return sorted(profiles, key=get_score, reverse=True)
+    if sort_by == "name":
+        return sorted(profiles, key=lambda p: p.name.lower())
+    if sort_by == "reset":
+        def get_reset_key(p: Profile) -> float:
+            u = completed_map.get(p.name)
+            if not u or u.status != "success":
+                return float("inf")
+            b = extract_quota_bucket(u, "gemini", "5h")
+            if b and b.reset_time:
+                return b.reset_time.timestamp()
+            return float("inf")
+        return sorted(profiles, key=get_reset_key)
+    if sort_by in ("sub", "subscription"):
+        def get_sub_key(p: Profile) -> float:
+            h = calculate_subscription_health(p.subscription_date)
+            if h.days_remaining is not None:
+                return float(h.days_remaining)
+            return float("inf")
+        return sorted(profiles, key=get_sub_key)
+    return list(profiles)
+
+
+def render_usage_view_lines(
+    profiles: Sequence[Profile],
+    completed_map: dict[str, AccountUsage],
+    *,
+    view: str = "table",
+    sort_by: str = "usage",
+    show_claude: bool = False,
+    include_summary: bool = True,
     spinner_char: str | None = None,
     use_color: bool = True,
     bar_width: int = 10,
+    term_width: int | None = None,
 ) -> list[str]:
-    # cell_width: prefix (4 chars: "5h: " / "Wk: ") + bar (12) + 1 + pct (4) + 1 + reset (5) = 27
-    cell_width = bar_width + 17
-    spinner_pad = 2 if spinner_char else 0
-    acc_col_width = max(10, max([len(p.name) + spinner_pad for p in profiles], default=10))
+    """Dispatches rendering to the appropriate view: table, grid, matrix, or telemetry."""
+    sorted_profs = sort_profiles(profiles, completed_map, sort_by=sort_by)
+    telemetry = compute_fleet_telemetry(completed_map, extract_quota_bucket)
 
-    quota_area_width = cell_width * len(QUOTA_COLUMNS) + 3 * (len(QUOTA_COLUMNS) - 1)
+    lines: list[str] = []
+    # Prepend fleet summary banner for table, grid, matrix if summary is requested
+    if include_summary and len(completed_map) > 0 and view != "telemetry":
+        banner = render_fleet_summary_banner(telemetry, width=term_width or 80, use_color=use_color)
+        if banner:
+            lines.extend(banner)
+            lines.append("")
 
-    top_border = (
-        "┌─"
-        + ("─" * acc_col_width)
-        + "─┬─"
-        + "─┬─".join("─" * cell_width for _ in TABLE_COLUMNS)
-        + "─┐"
-    )
-
-    header_cols = [f"{title:^{cell_width}}" for _, title in TABLE_COLUMNS]
-    header_row = f"│ {'Account':<{acc_col_width}} │ " + " │ ".join(header_cols) + " │"
-
-    divider = (
-        "├─"
-        + ("─" * acc_col_width)
-        + "─┼─"
-        + "─┼─".join("─" * cell_width for _ in TABLE_COLUMNS)
-        + "─┤"
-    )
-
-    bottom_border = (
-        "└─"
-        + ("─" * acc_col_width)
-        + "─┴─"
-        + "─┴─".join("─" * cell_width for _ in TABLE_COLUMNS)
-        + "─┘"
-    )
-
-    lines = [top_border, header_row, divider]
-
-    for idx, p in enumerate(profiles):
-        sub_health = calculate_subscription_health(p.subscription_date)
-        sub_cell_1, sub_cell_2 = format_subscription_cells(
-            sub_health, width=cell_width, use_color=use_color
+    if view == "matrix":
+        lines.extend(
+            render_usage_matrix_lines(
+                sorted_profs,
+                completed_map,
+                extract_quota_bucket,
+                use_color=use_color,
+                term_width=term_width,
+            )
+        )
+    elif view == "grid":
+        lines.extend(
+            render_usage_grid_lines(
+                sorted_profs,
+                completed_map,
+                extract_quota_bucket,
+                format_short_reset_time,
+                show_claude=show_claude,
+                use_color=use_color,
+                term_width=term_width,
+            )
+        )
+    elif view == "telemetry":
+        banner = render_fleet_summary_banner(telemetry, width=term_width or 80, use_color=use_color)
+        if banner:
+            lines.extend(banner)
+            lines.append("")
+        lines.extend(
+            render_usage_telemetry_lines(
+                sorted_profs,
+                completed_map,
+                extract_quota_bucket,
+                format_short_reset_time,
+                use_color=use_color,
+                term_width=term_width,
+            )
+        )
+    else:
+        # Default "table" view
+        lines.extend(
+            render_usage_table_lines(
+                sorted_profs,
+                completed_map,
+                show_claude=show_claude,
+                spinner_char=spinner_char,
+                use_color=use_color,
+                smooth=use_color,
+                bar_width=bar_width,
+                term_width=term_width,
+            )
         )
 
-        if p.name in completed_map:
-            usage = completed_map[p.name]
-            if usage.status == "success":
-                # Row 1: 5h limit
-                cells_5h = [
-                    format_quota_cell(
-                        extract_quota_bucket(usage, fam, "5h"),
-                        prefix="5h: ",
-                        bar_width=bar_width,
-                        use_color=use_color,
-                        target_width=cell_width,
-                    )
-                    for fam, _ in QUOTA_COLUMNS
-                ]
-                # Row 2: Week limit (below the 5h)
-                cells_wk = [
-                    format_quota_cell(
-                        extract_quota_bucket(usage, fam, "week"),
-                        prefix="Wk: ",
-                        bar_width=bar_width,
-                        use_color=use_color,
-                        target_width=cell_width,
-                    )
-                    for fam, _ in QUOTA_COLUMNS
-                ]
-                acc_sub = f"· {format_age(usage.age_seconds)}" if usage.cached else ""
-                if len(acc_sub) > acc_col_width:
-                    acc_sub = acc_sub[:acc_col_width]
-                acc_sub_disp = f"\033[90m{acc_sub:<{acc_col_width}}\033[0m" if (use_color and acc_sub) else f"{acc_sub:<{acc_col_width}}"
-                row_1 = f"│ {usage.account:<{acc_col_width}} │ " + " │ ".join(cells_5h + [sub_cell_1]) + " │"
-                row_2 = f"│ {acc_sub_disp} │ " + " │ ".join(cells_wk + [sub_cell_2]) + " │"
-                lines.append(row_1)
-                lines.append(row_2)
-            else:
-                err_msg = usage.error or "unknown error"
-                failed_text = f"✗ Failed: {err_msg}"
-                if len(failed_text) > quota_area_width:
-                    failed_text = failed_text[: quota_area_width - 3] + "..."
-                if use_color:
-                    failed_display = f"\033[91m{failed_text:<{quota_area_width}}\033[0m"
-                else:
-                    failed_display = f"{failed_text:<{quota_area_width}}"
-                row_1 = f"│ {usage.account:<{acc_col_width}} │ {failed_display} │ {sub_cell_1} │"
-                row_2 = f"│ {'':<{acc_col_width}} │ {'':<{quota_area_width}} │ {sub_cell_2} │"
-                lines.append(row_1)
-                lines.append(row_2)
-        else:
-            loading_text = "Loading..."
-            if use_color:
-                loading_display = f"\033[90m{loading_text:<{quota_area_width}}\033[0m"
-            else:
-                loading_display = f"{loading_text:<{quota_area_width}}"
-            acc_str = f"{spinner_char} {p.name}" if spinner_char else p.name
-            row_1 = f"│ {acc_str:<{acc_col_width}} │ {loading_display} │ {sub_cell_1} │"
-            row_2 = f"│ {'':<{acc_col_width}} │ {'':<{quota_area_width}} │ {sub_cell_2} │"
-            lines.append(row_1)
-            lines.append(row_2)
-
-        # "only seperate after the week"
-        if idx < len(profiles) - 1:
-            lines.append(divider)
-
-    lines.append(bottom_border)
     return lines
 
 
@@ -845,10 +886,21 @@ class ProgressiveUsageUI:
         profiles: Sequence[Profile],
         is_tty: bool | None = None,
         stdout: Any = None,
+        view: str = "table",
+        sort_by: str = "usage",
+        show_claude: bool = False,
+        include_summary: bool | None = None,
     ) -> None:
         self.profiles = list(profiles)
         self.stdout = sys.stdout if stdout is None else stdout
         self.is_tty = sys.stdout.isatty() if is_tty is None else is_tty
+        self.view = view
+        self.sort_by = sort_by
+        self.show_claude = show_claude
+        if include_summary is None:
+            self.include_summary = self.is_tty
+        else:
+            self.include_summary = include_summary
         self.completed: dict[str, AccountUsage] = {}
         self.spinner_idx = 0
         self.last_lines_count = 0
@@ -878,23 +930,21 @@ class ProgressiveUsageUI:
             self.stdout.flush()
 
     def _render_title(self) -> str:
-        cached_count = sum(1 for u in self.completed.values() if u.cached)
-        if cached_count == len(self.completed) and cached_count > 0:
-            max_age = max((u.age_seconds for u in self.completed.values()), default=0.0)
-            return f"Antigravity Usage (Cached {format_age(max_age)})"
-        elif cached_count > 0:
-            return f"Antigravity Usage ({cached_count}/{len(self.completed)} cached)"
         return "Antigravity Usage"
 
     def _render_tty_frame(self, spinner_char: str) -> list[str]:
         lines: list[str] = [self._render_title(), ""]
-        table_lines = render_usage_table_lines(
+        view_lines = render_usage_view_lines(
             self.profiles,
             self.completed,
+            view=self.view,
+            sort_by=self.sort_by,
+            show_claude=self.show_claude,
+            include_summary=self.include_summary,
             spinner_char=spinner_char,
             use_color=True,
         )
-        lines.extend(table_lines)
+        lines.extend(view_lines)
         return lines
 
     def render_tty(self, spinner_char: str) -> None:
@@ -931,15 +981,19 @@ class ProgressiveUsageUI:
     def finish(self, usages: Sequence[AccountUsage]) -> None:
         self._stop_event.set()
         completed_map = {u.account: u for u in usages}
-        table_lines = render_usage_table_lines(
+        view_lines = render_usage_view_lines(
             self.profiles,
             completed_map,
+            view=self.view,
+            sort_by=self.sort_by,
+            show_claude=self.show_claude,
+            include_summary=self.include_summary,
             spinner_char=None,
             use_color=self.is_tty,
         )
         title = self._render_title()
         if self.is_tty:
-            lines = [title, ""] + table_lines
+            lines = [title, ""] + view_lines
             out: list[str] = []
             if self.last_lines_count > 0:
                 out.append(f"\033[{self.last_lines_count}A\r")
@@ -949,7 +1003,7 @@ class ProgressiveUsageUI:
             self._safe_write("".join(out))
             self.stdout.flush()
         else:
-            lines = [title, ""] + table_lines + [""]
+            lines = [title, ""] + view_lines + [""]
             self._safe_write("\n".join(lines))
             self.stdout.flush()
 
@@ -962,6 +1016,10 @@ async def run_usage(
     refresh: bool = False,
     timeout: float = 30.0,
     concurrency_limit: int = 8,
+    view: str = "table",
+    sort_by: str = "usage",
+    show_claude: bool = False,
+    include_summary: bool | None = None,
     cache_manager: CacheManager | None = None,
     is_tty: bool | None = None,
     stdout: Any = None,
@@ -1003,7 +1061,15 @@ async def run_usage(
 
     tty_mode = sys.stdout.isatty() if is_tty is None else is_tty
     if need_live_query and tty_mode:
-        ui = ProgressiveUsageUI(profiles, is_tty=tty_mode, stdout=out)
+        ui = ProgressiveUsageUI(
+            profiles,
+            is_tty=tty_mode,
+            stdout=out,
+            view=view,
+            sort_by=sort_by,
+            show_claude=show_claude,
+            include_summary=include_summary,
+        )
         spinner_task = asyncio.create_task(ui.spinner_loop())
         usages_result: list[AccountUsage] = []
         try:
@@ -1022,7 +1088,15 @@ async def run_usage(
             await spinner_task
         return usages_result
 
-    ui = ProgressiveUsageUI(profiles, is_tty=tty_mode, stdout=out)
+    ui = ProgressiveUsageUI(
+        profiles,
+        is_tty=tty_mode,
+        stdout=out,
+        view=view,
+        sort_by=sort_by,
+        show_claude=show_claude,
+        include_summary=include_summary,
+    )
     usages_result = await fetch_all_usage(
         agy_path,
         profiles,

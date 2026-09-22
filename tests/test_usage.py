@@ -482,11 +482,12 @@ class OutputRenderingTests(unittest.TestCase):
 
         # Final formatted report table
         self.assertIn("Antigravity Usage", output)
-        self.assertIn("Gemini", output)
-        self.assertIn("Claude & GPT", output)
+        self.assertIn("Gemini 5h", output)
+        self.assertIn("Gemini Wk", output)
+        self.assertNotIn("Claude & GPT", output)
         self.assertIn("personal", output)
-        self.assertIn("5h: [████████░░]  84%", output)
-        self.assertIn("Wk: [██████████]  99%", output)
+        self.assertIn("5h: [████████▍░]  84%", output)
+        self.assertIn("Wk: [█████████▉]  99%", output)
         self.assertIn("work", output)
         self.assertIn("Failed: agy exited with status 1 (session expired)", output)
 
@@ -536,40 +537,40 @@ class TableAndBarStylingTests(unittest.TestCase):
     def test_short_reset_time_abbreviations(self) -> None:
         now = datetime(2026, 9, 21, 0, 0, 0, tzinfo=timezone.utc)
 
-        # 6d 21h -> 6d+
+        # 6d 21h -> 6d
         res_6d_plus = format_reset_time(now + timedelta(days=6, hours=21), now=now, short=True)
-        self.assertEqual(res_6d_plus, "6d+")
-        self.assertLessEqual(len(res_6d_plus), 5)
+        self.assertEqual(res_6d_plus, "6d")
+        self.assertLessEqual(len(res_6d_plus), 4)
 
         # 6d 0h -> 6d
         res_6d = format_reset_time(now + timedelta(days=6), now=now, short=True)
         self.assertEqual(res_6d, "6d")
-        self.assertLessEqual(len(res_6d), 5)
+        self.assertLessEqual(len(res_6d), 4)
 
-        # >= 3h: 4h 17m -> 4h+
+        # >= 3h: 4h 17m -> 4h
         res_4h_plus = format_reset_time(now + timedelta(hours=4, minutes=17), now=now, short=True)
-        self.assertEqual(res_4h_plus, "4h+")
-        self.assertLessEqual(len(res_4h_plus), 5)
+        self.assertEqual(res_4h_plus, "4h")
+        self.assertLessEqual(len(res_4h_plus), 4)
 
         # >= 3h: 3h 0m -> 3h
         res_3h = format_reset_time(now + timedelta(hours=3), now=now, short=True)
         self.assertEqual(res_3h, "3h")
-        self.assertLessEqual(len(res_3h), 5)
+        self.assertLessEqual(len(res_3h), 4)
 
-        # < 3h: show minutes too! (2h 59m -> 2h59m)
+        # < 3h: shorter format (2h 59m -> 2h)
         res_2h59m = format_reset_time(now + timedelta(hours=2, minutes=59), now=now, short=True)
-        self.assertEqual(res_2h59m, "2h59m")
-        self.assertLessEqual(len(res_2h59m), 5)
+        self.assertEqual(res_2h59m, "2h")
+        self.assertLessEqual(len(res_2h59m), 4)
 
-        # < 3h: show minutes too! (1h 15m -> 1h15m)
+        # < 3h: shorter format (1h 15m -> 1h)
         res_1h15m = format_reset_time(now + timedelta(hours=1, minutes=15), now=now, short=True)
-        self.assertEqual(res_1h15m, "1h15m")
-        self.assertLessEqual(len(res_1h15m), 5)
+        self.assertEqual(res_1h15m, "1h")
+        self.assertLessEqual(len(res_1h15m), 4)
 
-        # < 3h: show minutes too! (1h 5m -> 1h05m)
+        # < 3h: shorter format (1h 5m -> 1h)
         res_1h05m = format_reset_time(now + timedelta(hours=1, minutes=5), now=now, short=True)
-        self.assertEqual(res_1h05m, "1h05m")
-        self.assertLessEqual(len(res_1h05m), 5)
+        self.assertEqual(res_1h05m, "1h")
+        self.assertLessEqual(len(res_1h05m), 4)
 
         # less than 1 hour: exact minutes (45m)
         res_45m = format_reset_time(now + timedelta(minutes=45, seconds=30), now=now, short=True)
@@ -716,16 +717,16 @@ class SubscriptionUsageIntegrationTests(unittest.TestCase):
         lines = render_usage_table_lines([p1, p2, p3], completed, use_color=False)
         rendered = "\n".join(lines)
 
-        # Header has Subscription
-        self.assertIn("Subscription", rendered)
-        # Safe profile has bar and renews date
-        self.assertIn("[██████████]", rendered)
-        self.assertIn("Renews: 21/03/2027", rendered)
+        # Header has Sub
+        self.assertIn("Sub", rendered)
+        # Safe profile has compact remaining time
+        self.assertIn("p-safe", rendered)
+        self.assertIn("5mo", rendered)
         # Expired profile shows failed quota error AND subscription status
         self.assertIn("Failed: session expired", rendered)
-        self.assertIn("Expired: 09/09/2026", rendered)
+        self.assertIn("exp", rendered)
         # Unknown profile shows neutral unknown
-        self.assertIn("(date not set)", rendered)
+        self.assertIn("p-unk", rendered)
 
     def test_json_payload_includes_subscription(self) -> None:
         u_sub = parse_usage_response(SAMPLE_REAL_RESPONSE, "p-sub", subscription_date="2027-03-21")
@@ -830,14 +831,15 @@ class CacheUsageIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(a2["cached"])
         self.assertEqual(a2["age_seconds"], 0.0)
 
-    def test_table_rendering_shows_cached_age(self) -> None:
+    def test_table_rendering_no_cached_part(self) -> None:
         from agym.usage import render_usage_table_lines
 
         p1 = Profile(name="p-cached", home=Path("/h1"), created_at="")
         u1 = parse_usage_response(SAMPLE_REAL_RESPONSE, "p-cached", cached=True, age_seconds=42.0)
         lines = render_usage_table_lines([p1], {"p-cached": u1}, use_color=False)
         rendered = "\n".join(lines)
-        self.assertIn("42s ago", rendered)
+        self.assertNotIn("42s ago", rendered)
+        self.assertNotIn("Cached", rendered)
 
     def test_cli_usage_refresh_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -852,4 +854,261 @@ class CacheUsageIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(code, 0)
                 mock_run.assert_called_once()
                 self.assertTrue(mock_run.call_args.kwargs["refresh"])
+
+
+class UsageGraphsTests(unittest.TestCase):
+    def test_smooth_fractional_bar_formatting(self) -> None:
+        from agym.usage_graphs import format_smooth_bar
+
+        # 0% empty
+        self.assertEqual(format_smooth_bar(0.0, 10, use_color=False), "[░░░░░░░░░░]")
+        # 100% full
+        self.assertEqual(format_smooth_bar(1.0, 10, use_color=False), "[██████████]")
+        # 50% half
+        self.assertEqual(format_smooth_bar(0.5, 10, use_color=False), "[█████░░░░░]")
+        # 5% should show a fractional block (▌), not empty!
+        self.assertEqual(format_smooth_bar(0.05, 10, use_color=False), "[▌░░░░░░░░░]")
+        # 84% should show 8 full blocks + fractional ▍ + empty
+        self.assertEqual(format_smooth_bar(0.84, 10, use_color=False), "[████████▍░]")
+
+    def test_sparkline_and_micro_bar(self) -> None:
+        from agym.usage_graphs import format_micro_bar, format_sparkline_glyph
+
+        # Sparkline glyphs
+        self.assertEqual(format_sparkline_glyph(0.0, use_color=False), " ")
+        self.assertEqual(format_sparkline_glyph(1.0, use_color=False), "█")
+
+        # Micro bar
+        self.assertEqual(format_micro_bar(1.0, 5, use_color=False), "▰▰▰▰▰")
+        self.assertEqual(format_micro_bar(0.0, 5, use_color=False), "▱▱▱▱▱")
+        self.assertEqual(format_micro_bar(0.6, 5, use_color=False), "▰▰▰▱▱")
+
+    def test_compute_fleet_telemetry(self) -> None:
+        from agym.usage import extract_quota_bucket
+        from agym.usage_graphs import compute_fleet_telemetry
+
+        u1 = parse_usage_response(SAMPLE_REAL_RESPONSE, "acc1")
+        u2 = parse_usage_response(SAMPLE_REAL_RESPONSE, "acc2")
+        u3 = AccountUsage(account="acc3", status="error", error="session expired")
+
+        telemetry = compute_fleet_telemetry({"acc1": u1, "acc2": u2, "acc3": u3}, extract_quota_bucket)
+        self.assertEqual(telemetry.total_accounts, 3)
+        self.assertGreater(telemetry.gemini_avg_pct, 50.0)
+        self.assertEqual(telemetry.claude_avg_pct, 100.0)
+        self.assertEqual(telemetry.ready_count, 2)
+        self.assertEqual(telemetry.depleted_count, 1)
+
+    def test_render_fleet_summary_banner(self) -> None:
+        from agym.usage import extract_quota_bucket
+        from agym.usage_graphs import compute_fleet_telemetry, render_fleet_summary_banner
+
+        u1 = parse_usage_response(SAMPLE_REAL_RESPONSE, "acc1")
+        telemetry = compute_fleet_telemetry({"acc1": u1}, extract_quota_bucket)
+        lines = render_fleet_summary_banner(telemetry, width=80, use_color=False)
+        self.assertGreater(len(lines), 2)
+        banner_text = "\n".join(lines)
+        self.assertIn("Fleet Capacity", banner_text)
+        self.assertIn("Gemini Pool", banner_text)
+        self.assertIn("Claude Pool", banner_text)
+
+    def test_render_views(self) -> None:
+        from agym.usage import render_usage_view_lines
+
+        p1 = Profile(name="alpha", home=Path("/h1"), created_at="")
+        p2 = Profile(name="beta", home=Path("/h2"), created_at="")
+        u1 = parse_usage_response(SAMPLE_REAL_RESPONSE, "alpha")
+        u2 = parse_usage_response(SAMPLE_REAL_RESPONSE, "beta")
+        completed = {"alpha": u1, "beta": u2}
+
+        # 1. Grid view (Option 2)
+        grid_lines = render_usage_view_lines(
+            [p1, p2], completed, view="grid", use_color=False, term_width=100
+        )
+        grid_text = "\n".join(grid_lines)
+        self.assertIn("alpha", grid_text)
+        self.assertIn("beta", grid_text)
+        self.assertIn("Gemini 5h", grid_text)
+        self.assertIn("Gemini Wk", grid_text)
+        self.assertIn("Sub", grid_text)
+        # Claude & GPT is omitted from the grid table body
+        body = grid_text.split("Account")[1]
+        self.assertNotIn("Claude & GPT", body)
+        # Exactly 1 line per account
+        alpha_lines = [l for l in grid_lines if "alpha" in l]
+        self.assertEqual(len(alpha_lines), 1)
+
+        # 2. Matrix view (Option 2 - ultra dense)
+        matrix_lines = render_usage_view_lines(
+            [p1, p2], completed, view="matrix", use_color=False, term_width=100
+        )
+        matrix_text = "\n".join(matrix_lines)
+        self.assertIn("Fleet Heatmap Matrix", matrix_text)
+        self.assertIn("alpha", matrix_text)
+        self.assertIn("Legend:", matrix_text)
+
+        # 3. Telemetry view (Option 3 - executive tiers)
+        tele_lines = render_usage_view_lines(
+            [p1, p2], completed, view="telemetry", use_color=False, term_width=100
+        )
+        tele_text = "\n".join(tele_lines)
+        self.assertIn("READY TO USE", tele_text)
+        self.assertIn("Recommendation:", tele_text)
+
+        # 4. Table view (Option 1)
+        table_lines = render_usage_view_lines(
+            [p1, p2], completed, view="table", use_color=False, term_width=100
+        )
+        table_text = "\n".join(table_lines)
+        self.assertIn("Account", table_text)
+        self.assertIn("Gemini", table_text)
+
+    def test_profile_sorting(self) -> None:
+        from agym.usage import sort_profiles
+
+        p1 = Profile(name="zebra", home=Path("/h1"), created_at="")
+        p2 = Profile(name="alpha", home=Path("/h2"), created_at="")
+        u1 = parse_usage_response(SAMPLE_REAL_RESPONSE, "zebra")
+        u2 = parse_usage_response(SAMPLE_REAL_RESPONSE, "alpha")
+        completed = {"zebra": u1, "alpha": u2}
+
+        sorted_by_name = sort_profiles([p1, p2], completed, sort_by="name")
+        self.assertEqual([p.name for p in sorted_by_name], ["alpha", "zebra"])
+
+        # Test sub sorting
+        p_exp = Profile(name="exp_prof", home=Path("/h3"), created_at="", subscription_date="2026-09-25")
+        p_safe = Profile(name="safe_prof", home=Path("/h4"), created_at="", subscription_date="2028-01-01")
+        p_none = Profile(name="none_prof", home=Path("/h5"), created_at="", subscription_date=None)
+        sorted_by_sub = sort_profiles([p_none, p_safe, p_exp], {}, sort_by="sub")
+        self.assertEqual([p.name for p in sorted_by_sub], ["exp_prof", "safe_prof", "none_prof"])
+
+        # Test default sorting by usage
+        u_low = AccountUsage(
+            account="low_prof",
+            status="success",
+            groups=[
+                UsageGroup(
+                    name="Gemini",
+                    description=None,
+                    buckets=[UsageBucket(id="g5", name="5h", window="5h", remaining_fraction=0.10, reset_time=None)],
+                )
+            ],
+        )
+        p_low = Profile(name="low_prof", home=Path("/hl"), created_at="")
+        p_high = Profile(name="high_prof", home=Path("/hh"), created_at="")
+        completed_usage = {"low_prof": u_low, "high_prof": u1}
+        # Default sort (no sort_by argument) should sort by usage descending
+        sorted_default = sort_profiles([p_low, p_high], completed_usage)
+        self.assertEqual([p.name for p in sorted_default], ["high_prof", "low_prof"])
+        # Explicit sort_by="usage"
+        sorted_usage = sort_profiles([p_low, p_high], completed_usage, sort_by="usage")
+        self.assertEqual([p.name for p in sorted_usage], ["high_prof", "low_prof"])
+
+    def test_format_compact_sub(self) -> None:
+        from datetime import date
+        from agym.subscription import calculate_subscription_health, format_compact_sub, format_colored_compact_sub
+
+        now = date(2026, 9, 21)
+        h_unknown = calculate_subscription_health(None, now=now)
+        self.assertEqual(format_compact_sub(h_unknown, now=now), "-")
+
+        h_exp = calculate_subscription_health("2020-01-01", now=now)
+        self.assertEqual(format_compact_sub(h_exp, now=now), "exp")
+
+        h_1d = calculate_subscription_health("2026-09-22", now=now)
+        self.assertEqual(format_compact_sub(h_1d, now=now), "1d")
+
+        h_14d = calculate_subscription_health("2026-10-05", now=now)
+        self.assertEqual(format_compact_sub(h_14d, now=now), "14d")
+
+        h_1mo = calculate_subscription_health("2026-10-25", now=now)
+        self.assertEqual(format_compact_sub(h_1mo, now=now), "1mo")
+
+        h_6mo = calculate_subscription_health("2027-03-21", now=now)
+        self.assertEqual(format_compact_sub(h_6mo, now=now), "6mo")
+
+        h_18m = calculate_subscription_health("2028-03-21", now=now)
+        self.assertEqual(format_compact_sub(h_18m, now=now), "18m")
+
+        # Verify <= 3 chars for all
+        for h in (h_unknown, h_exp, h_1d, h_14d, h_1mo, h_6mo, h_18m):
+            sub_str = format_compact_sub(h, now=now)
+            self.assertLessEqual(len(sub_str), 3)
+
+        # Colored version
+        colored = format_colored_compact_sub(h_18m, use_color=True, now=now)
+        self.assertIn("18m", colored)
+        self.assertIn("\033[", colored)
+
+    def test_cli_view_and_sort_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = ProfileStore(config_root=tmp_path / "config", data_root=tmp_path / "data")
+            store.create("p1")
+
+            with mock.patch("agym.cli.ProfileStore", return_value=store), \
+                 mock.patch("agym.cli.resolve_agy", return_value=Path("/fake/agy")), \
+                 mock.patch("agym.cli.run_usage", return_value=[]) as mock_run:
+                code = cli.main(["usage", "--grid", "--sort", "quota", "--no-summary"])
+                self.assertEqual(code, 0)
+                mock_run.assert_called_once()
+                self.assertEqual(mock_run.call_args.kwargs["view"], "grid")
+                self.assertEqual(mock_run.call_args.kwargs["sort_by"], "quota")
+                self.assertFalse(mock_run.call_args.kwargs["include_summary"])
+
+            with mock.patch("agym.cli.ProfileStore", return_value=store), \
+                 mock.patch("agym.cli.resolve_agy", return_value=Path("/fake/agy")), \
+                 mock.patch("agym.cli.run_usage", return_value=[]) as mock_run:
+                code = cli.main(["usage", "-t"])
+                self.assertEqual(code, 0)
+                mock_run.assert_called_once()
+                self.assertEqual(mock_run.call_args.kwargs["view"], "telemetry")
+
+            with mock.patch("agym.cli.ProfileStore", return_value=store), \
+                 mock.patch("agym.cli.resolve_agy", return_value=Path("/fake/agy")), \
+                 mock.patch("agym.cli.run_usage", return_value=[]) as mock_run:
+                code = cli.main(["usage", "-m"])
+                self.assertEqual(code, 0)
+                mock_run.assert_called_once()
+                self.assertEqual(mock_run.call_args.kwargs["view"], "matrix")
+
+            with mock.patch("agym.cli.ProfileStore", return_value=store), \
+                 mock.patch("agym.cli.resolve_agy", return_value=Path("/fake/agy")), \
+                 mock.patch("agym.cli.run_usage", return_value=[]) as mock_run:
+                code = cli.main(["usage", "-c"])
+                self.assertEqual(code, 0)
+                mock_run.assert_called_once()
+                self.assertTrue(mock_run.call_args.kwargs["show_claude"])
+
+    def test_render_usage_with_claude_flag(self) -> None:
+        from agym.usage import render_usage_view_lines
+
+        p1 = Profile(name="dev", home=Path("/h1"), created_at="", subscription_date="2027-03-21")
+        u1 = parse_usage_response(SAMPLE_REAL_RESPONSE, "dev", subscription_date="2027-03-21")
+        completed = {"dev": u1}
+
+        # 1. Default (no claude): Claude omitted
+        default_lines = render_usage_view_lines([p1], completed, show_claude=False, use_color=False)
+        default_text = "\n".join(default_lines)
+        self.assertIn("Gemini 5h", default_text)
+        self.assertIn("Gemini Wk", default_text)
+        self.assertNotIn("Claude 5h", default_text)
+
+        # 2. Wide terminal (term_width >= 120): single line with Claude 5h & Claude Wk
+        wide_lines = render_usage_view_lines([p1], completed, show_claude=True, use_color=False, term_width=130)
+        wide_text = "\n".join(wide_lines)
+        self.assertIn("Gemini 5h", wide_text)
+        self.assertIn("Claude 5h", wide_text)
+        self.assertIn("Claude Wk", wide_text)
+        dev_wide = [l for l in wide_lines if "dev" in l]
+        self.assertEqual(len(dev_wide), 1)
+
+        # 3. Narrow terminal (term_width < 120): 2 lines per account (Gemini row & Claude row)
+        narrow_lines = render_usage_view_lines([p1], completed, show_claude=True, use_color=False, term_width=80)
+        narrow_text = "\n".join(narrow_lines)
+        self.assertIn("Model", narrow_text)
+        self.assertIn("Gemini", narrow_text)
+        self.assertIn("Claude", narrow_text)
+        dev_narrow = [l for l in narrow_lines if "dev" in l or "Claude" in l]
+        self.assertGreaterEqual(len(dev_narrow), 2)
+
 

@@ -98,15 +98,26 @@ Command Options:
       --name, --rename NEW_NAME       Rename the profile to a new name
       -s, --subscription-date DATE    Set renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)
       --clear-subscription-date       Remove stored subscription date
-  agym usage [--json] [-f, --refresh] [--timeout SECONDS] [profiles...]
+  agym usage [--json] [-c, --claude] [-f, --refresh] [-v, --view {table,grid,matrix,telemetry}] [--sort {usage,quota,reset,name,sub,default}] [--timeout SECONDS] [profiles...]
       --json                          Output quota and subscription data in JSON format
+      -c, --claude                    Include Claude & GPT quotas in the usage view
       -f, --refresh                   Bypass cache and force live query
+      -v, --view VIEW                 Visual graph layout: table (default), grid, matrix, or telemetry
+      -g, --grid                      Shortcut for --view grid (borderless account view)
+      -m, --matrix                    Shortcut for --view matrix (ultra-dense heatmap for dozens of accounts)
+      -t, --telemetry                 Shortcut for --view telemetry (executive tiered view & recommendation)
+      --sort CRITERION                Sort accounts by: usage (default), quota, reset, name, or sub
+      --no-summary                    Hide top fleet capacity summary banner
       --timeout SECONDS               Per-profile query timeout in seconds (default: 30)
 
-  agym tokens [--json] [-b, --breakdown] [-f, --refresh] [profiles...]
+  agym tokens [--json] [-b, --breakdown] [-f, --refresh] [-v, --view {table,matrix,telemetry,classic}] [--sort {default,volume,cache,name}] [profiles...]
       --json                          Output token metrics and summary in JSON format
       -b, --breakdown                 Show detailed token composition breakdown table
       -f, --refresh                   Bypass cache and re-scan conversation databases
+      -v, --view VIEW                 Visual layout: table (default), matrix, telemetry, classic
+      -m, --matrix                    Shortcut for --view matrix (ultra-dense heatmap for dozens of accounts)
+      -t, --telemetry                 Shortcut for --view telemetry (executive tiered view & analytics)
+      --sort CRITERION                Sort accounts by: default, volume, cache, or name
 
   agym statusline [--preview [profile] | --sync | --status | --enable | --disable]
       --preview, -p [PROFILE]         Preview rendered statusline for active or specified profile
@@ -437,6 +448,63 @@ def _usage(argv: list[str], store: ProfileStore) -> int:
         help="Bypass cache and force live query",
     )
     parser.add_argument(
+        "--view",
+        "-v",
+        choices=["table", "grid", "matrix", "telemetry"],
+        default="table",
+        help="Visual graph layout style: table (default), grid, matrix, or telemetry",
+    )
+    parser.add_argument(
+        "--grid",
+        "-g",
+        action="store_const",
+        dest="view",
+        const="grid",
+        help="Shortcut for --view grid (multi-column card dashboard)",
+    )
+    parser.add_argument(
+        "--matrix",
+        "-m",
+        action="store_const",
+        dest="view",
+        const="matrix",
+        help="Shortcut for --view matrix (ultra-dense heatmap for dozens of accounts)",
+    )
+    parser.add_argument(
+        "--telemetry",
+        "-t",
+        action="store_const",
+        dest="view",
+        const="telemetry",
+        help="Shortcut for --view telemetry (executive tiered view & recommendations)",
+    )
+    parser.add_argument(
+        "--sort",
+        choices=["usage", "quota", "reset", "name", "sub", "default"],
+        default="usage",
+        help="Sort order for profiles (default: usage; options: usage, quota, reset, name, sub, default)",
+    )
+    parser.add_argument(
+        "--claude",
+        "-c",
+        action="store_true",
+        dest="show_claude",
+        help="Include Claude & GPT quotas in the usage view",
+    )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        dest="include_summary",
+        default=None,
+        help="Show top fleet capacity summary banner",
+    )
+    parser.add_argument(
+        "--no-summary",
+        action="store_false",
+        dest="include_summary",
+        help="Hide top fleet capacity summary banner",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=30.0,
@@ -468,6 +536,14 @@ def _usage(argv: list[str], store: ProfileStore) -> int:
     }
     if ns.refresh:
         kwargs["refresh"] = True
+    if ns.show_claude:
+        kwargs["show_claude"] = True
+    if ns.view != "table":
+        kwargs["view"] = ns.view
+    if ns.sort != "usage":
+        kwargs["sort_by"] = ns.sort
+    if ns.include_summary is not None:
+        kwargs["include_summary"] = ns.include_summary
     try:
         asyncio.run(run_usage(agy, profiles, **kwargs))
         return 0
@@ -499,6 +575,35 @@ def _tokens(argv: list[str], store: ProfileStore) -> int:
         help="Bypass cache and re-scan conversation databases",
     )
     parser.add_argument(
+        "--view",
+        "-v",
+        choices=["table", "matrix", "telemetry", "classic"],
+        default="table",
+        help="Visual layout style: table (default), matrix, telemetry, classic",
+    )
+    parser.add_argument(
+        "--matrix",
+        "-m",
+        action="store_const",
+        dest="view",
+        const="matrix",
+        help="Shortcut for --view matrix (ultra-dense heatmap for dozens of accounts)",
+    )
+    parser.add_argument(
+        "--telemetry",
+        "-t",
+        action="store_const",
+        dest="view",
+        const="telemetry",
+        help="Shortcut for --view telemetry (executive tiered view & analytics)",
+    )
+    parser.add_argument(
+        "--sort",
+        choices=["default", "volume", "cache", "name"],
+        default="default",
+        help="Sort order for profiles (default, volume, cache, name)",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=30.0,
@@ -524,13 +629,21 @@ def _tokens(argv: list[str], store: ProfileStore) -> int:
         return 0
 
     agy = resolve_agy()
-    kwargs = {
+    resolved_view = ns.view
+    if ns.breakdown and not any(arg in argv for arg in ("--view", "-v", "-g", "--grid", "-m", "--matrix", "-t", "--telemetry")):
+        resolved_view = "classic"
+
+    kwargs: dict[str, Any] = {
         "json_mode": ns.json_mode,
         "breakdown": ns.breakdown,
         "timeout": ns.timeout,
     }
     if ns.refresh:
         kwargs["refresh"] = True
+    if resolved_view != "classic":
+        kwargs["view"] = resolved_view
+    if ns.sort != "default":
+        kwargs["sort_by"] = ns.sort
     try:
         asyncio.run(run_tokens(agy, profiles, **kwargs))
         return 0
