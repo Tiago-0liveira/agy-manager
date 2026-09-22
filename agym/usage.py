@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Sequence
 
-from .cache import CacheManager, TTL_USAGE_SECONDS, format_age, format_freshness_badge
+from .cache import CacheManager, TTL_USAGE_SECONDS, USAGE_CACHE_TTL_SECONDS, format_age, format_freshness_badge
 from .launcher import build_profile_env, resolve_agy
 from .profiles import Profile, ProfileStore
 from .subscription import calculate_subscription_health, format_subscription_cells
@@ -751,9 +751,10 @@ async def fetch_account_usage_async(
     force_refresh: bool = False,
     cache_manager: CacheManager | None = None,
     runner: Callable[..., Coroutine[Any, Any, tuple[int, str, str]]] | None = None,
+    max_age: float = TTL_USAGE_SECONDS,
 ) -> AccountUsage:
     if not force_refresh and cache_manager is not None:
-        cached_entry = cache_manager.get_usage(profile.name, max_age=TTL_USAGE_SECONDS)
+        cached_entry = cache_manager.get_usage(profile.name, max_age=max_age)
         if cached_entry is not None:
             parsed_data, raw_out, age_secs, cached_at = cached_entry
             cached_usage = parse_usage_response(
@@ -846,6 +847,7 @@ async def fetch_all_usage(
     timeout: float = 30.0,
     force_refresh: bool = False,
     cache_manager: CacheManager | None = None,
+    max_age: float = TTL_USAGE_SECONDS,
     on_progress: Callable[[AccountUsage], None] | None = None,
     runner: Callable[..., Coroutine[Any, Any, tuple[int, str, str]]] | None = None,
 ) -> list[AccountUsage]:
@@ -864,6 +866,7 @@ async def fetch_all_usage(
             force_refresh=force_refresh,
             cache_manager=cache_manager,
             runner=runner,
+            max_age=max_age,
         )
         if on_progress is not None:
             on_progress(usage)
@@ -1109,3 +1112,80 @@ async def run_usage(
     )
     ui.finish(usages_result)
     return usages_result
+
+
+async def fetch_and_cache_usage_async(
+    profiles: Sequence[Profile] | None = None,
+    force: bool = False,
+    *,
+    agy_path: Path | None = None,
+    cache_manager: CacheManager | None = None,
+    concurrency_limit: int = 8,
+    timeout: float = 30.0,
+    runner: Callable[..., Coroutine[Any, Any, tuple[int, str, str]]] | None = None,
+    on_progress: Callable[[AccountUsage], None] | None = None,
+) -> list[AccountUsage]:
+    """Retrieves usage data for profiles honoring 5-minute cache freshness (USAGE_CACHE_TTL_SECONDS).
+
+    If force is False and valid cache (<300s) exists, cached data is returned without network calls.
+    Otherwise, invokes the API runner to refresh stale/missing data and updates the cache.
+    """
+    cm = cache_manager if cache_manager is not None else CacheManager()
+    if profiles is None:
+        store = ProfileStore()
+        profiles = store.list()
+    if not profiles:
+        return []
+
+    if agy_path is None:
+        agy_path = resolve_agy()
+
+    return await fetch_all_usage(
+        agy_path=agy_path,
+        profiles=profiles,
+        concurrency_limit=concurrency_limit,
+        timeout=timeout,
+        force_refresh=force,
+        cache_manager=cm,
+        max_age=USAGE_CACHE_TTL_SECONDS,
+        on_progress=on_progress,
+        runner=runner,
+    )
+
+
+def fetch_and_cache_usage(
+    profiles: Sequence[Profile] | None = None,
+    force: bool = False,
+    *,
+    agy_path: Path | None = None,
+    cache_manager: CacheManager | None = None,
+    concurrency_limit: int = 8,
+    timeout: float = 30.0,
+    runner: Callable[..., Coroutine[Any, Any, tuple[int, str, str]]] | None = None,
+    on_progress: Callable[[AccountUsage], None] | None = None,
+) -> list[AccountUsage]:
+    """Synchronous entry point for fetch_and_cache_usage_async."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    coro = fetch_and_cache_usage_async(
+        profiles=profiles,
+        force=force,
+        agy_path=agy_path,
+        cache_manager=cache_manager,
+        concurrency_limit=concurrency_limit,
+        timeout=timeout,
+        runner=runner,
+        on_progress=on_progress,
+    )
+
+    if loop and loop.is_running():
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            return executor.submit(asyncio.run, coro).result()
+    else:
+        return asyncio.run(coro)
+

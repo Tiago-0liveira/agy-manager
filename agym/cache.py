@@ -11,7 +11,30 @@ from .profiles import _chmod_private_dir, _default_data_root
 
 # Default TTL policies
 TTL_USAGE_SECONDS = 60.0      # 1 minute for live quota
+USAGE_CACHE_TTL_SECONDS = 300.0  # 5 minutes for interactive picker cache freshness
 TTL_TOKENS_SECONDS = 600.0    # 10 minutes for token usage tracking
+
+
+def should_refresh_cache(
+    cached_timestamp: float | None,
+    force_fresh: bool = False,
+    ttl_seconds: float = USAGE_CACHE_TTL_SECONDS,
+    now: datetime | None = None,
+) -> bool:
+    """Evaluates whether usage cache should be refreshed according to TTL and freshness flags."""
+    if force_fresh:
+        return True
+    if cached_timestamp is None:
+        return True
+    if now is None:
+        now_ts = datetime.now(timezone.utc).timestamp()
+    else:
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        now_ts = now.timestamp()
+    if (now_ts - cached_timestamp) > ttl_seconds:
+        return True
+    return False
 
 
 def format_age(seconds: float) -> str:
@@ -180,6 +203,27 @@ class CacheManager:
         }
         filepath = self.usage_dir / f"{profile_name}.json"
         _write_json_atomic(filepath, payload)
+
+    def get_cached_usage_with_meta(
+        self,
+        profile_name: str,
+    ) -> tuple[dict[str, Any] | None, float | None]:
+        """Retrieves raw cached usage data along with the timestamp of when it was fetched."""
+        filepath = self.usage_dir / f"{profile_name}.json"
+        if not filepath.exists():
+            return None, None
+        try:
+            with filepath.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if not isinstance(payload, dict):
+                return None, None
+            cached_timestamp = payload.get("cached_timestamp")
+            if not isinstance(cached_timestamp, (int, float)):
+                return None, None
+            parsed_data = payload.get("parsed_data")
+            return parsed_data, float(cached_timestamp)
+        except (OSError, json.JSONDecodeError):
+            return None, None
 
     # --- Token Usage Cache & Ledger ---
 
@@ -409,3 +453,39 @@ class CacheManager:
             if self.tokens_dir.exists():
                 for f in self.tokens_dir.glob("*.json"):
                     f.unlink()
+
+
+def get_cached_usage_with_meta(
+    profile_name: str,
+    cache_manager: CacheManager | None = None,
+) -> tuple[dict[str, Any] | None, float | None]:
+    """Convenience helper to retrieve (data, last_fetched_timestamp) for a profile."""
+    cm = cache_manager if cache_manager is not None else CacheManager()
+    return cm.get_cached_usage_with_meta(profile_name)
+
+
+def fetch_and_cache_usage(
+    profiles: Any = None,
+    force: bool = False,
+    *,
+    agy_path: Any = None,
+    cache_manager: CacheManager | None = None,
+    concurrency_limit: int = 8,
+    timeout: float = 30.0,
+    runner: Any = None,
+    on_progress: Any = None,
+) -> Any:
+    """Convenience wrapper delegating to agym.usage.fetch_and_cache_usage."""
+    from .usage import fetch_and_cache_usage as _fetch_and_cache
+
+    return _fetch_and_cache(
+        profiles=profiles,
+        force=force,
+        agy_path=agy_path,
+        cache_manager=cache_manager,
+        concurrency_limit=concurrency_limit,
+        timeout=timeout,
+        runner=runner,
+        on_progress=on_progress,
+    )
+
