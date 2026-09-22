@@ -27,10 +27,10 @@ from .wincred import (
 
 logger = logging.getLogger("agym.quota_api")
 
-# Google Cloud Code Quota Endpoints
+# Google Cloud Code Quota Endpoints (production first, daily internal staging fallback)
 CLOUDCODE_HOSTS: tuple[str, ...] = (
-    "daily-cloudcode-pa.googleapis.com",
     "cloudcode-pa.googleapis.com",
+    "daily-cloudcode-pa.googleapis.com",
 )
 
 OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -360,6 +360,9 @@ async def query_quota_api_async(
     body_data = b"{}"
     loop = asyncio.get_running_loop()
 
+    # Per-host timeout: allow fast failover so a stalled host doesn't hang the UI
+    http_timeout = min(timeout, 5.0)
+
     last_error: Exception | None = None
     for host in CLOUDCODE_HOSTS:
         url = f"https://{host}/v1internal:retrieveUserQuotaSummary"
@@ -371,12 +374,15 @@ async def query_quota_api_async(
                     url,
                     body_data,
                     headers,
-                    timeout,
+                    http_timeout,
                 )
                 if status == 200:
                     payload = json.loads(body)
                     if isinstance(payload, dict) and "groups" in payload:
                         return payload
+                elif status == 401:
+                    # Token expired/invalid: fail immediately so caller refreshes rather than querying other hosts
+                    raise RuntimeError(f"API returned HTTP 401 from {host}: {body}")
                 elif status == 429 and attempt == 0:
                     # Rate limited: short pause and retry once
                     logger.debug("Quota API 429 received from %s; backing off 1.0s", host)
@@ -386,6 +392,8 @@ async def query_quota_api_async(
                     last_error = RuntimeError(f"API returned HTTP {status} from {host}: {body}")
                     break
             except Exception as exc:
+                if "401" in str(exc) or "unauthorized" in str(exc).lower():
+                    raise
                 last_error = exc
                 break
 
