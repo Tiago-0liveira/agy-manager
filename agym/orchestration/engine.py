@@ -19,11 +19,16 @@ import json
 import logging
 import os
 import sys
+import tempfile
+import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Collection, Sequence
+
+from agym.orchestration.locking import FileLock, LockTimeoutError
 
 from agym.orchestration.contracts import (
     ActionId,
@@ -67,6 +72,7 @@ from agym.orchestration.leases import is_pid_alive
 from agym.orchestration.prompts import (
     build_synthesis_prompt,
     format_coordinator_observation,
+    redact_profile_identities,
 )
 from agym.orchestration.protocol import (
     ActionValidationError,
@@ -114,6 +120,10 @@ class BudgetExceededError(EngineError):
 
 class ActionRejectedError(EngineError):
     """Raised when an unrecoverable coordinator action rejection occurs."""
+
+
+_ACTIVE_RUNS: set[str] = set()
+_ACTIVE_RUNS_LOCK = threading.Lock()
 
 
 # ============================================================================
@@ -208,6 +218,7 @@ def build_worker_prompt(
     objective: str = "",
     repository_scope: str = "",
     context_results: list[WorkerResult] | None = None,
+    workspace_mode: WorkspaceMode = WorkspaceMode.READ_ONLY,
 ) -> str:
     """Build a prompt for an analytical or specialized worker.
 
@@ -245,6 +256,18 @@ def build_worker_prompt(
         f"Perform your analysis and execution strictly in accordance with your role ({role.value}).",
         "Deliver clear, high-quality technical output addressing your objective.",
     ])
+    if workspace_mode == WorkspaceMode.READ_ONLY:
+        sections.extend([
+            "",
+            "## Workspace Constraint",
+            "You are operating in READ-ONLY mode. You must NOT modify any files, create commits, or alter the workspace. Only perform inspection, reading, and analysis.",
+        ])
+    elif workspace_mode == WorkspaceMode.MUTATING:
+        sections.extend([
+            "",
+            "## Workspace Constraint",
+            "You are operating in MUTATING mode. You may apply necessary code changes and edits within repository scope.",
+        ])
     return "\n".join(sections)
 
 
@@ -344,6 +367,27 @@ class OrchestrationEngine:
         # Per-run active registries (Do not use global process tracking)
         self._active_tasks: dict[RunId, dict[InvocationId, asyncio.Task[Any]]] = {}
         self._active_leases: dict[RunId, list[ProfileLease]] = {}
+        self._run_deadlines: dict[RunId, float] = {}
+        self._coord_profiles: dict[RunId, str] = {}
+
+    def _get_run_lock(self, run_id: RunId | str) -> FileLock:
+        """Obtain a cross-process exclusive FileLock for the given run_id."""
+        rid = RunId(run_id)
+        if hasattr(self.store, "base_dir"):
+            try:
+                bdir = Path(self.store.base_dir)
+                bdir.mkdir(parents=True, exist_ok=True)
+                return FileLock(bdir / f".run_{rid}.lock", timeout=0.1)
+            except Exception:
+                pass
+        if hasattr(self.lease_manager, "lease_root"):
+            try:
+                lroot = Path(self.lease_manager.lease_root)
+                lroot.mkdir(parents=True, exist_ok=True)
+                return FileLock(lroot / f".run_{rid}.lock", timeout=0.1)
+            except Exception:
+                pass
+        return FileLock(Path(tempfile.gettempdir()) / f"agym_run_{rid}.lock", timeout=0.1)
 
     # ========================================================================
     # Event Emission Helper
@@ -453,6 +497,12 @@ class OrchestrationEngine:
             )
 
         # 8. Budget Enforcement: max_runtime_seconds
+        deadline = self._run_deadlines.get(state.run_id)
+        if deadline is not None and time.monotonic() >= deadline:
+            return (
+                False,
+                f"Max runtime limit of {state.budget.max_runtime_seconds:.1f}s exceeded",
+            )
         if state.created_at:
             try:
                 cdt = datetime.fromisoformat(state.created_at)
@@ -511,6 +561,15 @@ class OrchestrationEngine:
             active_leases = self.lease_manager.list_leases()
             for lease in active_leases:
                 if str(lease.run_id) == str(run_id):
+                    # Never clean up a lease belonging to another live process
+                    if lease.pid is not None and lease.pid != os.getpid() and is_pid_alive(lease.pid):
+                        logger.warning(
+                            "Skipping release of lease %s for run %s: owner PID %d is still alive",
+                            lease.lease_id,
+                            run_id,
+                            lease.pid,
+                        )
+                        continue
                     try:
                         self.lease_manager.release(lease.lease_id, run_id=run_id)
                         self._emit_event(
@@ -535,6 +594,10 @@ class OrchestrationEngine:
         coordinator: CoordinatorClient | None = None,
     ) -> None:
         """Handle cancellation / SIGINT / Ctrl+C safely."""
+        if getattr(state, "_interruption_handled", False):
+            return
+        setattr(state, "_interruption_handled", True)
+
         logger.warning("Interruption received for run %s: %s", run_id, reason)
 
         # 1. Cancel tracked asyncio tasks
@@ -588,9 +651,25 @@ class OrchestrationEngine:
     ) -> CoordinatorObservation:
         """Construct the CoordinatorObservation after a wave completes or an action is rejected."""
         fleet_view = self.scheduler.get_fleet_view()
+        from dataclasses import replace
+
+        sanitized_completed = []
+        for r in completed:
+            if getattr(r, "response", None):
+                sanitized_completed.append(replace(r, response=redact_profile_identities(r.response)))
+            else:
+                sanitized_completed.append(r)
+
+        sanitized_failed = []
+        for r in failed:
+            if getattr(r, "response", None):
+                sanitized_failed.append(replace(r, response=redact_profile_identities(r.response)))
+            else:
+                sanitized_failed.append(r)
+
         return CoordinatorObservation(
-            completed_results=list(completed),
-            failed_results=list(failed),
+            completed_results=sanitized_completed,
+            failed_results=sanitized_failed,
             rejected_requests=list(rejected),
             budget_usage=BudgetUsage(
                 invocations=state.budget_usage.invocations,
@@ -647,7 +726,14 @@ class OrchestrationEngine:
                 objective=worker_req.objective,
                 repository_scope=repository_scope,
                 context_results=context_results,
+                workspace_mode=worker_req.workspace_mode,
             )
+
+        deadline = self._run_deadlines.get(state.run_id)
+        effective_timeout = worker_req.timeout_seconds
+        if deadline is not None:
+            remaining = max(0.1, deadline - time.monotonic())
+            effective_timeout = min(effective_timeout, remaining)
 
         invocation = ModelInvocation(
             invocation_id=iid,
@@ -657,7 +743,7 @@ class OrchestrationEngine:
             strategy=worker_req.strategy,
             workspace_mode=worker_req.workspace_mode,
             prompt=prompt,
-            timeout_seconds=worker_req.timeout_seconds,
+            timeout_seconds=effective_timeout,
         )
 
         # Record invocation started before launch
@@ -690,8 +776,8 @@ class OrchestrationEngine:
                         model_res = await self.runner.run_async(invocation, profile_name=current_lease.profile_name)
                     else:
                         model_res = await asyncio.to_thread(self.runner.run, invocation, current_lease.profile_name)
-                except (KeyboardInterrupt, asyncio.CancelledError) as exc:
-                    raise asyncio.CancelledError("Interrupted by user (Ctrl+C)") from exc
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    raise
                 except Exception as exc:
                     model_res = ModelResult(
                         invocation_id=iid,
@@ -795,7 +881,8 @@ class OrchestrationEngine:
                     role=worker_req.role,
                     status=InvocationStatus.FAILED,
                     invocation_id=iid,
-                    response=model_res.error or model_res.response,
+                    response=model_res.response,
+                    error=model_res.error or "Worker execution failed",
                     structured_data=model_res.structured_data,
                     conversation_id=model_res.conversation_id,
                     failure=failure_class,
@@ -806,8 +893,10 @@ class OrchestrationEngine:
                     self.store.record_invocation_failed(
                         state.run_id,
                         iid,
-                        error=model_res.error or model_res.response or "Worker execution failed",
+                        error=model_res.error or "Worker execution failed",
                         failure=failure_class,
+                        exit_code=getattr(model_res, "exit_code", None),
+                        output_text=model_res.response,
                     )
                 else:
                     self._emit_event(
@@ -816,7 +905,7 @@ class OrchestrationEngine:
                         {
                             "invocation_id": str(iid),
                             "worker_id": str(worker_req.worker_id),
-                            "error": model_res.error,
+                            "error": model_res.error or "Worker execution failed",
                         },
                     )
                 self.store.save_result(state.run_id, worker_res)
@@ -850,11 +939,13 @@ class OrchestrationEngine:
         # Resolve target worker outputs from prior store results
         all_results = self.store.get_results(state.run_id)
         target_results: list[WorkerResult] = []
-        target_map = {
-            str(r.worker_id): r
-            for r in all_results
-            if isinstance(r, WorkerResult) and r.status == InvocationStatus.SUCCEEDED
-        }
+        target_map: dict[str, WorkerResult] = {}
+        for r in all_results:
+            if isinstance(r, WorkerResult):
+                wid_str = str(r.worker_id)
+                if wid_str not in target_map or (r.status == InvocationStatus.SUCCEEDED and target_map[wid_str].status != InvocationStatus.SUCCEEDED):
+                    target_map[wid_str] = r
+
         for tid in audit_req.target_worker_ids:
             if str(tid) in target_map:
                 target_results.append(target_map[str(tid)])
@@ -866,6 +957,12 @@ class OrchestrationEngine:
             target_results=target_results,
         )
 
+        deadline = self._run_deadlines.get(state.run_id)
+        effective_timeout = audit_req.timeout_seconds
+        if deadline is not None:
+            remaining = max(0.1, deadline - time.monotonic())
+            effective_timeout = min(effective_timeout, remaining)
+
         invocation = ModelInvocation(
             invocation_id=iid,
             run_id=state.run_id,
@@ -874,7 +971,7 @@ class OrchestrationEngine:
             strategy=audit_req.strategy,
             workspace_mode=WorkspaceMode.READ_ONLY,
             prompt=prompt,
-            timeout_seconds=audit_req.timeout_seconds,
+            timeout_seconds=effective_timeout,
         )
 
         if hasattr(self.store, "record_invocation_started"):
@@ -900,8 +997,8 @@ class OrchestrationEngine:
                     model_res = await self.runner.run_async(invocation, profile_name=current_lease.profile_name)
                 else:
                     model_res = await asyncio.to_thread(self.runner.run, invocation, current_lease.profile_name)
-            except (KeyboardInterrupt, asyncio.CancelledError) as exc:
-                raise asyncio.CancelledError("Interrupted by user (Ctrl+C)") from exc
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                raise
             except Exception as exc:
                 model_res = ModelResult(
                     invocation_id=iid,
@@ -955,7 +1052,8 @@ class OrchestrationEngine:
                 worker_id=audit_req.worker_id,
                 invocation_id=iid,
                 findings=[],
-                response=model_res.error or model_res.response,
+                response=model_res.response,
+                error=model_res.error or "Auditor invocation failed",
                 status=InvocationStatus.FAILED,
                 failure=failure_class,
                 started_at=model_res.started_at,
@@ -967,6 +1065,8 @@ class OrchestrationEngine:
                     iid,
                     error=model_res.error or "Auditor invocation failed",
                     failure=failure_class,
+                    exit_code=getattr(model_res, "exit_code", None),
+                    output_text=model_res.response,
                 )
             else:
                 self._emit_event(
@@ -1024,10 +1124,13 @@ class OrchestrationEngine:
             if state.budget.min_quota_remaining > 1.0
             else state.budget.min_quota_remaining
         )
+        coord_profile = self._coord_profiles.get(state.run_id)
+        excluded = {coord_profile} if coord_profile else None
         leases = self.scheduler.allocate(
             requests,
             run_id=state.run_id,
             min_quota=min_q,
+            excluded_profiles=excluded,
             raise_on_insufficient=True,
         )
 
@@ -1065,6 +1168,12 @@ class OrchestrationEngine:
         # 4. Gather all parallel wave tasks
         try:
             results = await asyncio.gather(*tasks, return_exceptions=True)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         finally:
             self._active_tasks.pop(state.run_id, None)
 
@@ -1114,32 +1223,66 @@ class OrchestrationEngine:
             raise EngineError("No coordinator provided for run")
 
         rid = RunId(run_id or f"run_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}")
-        b = budget or self.default_budget or OrchestrationBudget()
+        with _ACTIVE_RUNS_LOCK:
+            if str(rid) in _ACTIVE_RUNS:
+                raise EngineError(f"Run '{rid}' is already active in this process")
+            _ACTIVE_RUNS.add(str(rid))
 
-        # Step 1: Create run atomically
-        if hasattr(self.store, "create_run"):
-            state = self.store.create_run(run_id=rid, task=task, mode=mode, budget=b)
-        else:
-            now = datetime.now(timezone.utc).isoformat()
-            state = RunState(
-                run_id=rid,
-                task=task,
-                mode=mode,
-                status=RunStatus.CREATED,
-                budget=b,
-                budget_usage=BudgetUsage(),
-                created_at=now,
-                updated_at=now,
-            )
-            self.store.save_run(state)
-            self._emit_event(EventType.RUN_CREATED, rid, {"task": task, "mode": mode.value})
-
-        state.status = RunStatus.RUNNING
-        self.store.save_run(state)
-
-        known_worker_ids: set[WorkerId] = set()
-
+        run_lock = self._get_run_lock(rid)
         try:
+            run_lock.acquire()
+        except Exception as exc:
+            with _ACTIVE_RUNS_LOCK:
+                _ACTIVE_RUNS.discard(str(rid))
+            raise EngineError(f"Run '{rid}' is already active in another process") from exc
+
+        state: RunState | None = None
+        try:
+            b = budget or self.default_budget or OrchestrationBudget()
+
+            # Step 1: Create run atomically
+            if hasattr(self.store, "create_run"):
+                state = self.store.create_run(run_id=rid, task=task, mode=mode, budget=b)
+            else:
+                now = datetime.now(timezone.utc).isoformat()
+                state = RunState(
+                    run_id=rid,
+                    task=task,
+                    mode=mode,
+                    status=RunStatus.CREATED,
+                    budget=b,
+                    budget_usage=BudgetUsage(),
+                    created_at=now,
+                    updated_at=now,
+                )
+                self.store.save_run(state)
+                self._emit_event(EventType.RUN_CREATED, rid, {"task": task, "mode": mode.value})
+
+            state.status = RunStatus.RUNNING
+            self.store.save_run(state)
+
+            coord_profile = getattr(coord, "profile_name", None) or getattr(coord, "_profile_name", None)
+            if coord_profile:
+                coord_lease = self.lease_manager.acquire(
+                    coord_profile,
+                    run_id=rid,
+                    worker_id=WorkerId("coordinator"),
+                )
+                self._active_leases.setdefault(rid, []).append(coord_lease)
+                self._coord_profiles[rid] = coord_profile
+                self._emit_event(
+                    EventType.PROFILE_LEASED,
+                    rid,
+                    {
+                        "lease_id": str(coord_lease.lease_id),
+                        "profile_name": coord_lease.profile_name,
+                        "worker_id": "coordinator",
+                        "run_id": str(rid),
+                    },
+                )
+
+            known_worker_ids: set[WorkerId] = set()
+
             # Step 2: Query fleet capacity (do not independently query quota)
             fleet_view = self.scheduler.get_fleet_view()
 
@@ -1149,6 +1292,8 @@ class OrchestrationEngine:
 
             if hasattr(coord, "start_run") and callable(coord.start_run):
                 initial_res = coord.start_run(task, fleet_view)
+            elif hasattr(coord, "start") and callable(coord.start):
+                initial_res = coord.start(task, fleet_view)
             elif hasattr(coord, "assess_task") and callable(coord.assess_task):
                 initial_res = coord.assess_task(task, fleet_view)
             else:
@@ -1158,10 +1303,19 @@ class OrchestrationEngine:
             if isinstance(initial_res, InitialCoordinatorResponse):
                 assessment = initial_res.assessment
                 action = initial_res.action
+            elif hasattr(initial_res, "assessment") and hasattr(initial_res, "action"):
+                assessment = getattr(initial_res, "assessment")
+                action = getattr(initial_res, "action")
             elif isinstance(initial_res, tuple) and len(initial_res) == 2:
                 assessment, action = initial_res
             elif isinstance(initial_res, TaskAssessment):
                 assessment = initial_res
+                if hasattr(coord, "_initial_action") and getattr(coord, "_initial_action") is not None:
+                    action = getattr(coord, "_initial_action")
+                    try:
+                        setattr(coord, "_initial_action", None)
+                    except Exception:
+                        pass
             elif isinstance(initial_res, (str, dict)):
                 try:
                     parsed_initial = parse_initial_response(initial_res, known_worker_ids=known_worker_ids)
@@ -1191,16 +1345,40 @@ class OrchestrationEngine:
 
             observation: CoordinatorObservation | None = None
 
+            start_monotonic = time.monotonic()
+            remaining_budget = max(0.0, state.budget.max_runtime_seconds - state.budget_usage.runtime_seconds)
+            deadline = start_monotonic + remaining_budget
+            self._run_deadlines[state.run_id] = deadline
+
+            consecutive_rejections = 0
+            coordinator_turns = 0
+            max_coordinator_turns = (state.budget.max_rounds + 1) * (state.budget.max_consecutive_rejections + 1)
+            emitted_rounds: set[int] = set()
+
             # Step 11: Repeat adaptively (decision -> validate -> execute -> observation)
             while True:
+                coordinator_turns += 1
+                if coordinator_turns > max_coordinator_turns:
+                    raise BudgetExceededError(
+                        f"Coordinator turn limit of {max_coordinator_turns} exceeded for run {state.run_id}"
+                    )
+
+                if time.monotonic() >= deadline:
+                    raise BudgetExceededError(
+                        f"Run {state.run_id} exceeded maximum runtime budget of {state.budget.max_runtime_seconds}s"
+                    )
+
                 fleet_view = self.scheduler.get_fleet_view()
 
-                if action is None:
+                if state.round_number not in emitted_rounds:
                     self._emit_event(
                         EventType.ROUND_STARTED,
                         state.run_id,
                         {"round_number": state.round_number},
                     )
+                    emitted_rounds.add(state.round_number)
+
+                if action is None:
                     obs = observation or CoordinatorObservation(
                         fleet_view=fleet_view,
                         round_number=state.round_number,
@@ -1213,11 +1391,16 @@ class OrchestrationEngine:
                         try:
                             action = parse_coordinator_action(raw_action, known_worker_ids=known_worker_ids)
                         except (ActionValidationError, ProtocolError, ValueError) as exc:
+                            consecutive_rejections += 1
                             self._emit_event(
                                 EventType.ACTION_REJECTED,
                                 state.run_id,
                                 {"action_id": "invalid_action", "reason": str(exc)},
                             )
+                            if consecutive_rejections >= state.budget.max_consecutive_rejections:
+                                raise ActionRejectedError(
+                                    f"Coordinator exceeded maximum consecutive rejected actions limit ({state.budget.max_consecutive_rejections}): {exc}"
+                                )
                             fail_res = [
                                 failure_to_worker_result(
                                     create_action_rejected_failure("invalid_action", str(exc))
@@ -1228,11 +1411,16 @@ class OrchestrationEngine:
                             continue
                     else:
                         err_msg = f"Invalid coordinator action returned: {type(raw_action)}"
+                        consecutive_rejections += 1
                         self._emit_event(
                             EventType.ACTION_REJECTED,
                             state.run_id,
                             {"action_id": "invalid_action", "reason": err_msg},
                         )
+                        if consecutive_rejections >= state.budget.max_consecutive_rejections:
+                            raise ActionRejectedError(
+                                f"Coordinator exceeded maximum consecutive rejected actions limit ({state.budget.max_consecutive_rejections}): {err_msg}"
+                            )
                         fail_res = [
                             failure_to_worker_result(
                                 create_action_rejected_failure("invalid_action", err_msg)
@@ -1254,28 +1442,35 @@ class OrchestrationEngine:
                     state.status = RunStatus.COMPLETED
                     state.final_result = action.final_response
                     state.updated_at = datetime.now(timezone.utc).isoformat()
-                    if hasattr(self.store, "finalize_run"):
-                        try:
-                            self.store.finalize_run(state.run_id, state.final_result or "", status=RunStatus.COMPLETED)
-                        except Exception:
-                            self.store.save_run(state)
+                    if hasattr(self.store, "finalize_run") and callable(self.store.finalize_run):
+                        self.store.finalize_run(state.run_id, state.final_result or "", status=RunStatus.COMPLETED)
                     else:
                         self.store.save_run(state)
-                    self._emit_event(
-                        EventType.RUN_COMPLETED,
-                        state.run_id,
-                        {"final_result": state.final_result},
-                    )
+                        self._emit_event(
+                            EventType.RUN_COMPLETED,
+                            state.run_id,
+                            {"final_result": state.final_result},
+                        )
+                    self._cleanup_leases(state.run_id)
                     return state
 
                 # Step 4 & Step 5: Action & Budget Validation
                 is_valid, reject_reason = self._validate_action(action, state, fleet_view, known_worker_ids)
                 if not is_valid:
+                    consecutive_rejections += 1
                     self._emit_event(
                         EventType.ACTION_REJECTED,
                         state.run_id,
                         {"action_id": str(action.action_id), "reason": reject_reason},
                     )
+                    if consecutive_rejections >= state.budget.max_consecutive_rejections:
+                        if any(kw in (reject_reason or "").lower() for kw in ("budget", "limit", "exceed", "quota", "runtime")):
+                            raise BudgetExceededError(
+                                f"Budget limit reached and coordinator exceeded rejection cap: {reject_reason}"
+                            )
+                        raise ActionRejectedError(
+                            f"Coordinator exceeded maximum consecutive rejected actions limit ({state.budget.max_consecutive_rejections}): {reject_reason}"
+                        )
                     all_reqs = list(action.workers) + list(action.auditors)
                     fail_res = [
                         failure_to_worker_result(
@@ -1287,18 +1482,24 @@ class OrchestrationEngine:
                     continue
 
                 # Action accepted
+                consecutive_rejections = 0
                 self._emit_event(EventType.ACTION_ACCEPTED, state.run_id, {"action_id": str(action.action_id)})
 
                 # Step 6 & 7: Allocate profiles and run wave
                 try:
                     completed, failed, rejected = await self._execute_action_wave(action, state, repository_scope)
                 except InsufficientCapacityError as exc:
+                    consecutive_rejections += 1
                     # Scheduler could not satisfy allocation -> rejected action observation
                     self._emit_event(
                         EventType.ACTION_REJECTED,
                         state.run_id,
                         {"action_id": str(action.action_id), "reason": str(exc)},
                     )
+                    if consecutive_rejections >= state.budget.max_consecutive_rejections:
+                        raise BudgetExceededError(
+                            f"Capacity budget exhausted and coordinator exceeded rejection cap: {exc}"
+                        )
                     all_reqs = list(action.workers) + list(action.auditors)
                     fail_res = [failure_to_worker_result(create_profile_unavailable_failure(r.worker_id)) for r in all_reqs]
                     observation = self._build_observation(state, completed=[], failed=fail_res, rejected=all_reqs)
@@ -1306,6 +1507,8 @@ class OrchestrationEngine:
                     continue
 
                 for r in completed:
+                    known_worker_ids.add(r.worker_id)
+                for r in failed:
                     known_worker_ids.add(r.worker_id)
 
                 state.round_number += 1
@@ -1327,41 +1530,56 @@ class OrchestrationEngine:
                 )
 
                 # Persist coordinator tracking info
+                latest_obs = self._build_observation(state, completed=completed, failed=failed, rejected=rejected)
                 if hasattr(self.store, "save_coordinator_info"):
                     try:
-                        from agym.orchestration.persistence import CoordinatorInfo
-                        cinfo = CoordinatorInfo(
+                        self.store.save_coordinator_info(
+                            run_id=state.run_id,
                             conversation_id=state.coordinator_conversation_id,
                             round_number=state.round_number,
                             last_accepted_action=action,
-                            latest_observation=self._build_observation(
-                                state, completed=completed, failed=failed, rejected=rejected
-                            ),
+                            latest_observation=latest_obs,
                         )
-                        self.store.save_coordinator_info(state.run_id, cinfo)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning("Failed to save coordinator info for run %s: %s", state.run_id, exc)
 
                 # Build observation for next decision
-                observation = self._build_observation(state, completed=completed, failed=failed, rejected=rejected)
+                observation = latest_obs
                 action = None
 
         except (KeyboardInterrupt, asyncio.CancelledError) as exc:
-            self._handle_interruption(state.run_id, state, reason=str(exc) or "Run interrupted (Ctrl+C)", coordinator=coord)
-            if raise_on_interrupt:
+            if state is not None:
+                self._handle_interruption(state.run_id, state, reason=str(exc) or "Run interrupted (Ctrl+C)", coordinator=coord)
+            if isinstance(exc, asyncio.CancelledError) or raise_on_interrupt:
                 raise
-            return state
+            return state or RunState(run_id=rid, task=task, status=RunStatus.INTERRUPTED)
         except Exception as exc:
-            logger.exception("Run %s failed due to coordinator or engine exception: %s", state.run_id, exc)
-            state.status = RunStatus.FAILED
-            state.final_result = f"Failed: {exc}"
-            state.updated_at = datetime.now(timezone.utc).isoformat()
-            self.store.save_run(state)
-            self._emit_event(EventType.RUN_FAILED, state.run_id, {"error": str(exc)})
-            self._cleanup_leases(state.run_id)
+            logger.exception("Run %s failed due to coordinator or engine exception: %s", rid, exc)
+            if state is not None:
+                state.status = RunStatus.FAILED
+                state.final_result = f"Failed: {exc}"
+                state.updated_at = datetime.now(timezone.utc).isoformat()
+                self.store.save_run(state)
+                self._emit_event(EventType.RUN_FAILED, state.run_id, {"error": str(exc)})
+            self._cleanup_leases(rid)
             if raise_on_error:
                 raise
-            return state
+            return state or RunState(run_id=rid, task=task, status=RunStatus.FAILED, final_result=str(exc))
+        finally:
+            if coord is not None and hasattr(coord, "close") and callable(coord.close):
+                try:
+                    coord.close()
+                except Exception:
+                    pass
+            self._cleanup_leases(rid)
+            self._coord_profiles.pop(rid, None)
+            self._run_deadlines.pop(rid, None)
+            try:
+                run_lock.release()
+            except Exception:
+                pass
+            with _ACTIVE_RUNS_LOCK:
+                _ACTIVE_RUNS.discard(str(rid))
 
     def run(
         self,
@@ -1382,21 +1600,47 @@ class OrchestrationEngine:
 
         try:
             if loop and loop.is_running():
+                runner_thread_loop: list[asyncio.AbstractEventLoop] = []
+
+                def _target() -> RunState:
+                    new_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(new_loop)
+                    runner_thread_loop.append(new_loop)
+                    try:
+                        return new_loop.run_until_complete(
+                            self.run_async(
+                                task,
+                                mode=mode,
+                                budget=budget,
+                                run_id=run_id,
+                                coordinator=coordinator,
+                                repository_scope=repository_scope,
+                                raise_on_interrupt=raise_on_interrupt,
+                                raise_on_error=raise_on_error,
+                            )
+                        )
+                    finally:
+                        new_loop.close()
+
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(
-                        asyncio.run,
-                        self.run_async(
-                            task,
-                            mode=mode,
-                            budget=budget,
-                            run_id=run_id,
-                            coordinator=coordinator,
-                            repository_scope=repository_scope,
-                            raise_on_interrupt=raise_on_interrupt,
-                            raise_on_error=raise_on_error,
-                        ),
-                    )
-                    return future.result()
+                    future = executor.submit(_target)
+                    try:
+                        return future.result()
+                    except (KeyboardInterrupt, asyncio.CancelledError) as exc:
+                        if runner_thread_loop:
+                            t_loop = runner_thread_loop[0]
+                            for t in asyncio.all_tasks(t_loop):
+                                t_loop.call_soon_threadsafe(t.cancel)
+                        if run_id and hasattr(self.runner, "cancel_run"):
+                            try:
+                                self.runner.cancel_run(run_id)
+                            except Exception:
+                                pass
+                        try:
+                            future.result(timeout=5.0)
+                        except BaseException:
+                            pass
+                        raise
             else:
                 return asyncio.run(
                     self.run_async(
@@ -1420,10 +1664,10 @@ class OrchestrationEngine:
                     state = runs[0]
             if state is not None:
                 self._handle_interruption(state.run_id, state, reason=str(exc) or "Run interrupted (Ctrl+C)", coordinator=coordinator)
-                if raise_on_interrupt:
+                if raise_on_interrupt or isinstance(exc, asyncio.CancelledError):
                     raise
                 return state
-            if raise_on_interrupt:
+            if raise_on_interrupt or isinstance(exc, asyncio.CancelledError):
                 raise
             return RunState(
                 run_id=RunId(str(run_id or "interrupted")),
@@ -1455,16 +1699,55 @@ class OrchestrationEngine:
         if state.status == RunStatus.COMPLETED:
             return state
 
+        with _ACTIVE_RUNS_LOCK:
+            if str(rid) in _ACTIVE_RUNS:
+                raise EngineError(f"Run '{rid}' is already active in this process")
+            _ACTIVE_RUNS.add(str(rid))
+
+        run_lock = self._get_run_lock(rid)
+        try:
+            run_lock.acquire()
+        except Exception as exc:
+            with _ACTIVE_RUNS_LOCK:
+                _ACTIVE_RUNS.discard(str(rid))
+            raise EngineError(f"Run '{rid}' is already active in another process") from exc
+
         coord = coordinator or self.coordinator
         if coord is None:
+            try:
+                run_lock.release()
+            except Exception:
+                pass
+            with _ACTIVE_RUNS_LOCK:
+                _ACTIVE_RUNS.discard(str(rid))
             raise EngineError(f"No coordinator available to resume run '{rid}'")
 
         # Step 16: Detect unfinished invocations, classify them, cleanup stale owned leases
         self._cleanup_leases(rid)
 
+        coord_profile = getattr(coord, "profile_name", None) or getattr(coord, "_profile_name", None)
+        if coord_profile:
+            coord_lease = self.lease_manager.acquire(
+                coord_profile,
+                run_id=rid,
+                worker_id=WorkerId("coordinator"),
+            )
+            self._active_leases.setdefault(rid, []).append(coord_lease)
+            self._coord_profiles[rid] = coord_profile
+            self._emit_event(
+                EventType.PROFILE_LEASED,
+                rid,
+                {
+                    "lease_id": str(coord_lease.lease_id),
+                    "profile_name": coord_lease.profile_name,
+                    "worker_id": "coordinator",
+                    "run_id": str(rid),
+                },
+            )
+
         # Inspect and classify unfinished invocations
         all_results = list(self.store.get_results(rid))
-        known_worker_ids = {r.worker_id for r in all_results if r.status == InvocationStatus.SUCCEEDED}
+        existing_iids = {r.invocation_id for r in all_results if getattr(r, "invocation_id", None)}
 
         if hasattr(self.store, "run_dir"):
             inv_dir = self.store.run_dir(rid) / "invocations"
@@ -1502,9 +1785,12 @@ class OrchestrationEngine:
                                         failure=FailureClass.RETRYABLE,
                                     )
                                 self.store.save_result(rid, failed_res)
+                                all_results = [r for r in all_results if getattr(r, "invocation_id", None) != iid]
                                 all_results.append(failed_res)
                     except Exception as exc:
                         logger.warning("Error inspecting invocation %s during resume: %s", inv_file, exc)
+
+        known_worker_ids = {r.worker_id for r in all_results}
 
         # Recover coordinator info
         if hasattr(self.store, "get_coordinator_info"):
@@ -1514,6 +1800,26 @@ class OrchestrationEngine:
                     state.coordinator_conversation_id = cinfo.conversation_id
             except Exception:
                 pass
+
+        # Prepare coordinator for resume
+        if hasattr(coord, "resume") and callable(coord.resume):
+            try:
+                coord.resume(
+                    run_id=rid,
+                    conversation_id=state.coordinator_conversation_id,
+                    run_state=state,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to resume coordinator with conversation ID %s (%s); "
+                    "recovering with a fresh coordinator session seeded from authoritative state.",
+                    state.coordinator_conversation_id,
+                    exc,
+                )
+                try:
+                    coord.resume(run_id=rid, conversation_id=None, run_state=state)
+                except Exception:
+                    pass
 
         # Reconstruct observation
         completed = [r for r in all_results if r.status == InvocationStatus.SUCCEEDED]
@@ -1526,9 +1832,29 @@ class OrchestrationEngine:
         observation = self._build_observation(state, completed=completed, failed=failed, rejected=[])
         action: CoordinatorAction | None = None
 
+        start_monotonic = time.monotonic()
+        remaining_budget = max(0.0, state.budget.max_runtime_seconds - state.budget_usage.runtime_seconds)
+        deadline = start_monotonic + remaining_budget
+        self._run_deadlines[state.run_id] = deadline
+
+        consecutive_rejections = 0
+        coordinator_turns = 0
+        max_coordinator_turns = (state.budget.max_rounds + 1) * (state.budget.max_consecutive_rejections + 1)
+
         try:
             # Continue the loop from current observation
             while True:
+                coordinator_turns += 1
+                if coordinator_turns > max_coordinator_turns:
+                    raise BudgetExceededError(
+                        f"Coordinator turn limit of {max_coordinator_turns} exceeded for run {state.run_id}"
+                    )
+
+                if time.monotonic() >= deadline:
+                    raise BudgetExceededError(
+                        f"Run {state.run_id} exceeded maximum runtime budget of {state.budget.max_runtime_seconds}s"
+                    )
+
                 fleet_view = self.scheduler.get_fleet_view()
 
                 if action is None:
@@ -1544,11 +1870,16 @@ class OrchestrationEngine:
                         try:
                             action = parse_coordinator_action(raw_action, known_worker_ids=known_worker_ids)
                         except (ActionValidationError, ProtocolError, ValueError) as exc:
+                            consecutive_rejections += 1
                             self._emit_event(
                                 EventType.ACTION_REJECTED,
                                 state.run_id,
                                 {"action_id": "invalid_action", "reason": str(exc)},
                             )
+                            if consecutive_rejections >= state.budget.max_consecutive_rejections:
+                                raise ActionRejectedError(
+                                    f"Coordinator exceeded maximum consecutive rejected actions limit ({state.budget.max_consecutive_rejections}): {exc}"
+                                )
                             fail_res = [
                                 failure_to_worker_result(
                                     create_action_rejected_failure("invalid_action", str(exc))
@@ -1559,11 +1890,16 @@ class OrchestrationEngine:
                             continue
                     else:
                         err_msg = f"Invalid coordinator action: {type(raw_action)}"
+                        consecutive_rejections += 1
                         self._emit_event(
                             EventType.ACTION_REJECTED,
                             state.run_id,
                             {"action_id": "invalid_action", "reason": err_msg},
                         )
+                        if consecutive_rejections >= state.budget.max_consecutive_rejections:
+                            raise ActionRejectedError(
+                                f"Coordinator exceeded maximum consecutive rejected actions limit ({state.budget.max_consecutive_rejections}): {err_msg}"
+                            )
                         fail_res = [
                             failure_to_worker_result(
                                 create_action_rejected_failure("invalid_action", err_msg)
@@ -1584,27 +1920,34 @@ class OrchestrationEngine:
                     state.status = RunStatus.COMPLETED
                     state.final_result = action.final_response
                     state.updated_at = datetime.now(timezone.utc).isoformat()
-                    if hasattr(self.store, "finalize_run"):
-                        try:
-                            self.store.finalize_run(state.run_id, state.final_result or "", status=RunStatus.COMPLETED)
-                        except Exception:
-                            self.store.save_run(state)
+                    if hasattr(self.store, "finalize_run") and callable(self.store.finalize_run):
+                        self.store.finalize_run(state.run_id, state.final_result or "", status=RunStatus.COMPLETED)
                     else:
                         self.store.save_run(state)
-                    self._emit_event(
-                        EventType.RUN_COMPLETED,
-                        state.run_id,
-                        {"final_result": state.final_result},
-                    )
+                        self._emit_event(
+                            EventType.RUN_COMPLETED,
+                            state.run_id,
+                            {"final_result": state.final_result},
+                        )
+                    self._cleanup_leases(state.run_id)
                     return state
 
                 is_valid, reject_reason = self._validate_action(action, state, fleet_view, known_worker_ids)
                 if not is_valid:
+                    consecutive_rejections += 1
                     self._emit_event(
                         EventType.ACTION_REJECTED,
                         state.run_id,
                         {"action_id": str(action.action_id), "reason": reject_reason},
                     )
+                    if consecutive_rejections >= state.budget.max_consecutive_rejections:
+                        if any(kw in (reject_reason or "").lower() for kw in ("budget", "limit", "exceed", "quota", "runtime")):
+                            raise BudgetExceededError(
+                                f"Budget limit reached and coordinator exceeded rejection cap: {reject_reason}"
+                            )
+                        raise ActionRejectedError(
+                            f"Coordinator exceeded maximum consecutive rejected actions limit ({state.budget.max_consecutive_rejections}): {reject_reason}"
+                        )
                     all_reqs = list(action.workers) + list(action.auditors)
                     fail_res = [
                         failure_to_worker_result(
@@ -1615,16 +1958,22 @@ class OrchestrationEngine:
                     action = None
                     continue
 
+                consecutive_rejections = 0
                 self._emit_event(EventType.ACTION_ACCEPTED, state.run_id, {"action_id": str(action.action_id)})
 
                 try:
                     c_wave, f_wave, r_wave = await self._execute_action_wave(action, state)
                 except InsufficientCapacityError as exc:
+                    consecutive_rejections += 1
                     self._emit_event(
                         EventType.ACTION_REJECTED,
                         state.run_id,
                         {"action_id": str(action.action_id), "reason": str(exc)},
                     )
+                    if consecutive_rejections >= state.budget.max_consecutive_rejections:
+                        raise BudgetExceededError(
+                            f"Capacity budget exhausted and coordinator exceeded rejection cap: {exc}"
+                        )
                     all_reqs = list(action.workers) + list(action.auditors)
                     fail_res = [failure_to_worker_result(create_profile_unavailable_failure(r.worker_id)) for r in all_reqs]
                     observation = self._build_observation(state, completed=[], failed=fail_res, rejected=all_reqs)
@@ -1632,6 +1981,8 @@ class OrchestrationEngine:
                     continue
 
                 for r in c_wave:
+                    known_worker_ids.add(r.worker_id)
+                for r in f_wave:
                     known_worker_ids.add(r.worker_id)
 
                 state.round_number += 1
@@ -1648,7 +1999,7 @@ class OrchestrationEngine:
 
         except (KeyboardInterrupt, asyncio.CancelledError) as exc:
             self._handle_interruption(state.run_id, state, reason=str(exc) or "Run interrupted (Ctrl+C)", coordinator=coord)
-            if raise_on_interrupt:
+            if isinstance(exc, asyncio.CancelledError) or raise_on_interrupt:
                 raise
             return state
         except Exception as exc:
@@ -1662,6 +2013,21 @@ class OrchestrationEngine:
             if raise_on_error:
                 raise
             return state
+        finally:
+            if coord is not None and hasattr(coord, "close") and callable(coord.close):
+                try:
+                    coord.close()
+                except Exception:
+                    pass
+            self._cleanup_leases(rid)
+            self._coord_profiles.pop(rid, None)
+            self._run_deadlines.pop(rid, None)
+            try:
+                run_lock.release()
+            except Exception:
+                pass
+            with _ACTIVE_RUNS_LOCK:
+                _ACTIVE_RUNS.discard(str(rid))
 
     def resume(
         self,
@@ -1750,6 +2116,8 @@ class OrchestrationEngine:
 
         if hasattr(coord, "start_run") and callable(coord.start_run):
             initial_res = coord.start_run(task, fleet_view)
+        elif hasattr(coord, "start") and callable(coord.start):
+            initial_res = coord.start(task, fleet_view)
         elif hasattr(coord, "assess_task") and callable(coord.assess_task):
             initial_res = coord.assess_task(task, fleet_view)
         else:
@@ -1758,10 +2126,19 @@ class OrchestrationEngine:
         if isinstance(initial_res, InitialCoordinatorResponse):
             assessment = initial_res.assessment
             action = initial_res.action
+        elif hasattr(initial_res, "assessment") and hasattr(initial_res, "action"):
+            assessment = getattr(initial_res, "assessment")
+            action = getattr(initial_res, "action")
         elif isinstance(initial_res, tuple) and len(initial_res) == 2:
             assessment, action = initial_res
         elif isinstance(initial_res, TaskAssessment):
             assessment = initial_res
+            if hasattr(coord, "_initial_action") and getattr(coord, "_initial_action") is not None:
+                action = getattr(coord, "_initial_action")
+                try:
+                    setattr(coord, "_initial_action", None)
+                except Exception:
+                    pass
         elif isinstance(initial_res, (str, dict)):
             try:
                 parsed = parse_initial_response(initial_res, known_worker_ids=set())

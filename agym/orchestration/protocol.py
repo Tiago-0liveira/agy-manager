@@ -820,9 +820,23 @@ def validate_coordinator_action(
             raise ActionValidationError(f"Duplicate worker_id '{a_id_str}' in action")
         seen_ids.add(a_id_str)
 
-    # 5. Unknown result references rejection where context is supplied
+    # 5. Run-wide uniqueness and unknown result references rejection where context is supplied
     if known_worker_ids is not None:
         known_str_ids = {str(k) for k in known_worker_ids}
+
+        for w in action.workers:
+            w_id_str = str(w.worker_id)
+            if w_id_str in known_str_ids:
+                raise ActionValidationError(
+                    f"Duplicate worker_id '{w_id_str}' across run: worker ID was already used in a prior round"
+                )
+
+        for a in action.auditors:
+            a_id_str = str(a.worker_id)
+            if a_id_str in known_str_ids:
+                raise ActionValidationError(
+                    f"Duplicate worker_id '{a_id_str}' across run: auditor ID was already used in a prior round"
+                )
 
         for w in action.workers:
             for ctx_id in w.context_worker_ids:

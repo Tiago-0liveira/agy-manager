@@ -39,6 +39,14 @@ class LeaseOwnershipError(LeaseError):
     """Raised when a release is attempted by a non-owner."""
 
 
+class LeaseReadError(LeaseError):
+    """Raised when an existing lease file exists but cannot be read."""
+
+
+class CorruptLeaseError(LeaseReadError):
+    """Raised when an existing lease file contains corrupt or invalid data."""
+
+
 def is_pid_alive(pid: int | None) -> bool:
     """Checks whether a process with the given PID is currently alive on the system."""
     if pid is None or pid <= 0:
@@ -75,19 +83,25 @@ def is_lease_stale(
 ) -> bool:
     """Conservatively checks if a lease is stale.
 
-    Criteria:
-    - PID is no longer alive
-    - Lease heartbeat or acquisition time is older than `timeout_seconds`
-
-    Conservative invariant:
-    Never steal a lease while the holding PID is still alive, even if the heartbeat
-    is delayed, because long LLM operations or heavy tasks may take time.
+    Deterministic reclamation invariants:
+    1. If an owner PID is recorded and conclusively dead, the lease is immediately stale,
+       regardless of how recently it was acquired or updated.
+    2. If the owner PID is alive, the lease is NEVER stolen while the process is running.
+    3. If no PID was recorded, lease age/heartbeat timeout is evaluated.
     """
     if now is None:
         now = datetime.now(timezone.utc)
     elif now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
 
+    # 1. Conclusively dead owner PID is stale immediately (W4-10)
+    if lease.pid is not None:
+        if not is_pid_alive(lease.pid):
+            return True
+        # Owner process is alive; never steal lease
+        return False
+
+    # 2. No PID recorded: fallback to age / heartbeat timeout
     ts_str = lease.heartbeat_at or lease.acquired_at
     if not ts_str:
         return True
@@ -100,21 +114,7 @@ def is_lease_stale(
     except (ValueError, TypeError):
         return True
 
-    # If timeout_seconds has not elapsed, the lease is not stale
-    if age < timeout_seconds:
-        return False
-
-    # Timeout threshold has elapsed. Check process liveness.
-    if lease.pid is not None:
-        if is_pid_alive(lease.pid):
-            # Process is still running! Conservative rule: do not steal the lease.
-            return False
-        else:
-            # Holding process has died and threshold has expired. Stale.
-            return True
-
-    # No PID was recorded and timeout has expired. Stale.
-    return True
+    return age >= timeout_seconds
 
 
 class ProfileLeaseManager:
@@ -163,17 +163,30 @@ class ProfileLeaseManager:
                 except OSError:
                     pass
 
-    def _read_lease_file(self, path: Path) -> ProfileLease | None:
+    def _read_lease_file(self, path: Path, raise_on_error: bool = False) -> ProfileLease | None:
+        if not path.exists():
+            return None
         if not path.is_file():
+            if raise_on_error:
+                raise LeaseReadError(f"Lease path at {path} is not a regular file")
             return None
         try:
             with path.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
             if not isinstance(data, dict):
+                if raise_on_error:
+                    raise CorruptLeaseError(f"Lease file at {path} does not contain a JSON dictionary")
                 return None
             return ProfileLease.from_dict(data)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
+        except OSError as exc:
+            logger.warning("Failed to read lease file at %s: %s", path, exc)
+            if raise_on_error:
+                raise LeaseReadError(f"Failed to read lease file at {path}: {exc}") from exc
+            return None
+        except (ValueError, json.JSONDecodeError) as exc:
             logger.warning("Failed to parse lease file at %s: %s", path, exc)
+            if raise_on_error:
+                raise CorruptLeaseError(f"Failed to parse corrupt lease file at {path}: {exc}") from exc
             return None
 
     def acquire(
@@ -187,12 +200,13 @@ class ProfileLeaseManager:
 
         Raises:
             ProfileAlreadyLeasedError: If profile is already leased and not stale.
+            LeaseReadError: If an existing lease file cannot be read or is corrupt.
             LockTimeoutError: If lock acquisition times out.
         """
         self._ensure_dirs()
         with FileLock(self._lock_path, timeout=self.lock_timeout_seconds):
             path = self._profile_path(profile_name)
-            existing = self._read_lease_file(path)
+            existing = self._read_lease_file(path, raise_on_error=True)
 
             if existing is not None:
                 if is_lease_stale(existing, timeout_seconds=self.stale_timeout_seconds):

@@ -11,7 +11,8 @@ This module encapsulates all prompt generation logic for the AGYM coordinator:
 from __future__ import annotations
 
 import json
-from typing import Any
+import re
+from typing import Any, Sequence
 
 from agym.orchestration.contracts import (
     AuditResult,
@@ -34,6 +35,7 @@ __all__ = [
     "build_observation_prompt",
     "format_infrastructure_failure",
     "build_synthesis_prompt",
+    "redact_profile_identities",
 ]
 
 
@@ -230,7 +232,11 @@ def format_coordinator_observation(observation: CoordinatorObservation) -> str:
             sections.append(f"#### Failed: {res.worker_id} (Role: {role_str})")
             sections.append(f"- Status: {res.status.value}")
             sections.append(f"- Failure Classification: {fail_class}")
-            if res.response:
+            if getattr(res, "error", None):
+                sections.append(f"- Error: {res.error.strip()}")
+                if getattr(res, "response", None):
+                    sections.append(f"- Output / Response:\n{res.response.strip()}")
+            elif res.response:
                 sections.append(f"- Error / Message: {res.response.strip()}")
             if hasattr(res, "structured_data") and res.structured_data:
                 sections.append(f"- Failure Details: {json.dumps(res.structured_data)}")
@@ -268,7 +274,49 @@ def format_coordinator_observation(observation: CoordinatorObservation) -> str:
         f"```json\n{action_schema_str}\n```",
     ])
 
-    return "\n".join(sections)
+    return redact_profile_identities("\n".join(sections))
+
+
+def redact_profile_identities(
+    text: str | None,
+    profile_names: Sequence[str] | None = None,
+) -> str:
+    """Redact physical profile names, profile filesystem paths, and identity leaks.
+
+    Ensures coordinator observations never receive physical profile paths or names.
+    """
+    if not text:
+        return "" if text is not None else ""
+
+    result = str(text)
+
+    # 1. Redact explicit known profile names
+    if profile_names:
+        for name in profile_names:
+            if name and len(name) > 1:
+                pattern = re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE)
+                result = pattern.sub("[REDACTED_PROFILE]", result)
+
+    # 2. Redact profile paths: /.../profiles/<name>/... or profiles/<name>
+    result = re.sub(
+        r"(?i)([/\\].*?[/\\]profiles[/\\\\])[^/\\ \t\n\r\"'`]+",
+        r"\1[REDACTED]",
+        result,
+    )
+    result = re.sub(
+        r"(?i)(profiles[/\\])[^/\\ \t\n\r\"'`]+",
+        r"\1[REDACTED]",
+        result,
+    )
+
+    # 3. Redact Profile '...' or Profile "..." references
+    result = re.sub(
+        r"(?i)\bprofile\s+['\"][^'\"]+['\"]",
+        "profile '[REDACTED]'",
+        result,
+    )
+
+    return result
 
 
 def build_observation_prompt(observation: CoordinatorObservation) -> str:

@@ -400,6 +400,7 @@ class WorkerResult:
     status: InvocationStatus = InvocationStatus.SUCCEEDED
     invocation_id: InvocationId | None = None
     response: str | None = None
+    error: str | None = None
     structured_data: dict[str, Any] | None = None
     conversation_id: ConversationId | None = None
     failure: FailureClass | None = None
@@ -426,6 +427,7 @@ class WorkerResult:
             "status": self.status.value,
             "invocation_id": str(self.invocation_id) if self.invocation_id is not None else None,
             "response": self.response,
+            "error": self.error,
             "structured_data": self.structured_data,
             "conversation_id": str(self.conversation_id) if self.conversation_id is not None else None,
             "failure": self.failure.value if self.failure is not None else None,
@@ -446,6 +448,7 @@ class WorkerResult:
             status=InvocationStatus(data.get("status", InvocationStatus.SUCCEEDED)),
             invocation_id=InvocationId(data["invocation_id"]) if data.get("invocation_id") is not None else None,
             response=data.get("response"),
+            error=data.get("error"),
             structured_data=data.get("structured_data"),
             conversation_id=ConversationId(data["conversation_id"]) if data.get("conversation_id") is not None else None,
             failure=FailureClass(data["failure"]) if data.get("failure") is not None else None,
@@ -522,6 +525,7 @@ class AuditResult:
     invocation_id: InvocationId | None = None
     findings: list[str] = field(default_factory=list)
     response: str | None = None
+    error: str | None = None
     status: InvocationStatus = InvocationStatus.SUCCEEDED
     failure: FailureClass | None = None
     started_at: str | None = None
@@ -546,6 +550,7 @@ class AuditResult:
             "invocation_id": str(self.invocation_id) if self.invocation_id is not None else None,
             "findings": list(self.findings),
             "response": self.response,
+            "error": self.error,
             "status": self.status.value,
             "failure": self.failure.value if self.failure is not None else None,
             "started_at": self.started_at,
@@ -569,6 +574,7 @@ class AuditResult:
             invocation_id=InvocationId(data["invocation_id"]) if data.get("invocation_id") is not None else None,
             findings=findings,
             response=data.get("response"),
+            error=data.get("error"),
             status=InvocationStatus(data.get("status", InvocationStatus.SUCCEEDED)),
             failure=FailureClass(data["failure"]) if data.get("failure") is not None else None,
             started_at=data.get("started_at"),
@@ -917,6 +923,7 @@ class OrchestrationBudget:
     max_retries: int = 3
     max_runtime_seconds: float = 1800.0
     min_quota_remaining: float = 10.0
+    max_consecutive_rejections: int = 3
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -927,6 +934,7 @@ class OrchestrationBudget:
             "max_retries": self.max_retries,
             "max_runtime_seconds": self.max_runtime_seconds,
             "min_quota_remaining": self.min_quota_remaining,
+            "max_consecutive_rejections": self.max_consecutive_rejections,
         }
 
     def to_json(self, indent: int | None = None) -> str:
@@ -944,6 +952,7 @@ class OrchestrationBudget:
             max_retries=int(data.get("max_retries", 3)),
             max_runtime_seconds=float(data.get("max_runtime_seconds", 1800.0)),
             min_quota_remaining=float(data.get("min_quota_remaining", 10.0)),
+            max_consecutive_rejections=int(data.get("max_consecutive_rejections", 3)),
         )
 
     @classmethod

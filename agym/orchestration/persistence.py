@@ -1028,7 +1028,7 @@ class FileRunStore:
             self.record_invocation_failed(
                 rid,
                 iid,
-                error=result.response or "Invocation failed",
+                error=getattr(result, "error", None) or result.response or "Invocation failed",
                 failure=result.failure,
                 output_text=result.response,
             )
@@ -1088,6 +1088,7 @@ class FileRunStore:
                     invocation_id=InvocationId(iid),
                     findings=findings,
                     response=response,
+                    error=data.get("error"),
                     status=InvocationStatus(data.get("status", InvocationStatus.SUCCEEDED)),
                     failure=FailureClass(data["failure"]) if data.get("failure") is not None else None,
                     started_at=data.get("started_at"),
@@ -1100,6 +1101,7 @@ class FileRunStore:
                     status=InvocationStatus(data.get("status", InvocationStatus.SUCCEEDED)),
                     invocation_id=InvocationId(iid),
                     response=response,
+                    error=data.get("error"),
                     structured_data=data.get("structured_data"),
                     conversation_id=(
                         ConversationId(data["conversation_id"])
@@ -1211,8 +1213,8 @@ class FileRunStore:
     def save_coordinator_info(
         self,
         run_id: RunId | str,
-        conversation_id: ConversationId | str | None,
-        round_number: int,
+        conversation_id: ConversationId | str | CoordinatorInfo | None,
+        round_number: int = 0,
         last_accepted_action: CoordinatorAction | dict[str, Any] | None = None,
         latest_observation: CoordinatorObservation | dict[str, Any] | None = None,
     ) -> CoordinatorInfo:
@@ -1222,35 +1224,43 @@ class FileRunStore:
         if not target_dir.exists():
             raise RunNotFoundError(f"Run '{rid}' not found")
 
-        cid = ConversationId(conversation_id) if conversation_id is not None else None
-        act = (
-            CoordinatorAction.from_dict(last_accepted_action)
-            if isinstance(last_accepted_action, dict)
-            else last_accepted_action
-        )
-        obs = (
-            CoordinatorObservation.from_dict(latest_observation)
-            if isinstance(latest_observation, dict)
-            else latest_observation
-        )
-
-        info = CoordinatorInfo(
-            conversation_id=cid,
-            round_number=round_number,
-            last_accepted_action=act,
-            latest_observation=obs,
-        )
+        if isinstance(conversation_id, CoordinatorInfo):
+            info = conversation_id
+            cid = info.conversation_id
+            round_number = info.round_number
+            act = info.last_accepted_action
+            obs = info.latest_observation
+        else:
+            cid = ConversationId(conversation_id) if conversation_id is not None else None
+            act = (
+                CoordinatorAction.from_dict(last_accepted_action)
+                if isinstance(last_accepted_action, dict)
+                else last_accepted_action
+            )
+            obs = (
+                CoordinatorObservation.from_dict(latest_observation)
+                if isinstance(latest_observation, dict)
+                else latest_observation
+            )
+            info = CoordinatorInfo(
+                conversation_id=cid,
+                round_number=round_number,
+                last_accepted_action=act,
+                latest_observation=obs,
+            )
 
         atomic_write_json(target_dir / "coordinator.json", info.to_dict())
 
-        # Update run.json
-        try:
-            state = self.load_run(rid)
-            state.coordinator_conversation_id = cid
-            state.round_number = round_number
-            self.save_run(state)
-        except Exception:
-            pass
+        # Update run.json coordinator_conversation_id if present
+        run_file = target_dir / "run.json"
+        if run_file.exists():
+            try:
+                with open(run_file, "r", encoding="utf-8") as f:
+                    rdata = json.load(f)
+                rdata["coordinator_conversation_id"] = str(cid) if cid else None
+                atomic_write_json(run_file, rdata)
+            except Exception:
+                pass
 
         return info
 
@@ -1335,21 +1345,23 @@ class FileRunStore:
         self,
         run_id: RunId | str,
         final_result: str | dict[str, Any],
+        status: RunStatus | str = RunStatus.COMPLETED,
     ) -> RunState:
         """Store final result independently in final.json and transition run state to COMPLETED."""
         rid = RunId(run_id)
         state = self.load_run(rid)
         now = datetime.now(timezone.utc).isoformat()
+        status_enum = status if isinstance(status, RunStatus) else RunStatus(status)
 
         final_data = {
             "run_id": str(rid),
             "final_result": final_result,
             "completed_at": now,
-            "status": RunStatus.COMPLETED.value,
+            "status": status_enum.value,
         }
         atomic_write_json(self.run_dir(rid) / "final.json", final_data)
 
-        state.status = RunStatus.COMPLETED
+        state.status = status_enum
         state.final_result = (
             json.dumps(final_result) if isinstance(final_result, dict) else str(final_result)
         )
@@ -1364,6 +1376,7 @@ class FileRunStore:
             timestamp=now,
             payload={
                 "completed_at": now,
+                "final_result": state.final_result,
                 "summary": str(final_result)[:200],
             },
         )
@@ -1591,8 +1604,8 @@ def get_assessment(
 
 def save_coordinator_info(
     run_id: RunId | str,
-    conversation_id: ConversationId | str | None,
-    round_number: int,
+    conversation_id: ConversationId | str | CoordinatorInfo | None,
+    round_number: int = 0,
     last_accepted_action: CoordinatorAction | dict[str, Any] | None = None,
     latest_observation: CoordinatorObservation | dict[str, Any] | None = None,
     store: FileRunStore | None = None,
@@ -1628,9 +1641,10 @@ def finalize_run(
     run_id: RunId | str,
     final_result: str | dict[str, Any],
     store: FileRunStore | None = None,
+    status: RunStatus | str = RunStatus.COMPLETED,
 ) -> RunState:
     """Store final result independently in final.json and mark COMPLETED."""
-    return _get_store(store).finalize_run(run_id, final_result)
+    return _get_store(store).finalize_run(run_id, final_result, status=status)
 
 
 def inspect_run(

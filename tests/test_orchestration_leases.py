@@ -32,6 +32,8 @@ def _race_worker(lease_root: str, profile: str, run_id: str, worker_id: str, que
     try:
         lease = mgr.acquire(profile, run_id=RunId(run_id), worker_id=WorkerId(worker_id))
         queue.put(("success", run_id, str(lease.lease_id)))
+        # Keep process alive briefly so the concurrent racer tests against a living process
+        time.sleep(0.5)
     except ProfileAlreadyLeasedError:
         queue.put(("failed", run_id, "already_leased"))
     except Exception as exc:
@@ -202,14 +204,46 @@ class TestProfileLeaseManager(unittest.TestCase):
         self.assertEqual(len(revoked), 0)
         self.assertTrue(mgr.is_leased("AI_ALIVE"))
 
-    def test_non_stale_lease_preserved_within_timeout(self) -> None:
-        """Lease with dead PID but within timeout threshold is not yet stale."""
-        mgr = ProfileLeaseManager(lease_root=self.lease_root, stale_timeout_seconds=100.0)
-        mgr.acquire("AI_RECENT", run_id="run-1", worker_id="w-1", pid=99999999)
+    def test_fresh_lease_with_dead_pid_is_stale_immediately(self) -> None:
+        """W4-10: Fresh lease whose owner PID is conclusively dead is stale immediately."""
+        mgr = ProfileLeaseManager(lease_root=self.lease_root, stale_timeout_seconds=300.0)
+        dead_pid = 99999999
+        self.assertFalse(is_pid_alive(dead_pid))
 
-        revoked = mgr.revoke_stale()
-        self.assertEqual(len(revoked), 0)
-        self.assertTrue(mgr.is_leased("AI_RECENT"))
+        # Acquire a lease with dead PID right now (age ~ 0 seconds)
+        lease = mgr.acquire("AI_DEAD_PID", run_id="run-1", worker_id="w-1", pid=dead_pid)
+        self.assertTrue(is_lease_stale(lease, timeout_seconds=300.0))
+
+        # Revoking stale should immediately reclaim this lease despite the 300s timeout
+        revoked = mgr.revoke_stale(timeout_seconds=300.0)
+        self.assertEqual(len(revoked), 1)
+        self.assertEqual(revoked[0].profile_name, "AI_DEAD_PID")
+        self.assertFalse(mgr.is_leased("AI_DEAD_PID"))
+
+    def test_acquire_does_not_overwrite_existing_lease_when_read_fails(self) -> None:
+        """W4-05: Lease acquisition must fail closed on read/parse errors and not overwrite active lease."""
+        from agym.orchestration.leases import LeaseReadError, CorruptLeaseError
+        from unittest.mock import patch
+
+        mgr = ProfileLeaseManager(lease_root=self.lease_root)
+        initial_lease = mgr.acquire("AI_FAILREAD", run_id="run-original", worker_id="w-orig")
+        self.assertIsNotNone(initial_lease)
+
+        file_path = self.lease_root / "AI_FAILREAD.json"
+        self.assertTrue(file_path.exists())
+
+        # Test A: Unreadable file (e.g. simulated PermissionError or sharing violation)
+        with patch.object(Path, "open", side_effect=PermissionError("Permission denied")):
+            with self.assertRaises(LeaseReadError):
+                mgr.acquire("AI_FAILREAD", run_id="run-new", worker_id="w-new")
+
+        # Test B: Corrupt JSON file
+        file_path.write_text("NOT_VALID_JSON{{{", encoding="utf-8")
+        with self.assertRaises(CorruptLeaseError):
+            mgr.acquire("AI_FAILREAD", run_id="run-new", worker_id="w-new")
+
+        # Verify that the corrupt file was NOT overwritten with a new lease
+        self.assertEqual(file_path.read_text(encoding="utf-8"), "NOT_VALID_JSON{{{")
 
     def test_acquire_evicts_stale_lease_automatically(self) -> None:
         mgr = ProfileLeaseManager(lease_root=self.lease_root, stale_timeout_seconds=0.05)

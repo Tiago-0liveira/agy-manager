@@ -16,7 +16,11 @@ import logging
 import os
 import re
 import shutil
+import signal
+import subprocess
+import tempfile
 import threading
+import time
 from contextlib import asynccontextmanager, contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,9 +56,23 @@ from agym.orchestration.strategies import (
     map_strategy,
 )
 from agym.profiles import Profile, ProfileError, ProfileNotFound, ProfileStore
-from agym.wincred import async_profile_credential_context, profile_credential_context
+from agym.orchestration.locking import FileLock
+from agym.orchestration.prompts import redact_profile_identities
+from agym.wincred import (
+    async_profile_credential_context,
+    get_wincred_async_lock,
+    is_windows_platform,
+    profile_credential_context,
+    sync_credentials_after_launch,
+)
 
 logger = logging.getLogger("agym.orchestration.runner")
+
+
+def get_wincred_cross_process_lock() -> FileLock:
+    """Return a cross-process lock for Windows Credential Manager synchronization."""
+    lock_file = Path(tempfile.gettempdir()) / ".agym_wincred_global.lock"
+    return FileLock(lock_file, timeout=10.0)
 
 __all__ = [
     "AntigravityRunner",
@@ -139,6 +157,36 @@ def _extract_conversation_id(text: str) -> ConversationId | None:
     return None
 
 
+def kill_process_tree(
+    proc: Any,
+    sig: signal.Signals = signal.SIGTERM,
+) -> None:
+    """Terminate or kill a process and its child descendants across platforms."""
+    if proc is None:
+        return
+    if getattr(proc, "returncode", None) is not None:
+        return
+    pid = getattr(proc, "pid", None)
+    if not isinstance(pid, int) or pid <= 0:
+        return
+
+    if is_windows_platform():
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, check=False)
+        except Exception:
+            pass
+    else:
+        try:
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, OSError):
+            try:
+                if hasattr(proc, "send_signal") and callable(proc.send_signal):
+                    proc.send_signal(sig)
+            except Exception:
+                pass
+
+
 class AntigravityRunner:
     """Conforms to ModelRunner.
 
@@ -193,19 +241,37 @@ class AntigravityRunner:
                     self._active_processes.pop(run_id, None)
 
     def cancel_run(self, run_id: RunId | str) -> int:
-        """Cancel all active subprocesses belonging to a specific run."""
+        """Cancel all active subprocesses belonging to a specific run, terminating process trees."""
         rid = RunId(run_id)
         with self._lock:
             procs = list(self._active_processes.get(rid, {}).values())
 
         cancelled = 0
         for proc in procs:
-            if proc.returncode is None:
+            if getattr(proc, "returncode", None) is None:
+                kill_process_tree(proc, signal.SIGTERM)
                 try:
-                    proc.terminate()
-                    cancelled += 1
-                except (ProcessLookupError, OSError):
+                    if hasattr(proc, "terminate") and callable(proc.terminate):
+                        proc.terminate()
+                except Exception:
                     pass
+                cancelled += 1
+
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            if all(getattr(p, "returncode", None) is not None for p in procs):
+                break
+            time.sleep(0.05)
+
+        for proc in procs:
+            if getattr(proc, "returncode", None) is None:
+                kill_process_tree(proc, signal.SIGKILL)
+                try:
+                    if hasattr(proc, "kill") and callable(proc.kill):
+                        proc.kill()
+                except Exception:
+                    pass
+
         return cancelled
 
     def cancel_invocation(
@@ -213,15 +279,17 @@ class AntigravityRunner:
         run_id: RunId | str,
         invocation_id: InvocationId | str,
     ) -> bool:
-        """Cancel an individual invocation's active subprocess."""
+        """Cancel an individual invocation's active subprocess tree."""
         rid = RunId(run_id)
         iid = InvocationId(invocation_id)
         with self._lock:
             proc = self._active_processes.get(rid, {}).get(iid)
 
-        if proc and proc.returncode is None:
+        if proc and getattr(proc, "returncode", None) is None:
+            kill_process_tree(proc, signal.SIGTERM)
             try:
-                proc.terminate()
+                if hasattr(proc, "terminate") and callable(proc.terminate):
+                    proc.terminate()
                 return True
             except (ProcessLookupError, OSError):
                 return False
@@ -281,15 +349,32 @@ class AntigravityRunner:
 
         op_args.extend(["--print", invocation.prompt])
 
+        if invocation.workspace_mode == WorkspaceMode.READ_ONLY:
+            op_args.extend(["--mode", "plan", "--sandbox"])
+        elif invocation.workspace_mode == WorkspaceMode.MUTATING:
+            op_args.extend(["--mode", "accept-edits"])
+
         if profile is not None:
-            return build_agy_args(
+            if invocation.workspace_mode == WorkspaceMode.READ_ONLY:
+                from dataclasses import replace
+                safe_settings = replace(profile.settings, dangerously_skip_permissions=False)
+                profile = replace(profile, settings=safe_settings)
+                if env and "AGYM_DANGEROUSLY_SKIP_PERMISSIONS" in env:
+                    env = {k: v for k, v in env.items() if k != "AGYM_DANGEROUSLY_SKIP_PERMISSIONS"}
+
+            argv = build_agy_args(
                 profile,
                 operation_args=op_args,
                 agy_path=self._agy_path,
                 env=env,
             )
         else:
-            return [str(self._agy_path), *op_args]
+            argv = [str(self._agy_path), *op_args]
+
+        if invocation.workspace_mode == WorkspaceMode.READ_ONLY:
+            argv = [arg for arg in argv if arg not in ("--dangerously-skip-permissions", "-y", "--yes")]
+
+        return argv
 
     # =========================================================================
     # ModelRunner Protocol implementation
@@ -344,7 +429,7 @@ class AntigravityRunner:
                 return ModelResult(
                     invocation_id=invocation.invocation_id,
                     status=InvocationStatus.FAILED,
-                    error=f"Profile '{profile_name}' not found: {exc}",
+                    error=f"Profile '[REDACTED]' not found: {redact_profile_identities(str(exc), [profile_name])}",
                     started_at=started_at,
                     completed_at=datetime.now(timezone.utc).isoformat(),
                 )
@@ -352,7 +437,7 @@ class AntigravityRunner:
                 return ModelResult(
                     invocation_id=invocation.invocation_id,
                     status=InvocationStatus.FAILED,
-                    error=f"Invalid profile settings for '{profile_name}': {', '.join(profile.settings.validation_errors)}",
+                    error=f"Invalid profile settings: {', '.join(profile.settings.validation_errors)}",
                     started_at=started_at,
                     completed_at=datetime.now(timezone.utc).isoformat(),
                 )
@@ -381,20 +466,40 @@ class AntigravityRunner:
 
         # Async subprocess execution
         proc: asyncio.subprocess.Process | None = None
-        try:
-            async with cred_ctx:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env,
-                )
-                self._register_process(invocation.run_id, invocation.invocation_id, proc)
+        popen_kwargs: dict[str, Any] = {}
+        if not is_windows_platform():
+            popen_kwargs["start_new_session"] = True
+        else:
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
 
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=invocation.timeout_seconds,
-                )
+        try:
+            if is_windows_platform() and profile is not None:
+                wincred_lock = get_wincred_cross_process_lock()
+                async with get_wincred_async_lock():
+                    with wincred_lock:
+                        with profile_credential_context(profile.home):
+                            proc = await asyncio.create_subprocess_exec(
+                                *cmd,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                                env=env,
+                                **popen_kwargs,
+                            )
+            else:
+                async with cred_ctx:
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=env,
+                        **popen_kwargs,
+                    )
+            self._register_process(invocation.run_id, invocation.invocation_id, proc)
+
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=invocation.timeout_seconds,
+            )
         except asyncio.TimeoutError:
             if proc:
                 await self._cleanup_process(proc)
@@ -409,14 +514,7 @@ class AntigravityRunner:
         except asyncio.CancelledError:
             if proc:
                 await self._cleanup_process(proc)
-            return ModelResult(
-                invocation_id=invocation.invocation_id,
-                status=InvocationStatus.CANCELLED,
-                exit_code=proc.returncode if proc else None,
-                error="Execution was cancelled",
-                started_at=started_at,
-                completed_at=datetime.now(timezone.utc).isoformat(),
-            )
+            raise
         except Exception as exc:
             if proc:
                 await self._cleanup_process(proc)
@@ -429,6 +527,14 @@ class AntigravityRunner:
             )
         finally:
             self._deregister_process(invocation.run_id, invocation.invocation_id)
+            if is_windows_platform() and profile is not None and proc is not None:
+                try:
+                    wincred_lock = get_wincred_cross_process_lock()
+                    async with get_wincred_async_lock():
+                        with wincred_lock:
+                            sync_credentials_after_launch(profile.home)
+                except Exception as exc:
+                    logger.debug("Failed to sync credentials after subprocess exit: %s", exc)
 
         completed_at = datetime.now(timezone.utc).isoformat()
         stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
@@ -452,6 +558,7 @@ class AntigravityRunner:
                 err_msg = f"Authentication failure: {stderr_text or stdout_text}"
             else:
                 err_msg = f"Process exited with non-zero exit code {exit_code}: {stderr_text or stdout_text}"
+            err_msg = redact_profile_identities(err_msg, [profile_name] if profile_name else None)
             return ModelResult(
                 invocation_id=invocation.invocation_id,
                 status=InvocationStatus.FAILED,
@@ -574,15 +681,17 @@ class AntigravityRunner:
         )
 
     async def _cleanup_process(self, proc: asyncio.subprocess.Process) -> None:
-        """Escalate from SIGTERM to SIGKILL if process hangs during cleanup."""
-        if proc.returncode is not None:
+        """Escalate from SIGTERM to SIGKILL on process tree if process hangs during cleanup."""
+        if getattr(proc, "returncode", None) is not None:
             return
+        kill_process_tree(proc, signal.SIGTERM)
         try:
             res = proc.terminate()
             if asyncio.iscoroutine(res):
                 await res
             await asyncio.wait_for(proc.wait(), timeout=2.0)
         except (asyncio.TimeoutError, ProcessLookupError, OSError):
+            kill_process_tree(proc, signal.SIGKILL)
             try:
                 res = proc.kill()
                 if asyncio.iscoroutine(res):
@@ -647,7 +756,10 @@ class AntigravitySession:
         self._conversation_id = ConversationId(conversation_id) if conversation_id else None
         self._turn_count = 0
         self._is_closed = False
+        self._is_invalid = False
         self._lock = threading.Lock()
+        self._turn_lock = threading.Lock()
+        self._stream_lock: asyncio.Lock | None = None
 
         # Dedicated background event loop and thread for process lifecycle
         self._loop = asyncio.new_event_loop()
@@ -668,7 +780,14 @@ class AntigravitySession:
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
+        self._stream_lock = asyncio.Lock()
         self._loop.run_forever()
+
+    async def _restart_process(self) -> None:
+        """Restart the underlying agy subprocess after crash or timeout."""
+        await self._close_process()
+        self._is_invalid = False
+        await self._start_process()
 
     async def _start_process(self) -> None:
         """Start the long-running agy subprocess in stream-json mode."""
@@ -711,12 +830,19 @@ class AntigravitySession:
         else:
             cmd = [str(self._agy_path), *op_args]
 
+        popen_kwargs: dict[str, Any] = {}
+        if not is_windows_platform():
+            popen_kwargs["start_new_session"] = True
+        else:
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            **popen_kwargs,
         )
         self._proc_started.set()
 
@@ -736,11 +862,25 @@ class AntigravitySession:
         if self._is_closed:
             raise RuntimeError("Session is closed")
         timeout = timeout_seconds if timeout_seconds is not None else self.default_timeout
-        fut = asyncio.run_coroutine_threadsafe(
-            self._send_coro(prompt, timeout),
-            self._loop,
-        )
-        return fut.result(timeout=timeout + 5.0)
+        with self._turn_lock:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._send_coro(prompt, timeout),
+                self._loop,
+            )
+            try:
+                return fut.result(timeout=timeout + 5.0)
+            except (concurrent.futures.TimeoutError, Exception) as exc:
+                fut.cancel()
+                self._is_invalid = True
+                asyncio.run_coroutine_threadsafe(self._close_process(), self._loop)
+                started_at = datetime.now(timezone.utc).isoformat()
+                return ModelResult(
+                    invocation_id=InvocationId(f"{self.conversation_id}-{self._turn_count}"),
+                    status=InvocationStatus.FAILED,
+                    error=f"Session turn timed out or failed: {exc}",
+                    started_at=started_at,
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
 
     def ask(self, prompt: str, timeout_seconds: float | None = None) -> ModelResult:
         """Alias for send() to satisfy wave1-A requirements."""
@@ -755,7 +895,20 @@ class AntigravitySession:
             self._send_coro(prompt, timeout),
             self._loop,
         )
-        return await asyncio.wrap_future(fut)
+        try:
+            return await asyncio.wrap_future(fut)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception) as exc:
+            fut.cancel()
+            self._is_invalid = True
+            asyncio.run_coroutine_threadsafe(self._close_process(), self._loop)
+            started_at = datetime.now(timezone.utc).isoformat()
+            return ModelResult(
+                invocation_id=InvocationId(f"{self.conversation_id}-{self._turn_count}"),
+                status=InvocationStatus.FAILED,
+                error=f"Session turn timed out or failed: {exc}",
+                started_at=started_at,
+                completed_at=datetime.now(timezone.utc).isoformat(),
+            )
 
     async def ask_async(self, prompt: str, timeout_seconds: float | None = None) -> ModelResult:
         """Async alias for ask()."""
@@ -767,135 +920,200 @@ class AntigravitySession:
         self._turn_count += 1
         inv_id = InvocationId(f"{self.conversation_id}-{self._turn_count}")
 
-        if not self._proc or self._proc.returncode is not None:
-            return ModelResult(
-                invocation_id=inv_id,
-                status=InvocationStatus.FAILED,
-                error="Subprocess is not running",
-                started_at=started_at,
-                completed_at=datetime.now(timezone.utc).isoformat(),
-            )
+        if self._stream_lock is None:
+            self._stream_lock = asyncio.Lock()
 
-        # Write NDJSON prompt line to stdin
-        payload = json.dumps({"prompt": prompt}) + "\n"
-        try:
-            assert self._proc.stdin is not None
-            write_res = self._proc.stdin.write(payload.encode("utf-8"))
-            if asyncio.iscoroutine(write_res):
-                await write_res
-            drain_coro = self._proc.stdin.drain()
-            if asyncio.iscoroutine(drain_coro):
-                await drain_coro
-        except Exception as exc:
-            return ModelResult(
-                invocation_id=inv_id,
-                status=InvocationStatus.FAILED,
-                error=f"Failed to write to subprocess stdin: {exc}",
-                started_at=started_at,
-                completed_at=datetime.now(timezone.utc).isoformat(),
-            )
-
-        # Read NDJSON response events from stdout
-        response_lines: list[str] = []
-        structured_data: dict[str, Any] | None = None
-        raw_response_text: str | None = None
-
-        try:
-            assert self._proc.stdout is not None
-            while True:
-                line_bytes = await asyncio.wait_for(
-                    self._proc.stdout.readline(),
-                    timeout=timeout,
+        async with self._stream_lock:
+            if self._is_closed:
+                return ModelResult(
+                    invocation_id=inv_id,
+                    status=InvocationStatus.FAILED,
+                    error="Session is closed",
+                    started_at=started_at,
+                    completed_at=datetime.now(timezone.utc).isoformat(),
                 )
-                if not line_bytes:
-                    break
 
-                if isinstance(line_bytes, bytes):
-                    line_str = line_bytes.decode("utf-8", errors="replace").strip()
-                else:
-                    line_str = str(line_bytes).strip()
-
-                if not line_str:
-                    continue
-
+            if self._is_invalid or not self._proc or getattr(self._proc, "returncode", None) is not None:
                 try:
-                    event = json.loads(line_str)
-                except json.JSONDecodeError:
-                    response_lines.append(line_str)
-                    continue
-
-                # Capture conversation ID from event
-                cid = (
-                    event.get("conversation_id")
-                    or event.get("conversationId")
-                    or event.get("session_id")
-                )
-                if cid and (self._conversation_id is None or self._conversation_id == "unknown"):
-                    self._conversation_id = ConversationId(cid)
-
-                evt_type = event.get("event") or event.get("step_type")
-                if evt_type == "init":
-                    continue
-                elif evt_type in ("result", "turn_complete", "response"):
-                    res = event.get("result") or event.get("response") or event.get("output")
-                    if isinstance(res, dict):
-                        structured_data = res
-                        raw_response_text = json.dumps(res)
-                    elif isinstance(res, str):
-                        raw_response_text = res
-                    elif res is not None:
-                        raw_response_text = str(res)
-                    break
-                elif evt_type == "error":
-                    err_msg = str(event.get("error") or event.get("message") or event)
+                    await self._restart_process()
+                except Exception as exc:
                     return ModelResult(
                         invocation_id=inv_id,
                         status=InvocationStatus.FAILED,
-                        error=err_msg,
-                        conversation_id=self.conversation_id,
+                        error=f"Failed to restart session process: {exc}",
                         started_at=started_at,
                         completed_at=datetime.now(timezone.utc).isoformat(),
                     )
-                elif "response" in event:
-                    raw_response_text = str(event["response"])
-                    break
-                else:
-                    if "delta" in event:
-                        response_lines.append(str(event["delta"]))
-                    elif "text" in event:
-                        response_lines.append(str(event["text"]))
-        except asyncio.TimeoutError:
+
+            # Write NDJSON prompt line to stdin
+            payload = json.dumps({"prompt": prompt}) + "\n"
+            try:
+                assert self._proc.stdin is not None
+                write_res = self._proc.stdin.write(payload.encode("utf-8"))
+                if asyncio.iscoroutine(write_res):
+                    await write_res
+                drain_coro = self._proc.stdin.drain()
+                if asyncio.iscoroutine(drain_coro):
+                    await drain_coro
+            except Exception as exc:
+                self._is_invalid = True
+                await self._close_process()
+                return ModelResult(
+                    invocation_id=inv_id,
+                    status=InvocationStatus.FAILED,
+                    error=f"Failed to write to subprocess stdin: {exc}",
+                    started_at=started_at,
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+
+            # Read NDJSON response events from stdout
+            response_lines: list[str] = []
+            structured_data: dict[str, Any] | None = None
+            raw_response_text: str | None = None
+            has_terminal_event = False
+
+            try:
+                assert self._proc.stdout is not None
+                while True:
+                    line_bytes = await asyncio.wait_for(
+                        self._proc.stdout.readline(),
+                        timeout=timeout,
+                    )
+                    if not line_bytes:
+                        break
+
+                    if isinstance(line_bytes, bytes):
+                        line_str = line_bytes.decode("utf-8", errors="replace").strip()
+                    else:
+                        line_str = str(line_bytes).strip()
+
+                    if not line_str:
+                        continue
+
+                    try:
+                        event = json.loads(line_str)
+                    except json.JSONDecodeError:
+                        response_lines.append(line_str)
+                        continue
+
+                    # Capture conversation ID from event
+                    cid = (
+                        event.get("conversation_id")
+                        or event.get("conversationId")
+                        or event.get("session_id")
+                    )
+                    if cid and (self._conversation_id is None or self._conversation_id == "unknown"):
+                        self._conversation_id = ConversationId(cid)
+
+                    evt_type = event.get("event") or event.get("step_type")
+                    if evt_type == "init":
+                        continue
+                    elif evt_type in ("result", "turn_complete", "response"):
+                        res = event.get("result") or event.get("response") or event.get("output")
+                        if isinstance(res, dict):
+                            structured_data = res
+                            raw_response_text = json.dumps(res)
+                        elif isinstance(res, str):
+                            raw_response_text = res
+                        elif res is not None:
+                            raw_response_text = str(res)
+                        has_terminal_event = True
+                        break
+                    elif evt_type == "error":
+                        err_msg = str(event.get("error") or event.get("message") or event)
+                        has_terminal_event = True
+                        return ModelResult(
+                            invocation_id=inv_id,
+                            status=InvocationStatus.FAILED,
+                            error=err_msg,
+                            conversation_id=self.conversation_id,
+                            started_at=started_at,
+                            completed_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                    elif "response" in event:
+                        raw_response_text = str(event["response"])
+                        has_terminal_event = True
+                        break
+                    else:
+                        if "delta" in event:
+                            response_lines.append(str(event["delta"]))
+                        elif "text" in event:
+                            response_lines.append(str(event["text"]))
+            except asyncio.TimeoutError:
+                self._is_invalid = True
+                await self._close_process()
+                return ModelResult(
+                    invocation_id=inv_id,
+                    status=InvocationStatus.FAILED,
+                    error=f"Session turn timed out after {timeout}s",
+                    conversation_id=self.conversation_id,
+                    started_at=started_at,
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+            except Exception as exc:
+                self._is_invalid = True
+                await self._close_process()
+                return ModelResult(
+                    invocation_id=inv_id,
+                    status=InvocationStatus.FAILED,
+                    error=f"Error reading session stream: {exc}",
+                    conversation_id=self.conversation_id,
+                    started_at=started_at,
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+
+            # Process status and EOF verification
+            proc_returncode = getattr(self._proc, "returncode", None)
+            if proc_returncode is not None and not has_terminal_event:
+                self._is_invalid = True
+                await self._close_process()
+                return ModelResult(
+                    invocation_id=inv_id,
+                    status=InvocationStatus.FAILED,
+                    error=f"Subprocess terminated prematurely (exit code {proc_returncode})",
+                    exit_code=proc_returncode,
+                    conversation_id=self.conversation_id,
+                    started_at=started_at,
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+
+            if not has_terminal_event and not response_lines and raw_response_text is None:
+                self._is_invalid = True
+                await self._close_process()
+                return ModelResult(
+                    invocation_id=inv_id,
+                    status=InvocationStatus.FAILED,
+                    error="Subprocess stream closed with EOF before delivering response",
+                    conversation_id=self.conversation_id,
+                    started_at=started_at,
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+
+            if raw_response_text is None:
+                raw_response_text = "\n".join(response_lines).strip()
+
+            if not raw_response_text:
+                self._is_invalid = True
+                await self._close_process()
+                return ModelResult(
+                    invocation_id=inv_id,
+                    status=InvocationStatus.FAILED,
+                    error="Empty response text returned from session",
+                    conversation_id=self.conversation_id,
+                    started_at=started_at,
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+
             return ModelResult(
                 invocation_id=inv_id,
-                status=InvocationStatus.FAILED,
-                error=f"Session turn timed out after {timeout}s",
+                status=InvocationStatus.SUCCEEDED,
+                response=raw_response_text,
+                structured_data=structured_data,
                 conversation_id=self.conversation_id,
+                exit_code=0,
                 started_at=started_at,
                 completed_at=datetime.now(timezone.utc).isoformat(),
             )
-        except Exception as exc:
-            return ModelResult(
-                invocation_id=inv_id,
-                status=InvocationStatus.FAILED,
-                error=f"Error reading session stream: {exc}",
-                conversation_id=self.conversation_id,
-                started_at=started_at,
-                completed_at=datetime.now(timezone.utc).isoformat(),
-            )
-
-        if raw_response_text is None:
-            raw_response_text = "\n".join(response_lines).strip()
-
-        return ModelResult(
-            invocation_id=inv_id,
-            status=InvocationStatus.SUCCEEDED,
-            response=raw_response_text,
-            structured_data=structured_data,
-            conversation_id=self.conversation_id,
-            exit_code=0,
-            started_at=started_at,
-            completed_at=datetime.now(timezone.utc).isoformat(),
-        )
 
     # =========================================================================
     # Lifecycle & Cleanup
@@ -908,30 +1126,35 @@ class AntigravitySession:
                 return
             self._is_closed = True
 
-        fut = asyncio.run_coroutine_threadsafe(self._close_process(), self._loop)
-        try:
-            fut.result(timeout=5.0)
-        except Exception:
-            pass
-        finally:
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            if self._thread.is_alive():
-                self._thread.join(timeout=2.0)
-            if not self._loop.is_closed():
-                self._loop.close()
+        if threading.current_thread() is self._thread:
+            asyncio.create_task(self._close_process())
+        else:
+            fut = asyncio.run_coroutine_threadsafe(self._close_process(), self._loop)
+            try:
+                fut.result(timeout=5.0)
+            except Exception:
+                pass
+            finally:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+                if self._thread.is_alive():
+                    self._thread.join(timeout=2.0)
+                if not self._loop.is_closed():
+                    self._loop.close()
 
     async def _close_process(self) -> None:
         """Terminate the subprocess on self._loop."""
-        if not self._proc:
+        proc = self._proc
+        self._proc = None
+        if not proc:
             return
 
-        if self._proc.returncode is None:
+        if getattr(proc, "returncode", None) is None:
             try:
-                if self._proc.stdin:
-                    close_res = self._proc.stdin.close()
+                if proc.stdin:
+                    close_res = proc.stdin.close()
                     if asyncio.iscoroutine(close_res):
                         await close_res
-                    wait_closed = getattr(self._proc.stdin, "wait_closed", None)
+                    wait_closed = getattr(proc.stdin, "wait_closed", None)
                     if callable(wait_closed):
                         res = wait_closed()
                         if asyncio.iscoroutine(res):
@@ -940,19 +1163,21 @@ class AntigravitySession:
                 pass
 
             try:
-                await asyncio.wait_for(self._proc.wait(), timeout=2.0)
+                await asyncio.wait_for(proc.wait(), timeout=1.0)
             except (asyncio.TimeoutError, Exception):
+                kill_process_tree(proc, signal.SIGTERM)
                 try:
-                    term_res = self._proc.terminate()
+                    term_res = proc.terminate()
                     if asyncio.iscoroutine(term_res):
                         await term_res
-                    await asyncio.wait_for(self._proc.wait(), timeout=1.0)
+                    await asyncio.wait_for(proc.wait(), timeout=1.5)
                 except (asyncio.TimeoutError, Exception):
+                    kill_process_tree(proc, signal.SIGKILL)
                     try:
-                        kill_res = self._proc.kill()
+                        kill_res = proc.kill()
                         if asyncio.iscoroutine(kill_res):
                             await kill_res
-                        await self._proc.wait()
+                        await asyncio.wait_for(proc.wait(), timeout=1.0)
                     except Exception:
                         pass
 

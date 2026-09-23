@@ -196,14 +196,44 @@ class TestRunnerArgvAndEnvironment(unittest.TestCase):
             worker_id=InvocationId("w-1"),
             role=WorkerRole.EXECUTOR,
             strategy=ExecutionStrategy.STANDARD,
+            workspace_mode=WorkspaceMode.MUTATING,
             prompt="Implement code",
         )
         argv = self.runner.build_argv(inv, profile=prof)
         self.assertIn("--model", argv)
         self.assertEqual(argv[argv.index("--model") + 1], "gemini-2.5-pro")
         self.assertIn("--dangerously-skip-permissions", argv)
+        self.assertIn("--mode", argv)
+        self.assertEqual(argv[argv.index("--mode") + 1], "accept-edits")
+        self.assertNotIn("--sandbox", argv)
         self.assertIn("--effort", argv)
         self.assertIn("--print", argv)
+
+    def test_runner_enforces_read_only_mode(self) -> None:
+        """Regression test for W4-01: READ_ONLY workspace mode is enforced at runner boundary."""
+        prof = self.profile_store.create(
+            "ro-prof",
+            settings=ProfileSettings(
+                model="gemini-2.5-pro",
+                dangerously_skip_permissions=True,
+            ),
+        )
+        ro_inv = ModelInvocation(
+            invocation_id=InvocationId("i-ro"),
+            run_id=RunId("r-1"),
+            worker_id=InvocationId("w-ro"),
+            role=WorkerRole.GENERAL,
+            strategy=ExecutionStrategy.STANDARD,
+            workspace_mode=WorkspaceMode.READ_ONLY,
+            prompt="Read and inspect repo",
+        )
+        argv = self.runner.build_argv(ro_inv, profile=prof)
+        self.assertIn("--mode", argv)
+        self.assertEqual(argv[argv.index("--mode") + 1], "plan")
+        self.assertIn("--sandbox", argv)
+        self.assertNotIn("--dangerously-skip-permissions", argv)
+        self.assertNotIn("-y", argv)
+        self.assertNotIn("--yes", argv)
 
     def test_argv_unsupported_boost_raises(self) -> None:
         inv = ModelInvocation(
@@ -464,6 +494,35 @@ class TestOneShotInvocationExecution(unittest.IsolatedAsyncioTestCase):
         self.assertIn("internal engine crash", result.error or "")
 
     @patch("asyncio.create_subprocess_exec")
+    async def test_nonzero_exit_preserves_stdout_and_error_separately(self, mock_exec: AsyncMock) -> None:
+        """W4-15: Useful stdout and error are preserved separately on non-zero exit."""
+        mock_proc = self._create_mock_process(
+            stdout="Useful partial analysis before exit",
+            stderr="fatal: process crashed with error",
+            returncode=1,
+        )
+        mock_exec.return_value = mock_proc
+
+        inv = ModelInvocation(
+            invocation_id=InvocationId("inv-nonzero-stdout"),
+            run_id=RunId("run-w415"),
+            worker_id=InvocationId("w-partial"),
+            role=WorkerRole.GENERAL,
+            prompt="Analyze codebase",
+        )
+        result = await self.runner.run_async(inv)
+
+        self.assertEqual(result.status, InvocationStatus.FAILED)
+        self.assertEqual(result.exit_code, 1)
+        # Stdout must be preserved in response
+        self.assertEqual(result.response, "Useful partial analysis before exit")
+        # Error must be preserved in error
+        self.assertIn("non-zero exit code 1", result.error or "")
+        self.assertIn("fatal: process crashed with error", result.error or "")
+        # Response and error are distinct
+        self.assertNotEqual(result.response, result.error)
+
+    @patch("asyncio.create_subprocess_exec")
     async def test_auth_failure_detection(self, mock_exec: AsyncMock) -> None:
         mock_proc = self._create_mock_process(
             stdout="",
@@ -539,10 +598,9 @@ class TestOneShotInvocationExecution(unittest.IsolatedAsyncioTestCase):
             role=WorkerRole.GENERAL,
             prompt="Cancel me",
         )
-        result = await self.runner.run_async(inv)
+        with self.assertRaises(asyncio.CancelledError):
+            await self.runner.run_async(inv)
 
-        self.assertEqual(result.status, InvocationStatus.CANCELLED)
-        self.assertIn("cancelled", (result.error or "").lower())
         mock_proc.terminate.assert_called()
 
     @patch("asyncio.create_subprocess_exec")
@@ -738,6 +796,67 @@ class TestPersistentModelSession(unittest.TestCase):
         with AntigravitySession(agy_path="/mock/agy", profile_store=self.profile_store) as sess:
             self.assertFalse(sess._is_closed)
         self.assertTrue(sess._is_closed)
+
+    @patch("asyncio.create_subprocess_exec")
+    def test_session_timeout_or_crash_cannot_contaminate_next_turn(self, mock_exec: AsyncMock) -> None:
+        """W4-09: Timeout or process crash invalidates session so next turn cannot consume delayed/contaminated output."""
+        # Process 1: Turn 1 times out (hangs reading stdout)
+        proc1 = AsyncMock()
+        proc1.returncode = None
+        async def slow_readline() -> bytes:
+            await asyncio.sleep(5.0)
+            return b'{"event": "result", "response": "Delayed Turn 1 output"}\n'
+        proc1.stdout.readline.side_effect = slow_readline
+
+        # Process 2: Spawned on restart for Turn 2
+        proc2 = AsyncMock()
+        proc2.returncode = None
+        proc2.stdout.readline.side_effect = [
+            b'{"event": "result", "response": "Turn 2 fresh output"}\n',
+        ]
+
+        mock_exec.side_effect = [proc1, proc2]
+
+        session = AntigravitySession(
+            agy_path="/mock/agy",
+            profile_store=self.profile_store,
+            timeout_seconds=0.1,
+        )
+
+        # Turn 1 should time out and fail
+        res1 = session.send("Turn 1 prompt", timeout_seconds=0.1)
+        self.assertEqual(res1.status, InvocationStatus.FAILED)
+        self.assertIn("timed out", (res1.error or "").lower())
+        self.assertTrue(session._is_invalid)
+
+        # Turn 2 must NOT receive Turn 1's delayed output; it restarts and gets Turn 2 output
+        res2 = session.send("Turn 2 prompt", timeout_seconds=2.0)
+        self.assertEqual(res2.status, InvocationStatus.SUCCEEDED)
+        self.assertEqual(res2.response, "Turn 2 fresh output")
+        self.assertNotEqual(res2.response, "Delayed Turn 1 output")
+
+        # Part 2: Crash / EOF handling
+        proc3 = AsyncMock()
+        proc3.returncode = 1
+        proc3.stdout.readline.side_effect = [b""]  # Immediate EOF from crashed process
+        proc4 = AsyncMock()
+        proc4.returncode = None
+        proc4.stdout.readline.side_effect = [
+            b'{"event": "result", "response": "Recovered after crash"}\n',
+        ]
+        mock_exec.side_effect = [proc3, proc4]
+
+        # Simulate crash on turn 3
+        session._is_invalid = True
+        res3 = session.send("Turn 3 prompt")
+        self.assertEqual(res3.status, InvocationStatus.FAILED)
+
+        # Next turn recovers
+        res4 = session.send("Turn 4 prompt")
+        self.assertEqual(res4.status, InvocationStatus.SUCCEEDED)
+        self.assertEqual(res4.response, "Recovered after crash")
+
+        session.close()
 
 
 class TestFakeModelRunnerAndSession(unittest.TestCase):

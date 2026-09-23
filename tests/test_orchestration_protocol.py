@@ -255,6 +255,28 @@ class TestObservationPrompt(unittest.TestCase):
         self.assertIn("## Round 1 Observation", formatted)
         self.assertIn("(None)", formatted)
 
+    def test_coordinator_observation_redacts_profile_identity_from_errors(self) -> None:
+        """Regression test for W4-03: coordinator observations redact profile paths and identities from errors."""
+        obs = CoordinatorObservation(
+            round_number=1,
+            failed_results=[
+                WorkerResult(
+                    worker_id=WorkerId("w-leak"),
+                    role=WorkerRole.GENERAL,
+                    status=InvocationStatus.FAILED,
+                    failure=FailureClass.RETRYABLE,
+                    response=(
+                        "Process failed in /home/user/.local/share/agym/profiles/account-secret/settings.json: "
+                        "profile 'account-secret' could not obtain token from profiles/account-secret/token.json"
+                    ),
+                )
+            ],
+        )
+        formatted = format_coordinator_observation(obs)
+        # Physical profile identity must never appear
+        self.assertNotIn("account-secret", formatted)
+        self.assertIn("[REDACTED]", formatted)
+
 
 class TestSynthesisPrompt(unittest.TestCase):
     """Tests for synthesis worker prompt generation."""

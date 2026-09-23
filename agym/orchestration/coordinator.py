@@ -440,6 +440,27 @@ class CoordinatorClient:
             conversation_id=cid or ConversationId("unknown"),
         )
 
+    def start_run(
+        self,
+        task: str,
+        fleet_view: FleetView | None = None,
+        run_id: RunId | str | None = None,
+        run_mode: RunMode | str | None = None,
+        budget: OrchestrationBudget | dict[str, Any] | None = None,
+        workspace_info: str = "",
+        repository_scope: str = "",
+    ) -> CoordinatorStartResult:
+        """Start coordinator run, returning assessment and initial action."""
+        return self.start(
+            task=task,
+            fleet_view=fleet_view,
+            run_id=run_id,
+            run_mode=run_mode,
+            budget=budget,
+            workspace_info=workspace_info,
+            repository_scope=repository_scope,
+        )
+
     # ------------------------------------------------------------------------
     # Protocol Interface: assess_task
     # ------------------------------------------------------------------------
@@ -471,12 +492,24 @@ class CoordinatorClient:
         if self._is_closed:
             raise CoordinatorClosedError("CoordinatorClient is closed")
 
-        # Resume if explicit conversation_id is passed and differs, or if session missing
-        if conversation_id is not None and (self._conversation_id is None or self._conversation_id != conversation_id):
-            self.resume(conversation_id=conversation_id)
+        # If Round 0 initial action was already produced by start()/assess_task()
+        # and observation is the clean initial Round 0 observation, return it without a redundant model turn
+        if (
+            self._initial_action is not None
+            and observation.round_number == 0
+            and not observation.completed_results
+            and not observation.failed_results
+            and not observation.rejected_requests
+        ):
+            act = self._initial_action
+            self._initial_action = None
+            return act
 
+        # Resume if session missing, or if explicit conversation_id is passed and differs
         if self._session is None:
-            raise CoordinatorError("Coordinator session has not been started. Call start() or resume() first.")
+            self.resume(conversation_id=conversation_id)
+        elif conversation_id is not None and (self._conversation_id is None or self._conversation_id != conversation_id):
+            self.resume(conversation_id=conversation_id)
 
         self._round_number = observation.round_number
 
@@ -492,7 +525,8 @@ class CoordinatorClient:
         obs_prompt = format_coordinator_observation(observation)
 
         # If resumed, prepend AGYM-authoritative latest state
-        if self._is_resumed:
+        is_first_turn_of_resume = self._is_resumed
+        if is_first_turn_of_resume:
             auth_header = self._format_authoritative_state_prompt(observation)
             full_prompt = f"{auth_header}\n\n{obs_prompt}"
             self._is_resumed = False
@@ -502,11 +536,30 @@ class CoordinatorClient:
         def _parse_action(raw: str | dict[str, Any]) -> CoordinatorAction:
             return parse_coordinator_action(raw, known_worker_ids=self._known_worker_ids)
 
-        action = self._send_and_parse(
-            prompt=full_prompt,
-            parser=_parse_action,
-            schema_name="CoordinatorAction",
-        )
+        try:
+            action = self._send_and_parse(
+                prompt=full_prompt,
+                parser=_parse_action,
+                schema_name="CoordinatorAction",
+            )
+        except CoordinatorCrashError as exc:
+            if is_first_turn_of_resume and self._conversation_id is not None:
+                logger.warning(
+                    "Resumed coordinator session with conversation ID %s failed (%s); "
+                    "recovering with a fresh coordinator session seeded from authoritative state.",
+                    self._conversation_id,
+                    exc,
+                )
+                self.resume(conversation_id=None)
+                auth_header = self._format_authoritative_state_prompt(observation)
+                fresh_full_prompt = f"{auth_header}\n\n{obs_prompt}"
+                action = self._send_and_parse(
+                    prompt=fresh_full_prompt,
+                    parser=_parse_action,
+                    schema_name="CoordinatorAction",
+                )
+            else:
+                raise
 
         # Record new worker IDs
         for w in action.workers:
@@ -565,9 +618,6 @@ class CoordinatorClient:
         if cid is None:
             cid = self._conversation_id
 
-        if cid is None:
-            raise CoordinatorError("Cannot resume: no conversation ID known or recorded in RunStore")
-
         # Terminate any dead or existing session
         if self._session is not None:
             try:
@@ -576,9 +626,12 @@ class CoordinatorClient:
                 pass
             self._session = None
 
-        # Create replacement coordinator session
+        # Create replacement coordinator session (fresh session if cid is None)
         self._session = self._create_session(conversation_id=cid)
-        self._conversation_id = ConversationId(cid)
+        if cid is not None:
+            self._conversation_id = ConversationId(cid)
+        else:
+            self._conversation_id = None
         self._is_resumed = True
 
         # Sync round number and assessment from authoritative store if available

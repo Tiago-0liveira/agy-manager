@@ -864,10 +864,12 @@ class TestBudgetContracts(unittest.TestCase):
         self.assertEqual(budget.max_retries, 3)
         self.assertEqual(budget.max_runtime_seconds, 1800.0)
         self.assertEqual(budget.min_quota_remaining, 10.0)
+        self.assertEqual(budget.max_consecutive_rejections, 3)
 
         d = budget.to_dict()
         restored = OrchestrationBudget.from_dict(d)
         self.assertEqual(restored.max_parallel, 4)
+        self.assertEqual(restored.max_consecutive_rejections, 3)
 
     def test_budget_usage_roundtrip(self) -> None:
         usage = BudgetUsage(
