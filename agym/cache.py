@@ -13,6 +13,7 @@ from .profiles import _chmod_private_dir, _default_data_root
 TTL_USAGE_SECONDS = 60.0      # 1 minute for live quota
 USAGE_CACHE_TTL_SECONDS = 300.0  # 5 minutes for interactive picker cache freshness
 TTL_TOKENS_SECONDS = 600.0    # 10 minutes for token usage tracking
+USAGE_CACHE_VERSION = 2  # v1 may contain quota values from the inaccurate direct API path
 
 
 def should_refresh_cache(
@@ -172,6 +173,8 @@ class CacheManager:
             return None
 
         payload, age, cached_at = entry
+        if payload.get("version") != USAGE_CACHE_VERSION:
+            return None
         parsed_data = payload.get("parsed_data")
         raw_output = payload.get("raw_output", "")
         if not isinstance(parsed_data, dict):
@@ -193,7 +196,7 @@ class CacheManager:
             now = now.replace(tzinfo=timezone.utc)
 
         payload = {
-            "version": 1,
+            "version": USAGE_CACHE_VERSION,
             "profile": profile_name,
             "cached_at": now.isoformat(),
             "cached_timestamp": now.timestamp(),
@@ -216,6 +219,8 @@ class CacheManager:
             with filepath.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)
             if not isinstance(payload, dict):
+                return None, None
+            if payload.get("version") != USAGE_CACHE_VERSION:
                 return None, None
             cached_timestamp = payload.get("cached_timestamp")
             if not isinstance(cached_timestamp, (int, float)):
@@ -488,4 +493,3 @@ def fetch_and_cache_usage(
         runner=runner,
         on_progress=on_progress,
     )
-

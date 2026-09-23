@@ -27,9 +27,10 @@ from .wincred import (
 
 logger = logging.getLogger("agym.quota_api")
 
-# Google Cloud Code Quota Endpoints (production first, daily internal staging fallback)
+# The production host can return reset/default quota values that disagree with
+# agy's /usage command. The daily host returned the matching live quota; if it
+# fails, fetch_account_usage_async falls back to the CLI instead.
 CLOUDCODE_HOSTS: tuple[str, ...] = (
-    "cloudcode-pa.googleapis.com",
     "daily-cloudcode-pa.googleapis.com",
 )
 
@@ -37,6 +38,18 @@ OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 USER_AGENT = "antigravity/1.2.8"
 
 _CACHED_OAUTH_CLIENT: tuple[str, str] | None = None
+
+
+class QuotaUnauthorizedError(RuntimeError):
+    """The quota endpoint rejected the access token."""
+
+
+class OAuthRefreshError(RuntimeError):
+    """OAuth refresh failed without exposing the provider response body."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(f"OAuth token refresh failed: {code}")
 
 
 def _get_fallback_credentials() -> tuple[str, str]:
@@ -282,7 +295,7 @@ async def refresh_oauth_token_async(
     }
     loop = asyncio.get_running_loop()
 
-    last_error: Exception | None = None
+    last_error: OAuthRefreshError | None = None
     for client_id, client_secret in candidates:
         params = {
             "client_id": client_id,
@@ -301,24 +314,34 @@ async def refresh_oauth_token_async(
                 timeout,
             )
             if status == 200:
-                resp_json = json.loads(body)
-                new_access_token = resp_json.get("access_token")
-                if not new_access_token:
-                    raise RuntimeError("OAuth refresh response missing access_token")
-                expires_in = int(resp_json.get("expires_in", 3600))
+                try:
+                    resp_json = json.loads(body)
+                    new_access_token = resp_json.get("access_token")
+                    expires_in = int(resp_json.get("expires_in", 3600))
+                except (ValueError, TypeError, AttributeError) as exc:
+                    raise OAuthRefreshError("invalid_response") from exc
+                if not isinstance(new_access_token, str) or not new_access_token:
+                    raise OAuthRefreshError("invalid_response")
                 new_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
                 return new_access_token, new_expiry
-            elif status in (400, 401) and "invalid_client" in body:
-                last_error = RuntimeError(f"Google OAuth token refresh failed (HTTP {status}): {body}")
+            if status in (400, 401):
+                try:
+                    error_code = json.loads(body).get("error")
+                except (ValueError, AttributeError):
+                    error_code = None
+                code = error_code if isinstance(error_code, str) and error_code in {"invalid_client", "invalid_grant"} else "rejected"
+                last_error = OAuthRefreshError(code)
+                # A refresh token may belong to a different candidate client.
                 continue
-            else:
-                raise RuntimeError(f"Google OAuth token refresh failed (HTTP {status}): {body}")
+            raise OAuthRefreshError(f"HTTP {status}")
+        except OAuthRefreshError:
+            raise
         except Exception as exc:
-            last_error = exc
+            raise OAuthRefreshError("network_error") from exc
 
     if last_error:
         raise last_error
-    raise RuntimeError("Failed to refresh OAuth token: all candidate credentials failed")
+    raise OAuthRefreshError("no_oauth_client")
 
 
 async def get_valid_access_token_async(
@@ -351,7 +374,7 @@ async def query_quota_api_async(
     access_token: str,
     timeout: float = 10.0,
 ) -> dict[str, Any]:
-    """Queries the Google Cloud Code retrieveUserQuotaSummary endpoint with fallback hosts and retry."""
+    """Queries the daily Cloud Code quota endpoint, retrying once on rate limits."""
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
@@ -360,7 +383,7 @@ async def query_quota_api_async(
     body_data = b"{}"
     loop = asyncio.get_running_loop()
 
-    # Per-host timeout: allow fast failover so a stalled host doesn't hang the UI
+    # The caller also enforces a total 2.5-second budget before CLI fallback.
     http_timeout = min(timeout, 5.0)
 
     last_error: Exception | None = None
@@ -378,28 +401,29 @@ async def query_quota_api_async(
                 )
                 if status == 200:
                     payload = json.loads(body)
-                    if isinstance(payload, dict) and "groups" in payload:
+                    if isinstance(payload, dict) and isinstance(payload.get("groups"), list):
                         return payload
+                    last_error = RuntimeError("Quota API returned invalid data")
+                    break
                 elif status == 401:
-                    # Token expired/invalid: fail immediately so caller refreshes rather than querying other hosts
-                    raise RuntimeError(f"API returned HTTP 401 from {host}: {body}")
+                    raise QuotaUnauthorizedError("Quota API rejected the access token (HTTP 401)")
                 elif status == 429 and attempt == 0:
                     # Rate limited: short pause and retry once
                     logger.debug("Quota API 429 received from %s; backing off 1.0s", host)
                     await asyncio.sleep(1.0)
                     continue
                 else:
-                    last_error = RuntimeError(f"API returned HTTP {status} from {host}: {body}")
+                    last_error = RuntimeError(f"Quota API returned HTTP {status} from {host}")
                     break
+            except QuotaUnauthorizedError:
+                raise
             except Exception as exc:
-                if "401" in str(exc) or "unauthorized" in str(exc).lower():
-                    raise
                 last_error = exc
                 break
 
     if last_error:
         raise last_error
-    raise RuntimeError("Failed to query Cloud Code Quota API from all candidate endpoints")
+    raise RuntimeError("Failed to query the daily Cloud Code Quota API")
 
 
 def normalize_api_quota_response(
@@ -528,8 +552,10 @@ async def fetch_quota_direct_async(
         refresh_token = token_data.get("refresh_token")
         expiry = token_data.get("expiry")
 
+        refresh_attempted = False
         # 1. Proactively refresh if token has expired or is expiring soon
         if is_token_expired(expiry) and refresh_token:
+            refresh_attempted = True
             try:
                 new_token, new_expiry = await refresh_oauth_token_async(refresh_token, timeout=timeout)
                 update_profile_tokens(profile.home, new_token, new_expiry)
@@ -541,8 +567,7 @@ async def fetch_quota_direct_async(
         try:
             raw_api_data = await query_quota_api_async(access_token, timeout=timeout)
         except Exception as exc:
-            err_str = str(exc)
-            if ("401" in err_str or "unauthorized" in err_str.lower()) and refresh_token:
+            if isinstance(exc, QuotaUnauthorizedError) and refresh_token and not refresh_attempted:
                 logger.debug("Quota API returned 401 for '%s', attempting refresh and retry", profile.name)
                 try:
                     new_token, new_expiry = await refresh_oauth_token_async(refresh_token, timeout=timeout)
