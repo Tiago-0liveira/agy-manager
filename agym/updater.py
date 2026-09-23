@@ -38,15 +38,14 @@ REQUEST_TIMEOUT_SECONDS = 2.5  # Fast timeout to never block CLI commands
 def parse_semver(ver: str) -> tuple[int, int, int]:
     """Parses semver string into (major, minor, patch) tuple."""
     clean = ver.strip().lstrip("v")
-    m = re.match(r"^(\d+)\.(\d+)\.(\d+)", clean)
-    if not m:
-        # Fallback to split or zeros if not standard 3-part semver
-        parts = re.split(r"[^\d]+", clean)
-        nums = [int(p) for p in parts if p.isdigit()]
-        while len(nums) < 3:
-            nums.append(0)
-        return (nums[0], nums[1], nums[2])
-    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", clean)
+    if m:
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    parts = re.split(r"[^\d]+", clean)
+    nums = [int(p) for p in parts if p.isdigit()]
+    while len(nums) < 3:
+        nums.append(0)
+    return (nums[0], nums[1], nums[2])
 
 
 def is_newer_version(candidate: str, current: str) -> bool:
@@ -132,7 +131,7 @@ def fetch_latest_release(
             sys_name = platform.system().lower()
             machine = platform.machine().lower()
 
-            if sys_name == "windows" and machine in {"amd64", "x86_64"}:
+            if sys_name == "windows" and machine in {"amd64", "x86_64", "x64"}:
                 standalone_url = asset_map.get("agym-windows-amd64.exe", "")
             elif sys_name == "darwin":
                 if "arm" in machine or "aarch" in machine:
@@ -197,8 +196,8 @@ def check_for_updates(
             state["wheel_url"] = fetched["wheel_url"]
             save_update_state(state)
         else:
-            # Keep previous cached release info if network fails
-            if state.get("latest_version"):
+            # Fall back to previous cached release info ONLY if not forced network query
+            if not force_network and state.get("latest_version"):
                 release_info = {
                     "version": state["latest_version"],
                     "tag": state.get("latest_tag", f"v{state['latest_version']}"),
@@ -253,50 +252,213 @@ def record_dismissal(version: str, now_ts: float | None = None) -> None:
     save_update_state(state)
 
 
-def execute_binary_update(download_url: str) -> None:
-    """Downloads new binary and replaces current binary atomically."""
-    current_exe = Path(sys.executable).resolve()
-    temp_dir = current_exe.parent
-    temp_download = temp_dir / f".agym_update_{int(time.time())}.tmp"
+def verify_binary(new_exe: Path, target_version: str | None = None) -> None:
+    """Verifies that the downloaded binary is executable and outputs expected version.
 
-    print(f"Downloading update from {download_url}...")
-    headers = {"User-Agent": f"agym/{__version__}"}
-    req = urllib.request.Request(download_url, headers=headers)
-    with urllib.request.urlopen(req, timeout=60) as resp, open(temp_download, "wb") as f:
-        shutil.copyfileobj(resp, f)
+    Steps:
+    1. Check file exists and size > 0.
+    2. Ensure executable permissions on POSIX.
+    3. Run new binary with --version.
+    4. Confirm output version matches target release.
+    """
+    if not new_exe.exists() or new_exe.stat().st_size == 0:
+        raise RuntimeError(f"Downloaded binary {new_exe} is missing or empty.")
 
     if os.name != "nt":
-        temp_download.chmod(0o755)
+        new_exe.chmod(0o755)
 
-    if os.name == "nt":
-        # Windows file locking trick: rename running exe to .old, place new exe
-        old_exe = current_exe.with_suffix(".exe.old")
-        if old_exe.exists():
+    try:
+        proc = subprocess.run(
+            [str(new_exe), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Failed to execute downloaded binary: {exc}") from exc
+
+    if proc.returncode != 0:
+        err = proc.stderr.strip() or proc.stdout.strip()
+        raise RuntimeError(f"Binary verification failed with exit code {proc.returncode}: {err}")
+
+    if target_version:
+        output_ver = proc.stdout.strip()
+        target_clean = target_version.lstrip("v").strip()
+        if parse_semver(output_ver) != parse_semver(target_clean):
+            raise RuntimeError(
+                f"Binary version mismatch: expected {target_clean}, got '{output_ver}'"
+            )
+
+
+def safe_replace_posix(current_exe: Path, new_exe: Path) -> None:
+    """Safely replaces executable on Linux/macOS with rollback support.
+
+    Flow:
+      agym.new
+      agym -> agym.old
+      agym.new -> agym
+      Restore .old if replacement fails.
+      Delete .old after success.
+    """
+    old_exe = current_exe.with_name(f"{current_exe.name}.old")
+
+    if old_exe.exists():
+        try:
+            old_exe.unlink()
+        except OSError:
+            pass
+
+    # Step 1: agym -> agym.old
+    try:
+        current_exe.rename(old_exe)
+    except Exception as exc:
+        if new_exe.exists():
             try:
-                old_exe.unlink()
+                new_exe.unlink()
             except OSError:
                 pass
+        raise RuntimeError(f"Failed to backup current executable to {old_exe}: {exc}") from exc
+
+    # Step 2: agym.new -> agym
+    try:
+        new_exe.rename(current_exe)
+    except Exception as replace_exc:
+        # Step 3: Rollback - restore .old if replacement fails!
+        rollback_error = None
         try:
-            current_exe.rename(old_exe)
-        except OSError:
-            # Fallback copy
-            pass
-        temp_download.rename(current_exe)
-    else:
-        temp_download.replace(current_exe)
+            old_exe.rename(current_exe)
+        except Exception as rb_exc:
+            rollback_error = rb_exc
+
+        if rollback_error:
+            raise RuntimeError(
+                f"Binary replacement failed ({replace_exc}) and rollback to restore {old_exe} also failed ({rollback_error})!"
+            ) from replace_exc
+        raise RuntimeError(
+            f"Binary replacement failed ({replace_exc}). Restored original executable from {old_exe}."
+        ) from replace_exc
+
+    # Step 4: Success - clean up old executable
+    try:
+        old_exe.unlink()
+    except OSError:
+        pass
 
     print(f"Update applied successfully! Current executable updated: {current_exe}")
 
 
-def execute_python_update(wheel_url: str | None = None) -> None:
-    """Updates python package via pip."""
-    cmd = [sys.executable, "-m", "pip", "install", "--upgrade"]
-    if wheel_url:
-        print(f"Installing update from {wheel_url}...")
-        cmd.append(wheel_url)
+def spawn_windows_deferred_replacement(
+    current_exe: Path,
+    new_exe: Path,
+    old_exe: Path | None = None,
+    pid: int | None = None,
+) -> None:
+    """Spawns helper process on Windows to replace locked executable after AGYM exits.
+
+    Flow:
+      1. Download agym.exe.new (already done).
+      2. Spawn a small helper process/script.
+      3. Exit AGYM.
+      4. Helper replaces the executable.
+      5. Delete the old version after success.
+    """
+    if old_exe is None:
+        old_exe = current_exe.with_name(f"{current_exe.name}.old")
+    if pid is None:
+        pid = os.getpid()
+
+    bat_file = Path(tempfile.gettempdir()) / f"agym_update_{pid}.bat"
+    bat_content = f"""@echo off
+set PID={pid}
+set TARGET="{current_exe}"
+set OLD="{old_exe}"
+set NEW="{new_exe}"
+
+:wait_pid
+timeout /t 1 /nobreak >nul 2>&1
+tasklist /FI "PID eq %PID%" 2>nul | findstr /i "%PID%" >nul
+if not errorlevel 1 goto wait_pid
+
+set RETRY=0
+:replace_loop
+if exist %OLD% del /f /q %OLD% >nul 2>&1
+move /y %TARGET% %OLD% >nul 2>&1
+if errorlevel 1 (
+    set /a RETRY+=1
+    if %RETRY% lss 20 (
+        timeout /t 1 /nobreak >nul 2>&1
+        goto replace_loop
+    )
+)
+move /y %NEW% %TARGET% >nul 2>&1
+if exist %OLD% del /f /q %OLD% >nul 2>&1
+del /f /q "%~f0" >nul 2>&1
+"""
+    bat_file.write_text(bat_content, encoding="utf-8")
+
+    creation_flags = 0
+    if os.name == "nt":
+        creation_flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+
+    cmd = ["cmd.exe", "/c", str(bat_file)]
+    subprocess.Popen(
+        cmd,
+        creationflags=creation_flags,
+        close_fds=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    print("Update verified! Replacement helper spawned. Exiting to complete update...")
+    sys.exit(0)
+
+
+def execute_binary_update(download_url: str, target_version: str | None = None) -> None:
+    """Downloads new binary, verifies it with --version, and safely replaces current binary."""
+    current_exe = Path(sys.executable).resolve()
+    new_exe = current_exe.with_name(f"{current_exe.name}.new")
+
+    print(f"Downloading update from {download_url}...")
+    headers = {"User-Agent": f"agym/{__version__}"}
+    req = urllib.request.Request(download_url, headers=headers)
+    with urllib.request.urlopen(req, timeout=60) as resp, open(new_exe, "wb") as f:
+        shutil.copyfileobj(resp, f)
+
+    try:
+        print("Verifying new binary...")
+        verify_binary(new_exe, target_version)
+    except Exception as exc:
+        if new_exe.exists():
+            try:
+                new_exe.unlink()
+            except OSError:
+                pass
+        raise RuntimeError(f"Binary verification failed: {exc}") from exc
+
+    if os.name == "nt":
+        spawn_windows_deferred_replacement(current_exe, new_exe)
     else:
-        print(f"Installing update from git repository...")
-        cmd.append(f"git+https://github.com/{GITHUB_REPO}.git")
+        safe_replace_posix(current_exe, new_exe)
+
+
+def execute_python_update(wheel_url: str | None = None) -> None:
+    """Updates python package via pip or pipx using release wheel."""
+    if not wheel_url:
+        raise RuntimeError("No wheel (.whl) asset found in latest GitHub release. Cannot update without a release wheel.")
+
+    print(f"Installing update from {wheel_url}...")
+
+    # Detect pipx installation
+    is_pipx = False
+    pipx_bin = shutil.which("pipx")
+    if pipx_bin:
+        prefix_parts = [p.lower() for p in Path(sys.prefix).parts]
+        if "pipx" in prefix_parts and "agym" in prefix_parts:
+            is_pipx = True
+
+    if is_pipx and pipx_bin:
+        cmd = [pipx_bin, "install", "--force", wheel_url]
+    else:
+        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", wheel_url]
 
     proc = subprocess.run(cmd)
     if proc.returncode != 0:
@@ -319,11 +481,18 @@ def do_update(release_info: dict[str, Any] | None = None) -> int:
     is_frozen = getattr(sys, "frozen", False)
     standalone_url = release_info.get("standalone_url")
 
+    # If standalone_url or wheel_url is missing (e.g. from an old cache), refresh from network
+    if (is_frozen and not standalone_url) or (not is_frozen and not release_info.get("wheel_url")):
+        fresh_info = fetch_latest_release()
+        if fresh_info:
+            release_info = fresh_info
+            standalone_url = release_info.get("standalone_url")
+
     try:
         if is_frozen and standalone_url:
-            execute_binary_update(standalone_url)
+            execute_binary_update(standalone_url, target_ver)
         elif is_frozen:
-            raise RuntimeError("No standalone update is available for this platform")
+            raise RuntimeError(f"No standalone update binary is available for platform {platform.system()} {platform.machine()}")
         else:
             execute_python_update(release_info.get("wheel_url"))
         print(f"agym has been updated to version {target_ver}!")
@@ -342,16 +511,15 @@ def maybe_prompt_startup_update(argv: list[str]) -> None:
         return
 
     # Skip if non-interactive
-    if not sys.stdin.isatty():
+    if not hasattr(sys.stdin, "isatty") or not sys.stdin.isatty():
         return
 
-    # Skip for statusline, update, help, or json flags
+    # Skip for statusline, update, help, version, or json flags
     if argv:
-        cmd0 = argv[0].lower()
-        if cmd0 in {"statusline", "update", "help", "-h", "--help"}:
-            return
-        if any(arg in {"--json", "-j"} for arg in argv):
-            return
+        for arg in argv:
+            arg_lower = arg.lower()
+            if arg_lower in {"--help", "-h", "help", "--version", "-v", "--json", "-j", "statusline", "update", "--statusline-render"}:
+                return
 
     try:
         release_info, is_newer = check_for_updates(force_network=False)
@@ -362,12 +530,8 @@ def maybe_prompt_startup_update(argv: list[str]) -> None:
             return
 
         target_ver = release_info["version"]
-        notes_url = release_info.get("html_url", "")
-        print(f"\n\033[36m[agym]\033[0m A new version is available: \033[33m{__version__}\033[0m -> \033[32m{target_ver}\033[0m")
-        if notes_url:
-            print(f"\033[36m[agym]\033[0m Release info: {notes_url}")
-
-        sys.stdout.write("Would you like to update now? [y/N]: ")
+        print(f"[agym] Update available: {__version__} -> {target_ver}")
+        sys.stdout.write("Update now? [y/N]: ")
         sys.stdout.flush()
 
         # Read single line response
@@ -379,6 +543,8 @@ def maybe_prompt_startup_update(argv: list[str]) -> None:
         else:
             record_dismissal(target_ver)
             print("Update postponed. You will be reminded again in 24 hours.\n")
+    except (KeyboardInterrupt, EOFError):
+        pass
     except Exception:
         # Never break or block the user command if update check fails
         pass
