@@ -18,6 +18,7 @@ logger = logging.getLogger("agym.wincred")
 TARGET_NAME = "gemini:antigravity"
 DEFAULT_USER = "antigravity"
 CREDENTIAL_FILENAME = "token.json"
+OAUTH_TOKEN_FILENAME = "antigravity-oauth-token"
 
 
 def is_windows_platform() -> bool:
@@ -129,15 +130,30 @@ def wincred_delete(target: str = TARGET_NAME) -> bool:
 
 
 def get_profile_token_path(profile_home: Path | str) -> Path:
-    """Resolves the isolated token storage path within a profile home directory."""
-    return Path(profile_home).resolve() / ".gemini" / "antigravity-cli" / CREDENTIAL_FILENAME
+    """Resolves the isolated token storage path within a profile home directory.
+
+    Prefers token.json if present, then antigravity-oauth-token, falling back to
+    platform-appropriate defaults.
+    """
+    base = Path(profile_home).resolve() / ".gemini" / "antigravity-cli"
+    win_tok = base / CREDENTIAL_FILENAME
+    native_tok = base / OAUTH_TOKEN_FILENAME
+    if win_tok.is_file():
+        return win_tok
+    if native_tok.is_file():
+        return native_tok
+    return win_tok if is_windows_platform() else native_tok
 
 
-def extract_email_from_blob(blob: bytes | str) -> str | None:
+def extract_email_from_blob(blob: bytes | str | dict[str, Any]) -> str | None:
     """Extracts user email from an OAuth ID token JWT or JSON structure if present."""
     try:
-        raw_text = blob.decode("utf-8", errors="replace") if isinstance(blob, bytes) else blob
-        data = json.loads(raw_text)
+        if isinstance(blob, dict):
+            data = blob
+        else:
+            raw_text = blob.decode("utf-8", errors="replace") if isinstance(blob, bytes) else blob
+            data = json.loads(raw_text) if isinstance(raw_text, str) else raw_text
+
         # Direct email field in JSON
         if isinstance(data, dict):
             if "email" in data and isinstance(data["email"], str):
@@ -171,7 +187,7 @@ def save_profile_token(
     else:
         raw_bytes = blob.encode("utf-8") if isinstance(blob, str) else blob
 
-    token_path = get_profile_token_path(profile_home)
+    token_path = Path(profile_home).resolve() / ".gemini" / "antigravity-cli" / CREDENTIAL_FILENAME
     token_path.parent.mkdir(parents=True, exist_ok=True)
 
     blob_text = raw_bytes.decode("utf-8", errors="replace")
@@ -206,42 +222,67 @@ def save_profile_token(
 
 def load_profile_token(profile_home: Path | str) -> tuple[str, bytes] | None:
     """Loads stored credential data from the profile's isolated token file."""
-    token_path = get_profile_token_path(profile_home)
-    if not token_path.is_file():
-        return None
-    try:
-        with open(token_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return None
-        username = data.get("username", DEFAULT_USER)
-        blob = data.get("blob", "")
-        return username, blob.encode("utf-8") if isinstance(blob, str) else b""
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Could not read token file %s: %s", token_path, exc)
-        return None
+    base = Path(profile_home).resolve() / ".gemini" / "antigravity-cli"
+    win_tok = base / CREDENTIAL_FILENAME
+    native_tok = base / OAUTH_TOKEN_FILENAME
+
+    # 1. Check wincred token.json (Windows isolated credential format)
+    if win_tok.is_file():
+        try:
+            with open(win_tok, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                username = data.get("username", DEFAULT_USER)
+                blob = data.get("blob", "")
+                return username, blob.encode("utf-8") if isinstance(blob, str) else b""
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Could not read token file %s: %s", win_tok, exc)
+
+    # 2. Check native antigravity-oauth-token (Linux/macOS native format)
+    if native_tok.is_file():
+        try:
+            with open(native_tok, "r", encoding="utf-8") as f:
+                raw_text = f.read()
+            data = json.loads(raw_text)
+            if isinstance(data, dict) and "token" in data:
+                return DEFAULT_USER, raw_text.encode("utf-8")
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Could not read native token file %s: %s", native_tok, exc)
+
+    return None
 
 
 def has_profile_token(profile_home: Path | str) -> bool:
     """Checks if a valid token file exists for the given profile home."""
-    return load_profile_token(profile_home) is not None
+    if load_profile_token(profile_home) is not None:
+        return True
+    oauth_token_path = Path(profile_home).resolve() / ".gemini" / "antigravity-cli" / OAUTH_TOKEN_FILENAME
+    return oauth_token_path.is_file()
 
 
 def get_profile_email(profile_home: Path | str) -> str | None:
     """Returns the authenticated email associated with this profile, if recorded."""
-    token_path = get_profile_token_path(profile_home)
-    if not token_path.is_file():
-        return None
-    try:
-        with open(token_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            if data.get("email"):
-                return str(data["email"])
-            blob = data.get("blob", "")
-            return extract_email_from_blob(blob)
-    except Exception:
-        pass
+    base = Path(profile_home).resolve() / ".gemini" / "antigravity-cli"
+    for filename in (CREDENTIAL_FILENAME, OAUTH_TOKEN_FILENAME):
+        token_path = base / filename
+        if not token_path.is_file():
+            continue
+        try:
+            with open(token_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                if data.get("email"):
+                    return str(data["email"])
+                blob = data.get("blob")
+                if blob:
+                    res = extract_email_from_blob(blob)
+                    if res:
+                        return res
+                res = extract_email_from_blob(data)
+                if res:
+                    return res
+        except Exception:
+            pass
     return None
 
 
@@ -326,19 +367,34 @@ def profile_credential_context(
     *,
     is_setup: bool = False,
 ) -> Generator[None, None, None]:
-    """Context manager ensuring safe, isolated Windows Credential Manager access for a profile.
+    """Context manager ensuring safe, isolated OS credential store access for a profile.
 
-    Synchronizes credentials before launch and captures updated tokens on exit.
+    - On Windows: synchronizes isolated token to/from Windows Credential Manager.
+    - On macOS: configures and synchronizes isolated login keychain to prevent 'Keychain Not Found' popups.
     """
-    if not is_windows_platform():
-        yield
+    if is_windows_platform():
+        sync_credentials_before_launch(profile_home, is_setup=is_setup)
+        try:
+            yield
+        finally:
+            sync_credentials_after_launch(profile_home, is_setup=is_setup)
         return
 
-    sync_credentials_before_launch(profile_home, is_setup=is_setup)
-    try:
-        yield
-    finally:
-        sync_credentials_after_launch(profile_home, is_setup=is_setup)
+    from .maccred import (
+        is_darwin_platform,
+        sync_mac_credentials_after_launch,
+        sync_mac_credentials_before_launch,
+    )
+
+    if is_darwin_platform():
+        sync_mac_credentials_before_launch(profile_home, is_setup=is_setup)
+        try:
+            yield
+        finally:
+            sync_mac_credentials_after_launch(profile_home, is_setup=is_setup)
+        return
+
+    yield
 
 
 @asynccontextmanager
@@ -347,14 +403,13 @@ async def async_profile_credential_context(
     *,
     is_setup: bool = False,
 ) -> AsyncGenerator[None, None]:
-    """Async context manager ensuring serialized, isolated Windows Credential Manager access.
-
-    Serializes concurrent tasks on Windows to prevent race conditions on gemini:antigravity.
-    """
-    if not is_windows_platform():
-        yield
+    """Async context manager ensuring isolated credential store access for a profile."""
+    if is_windows_platform():
+        async with get_wincred_async_lock():
+            with profile_credential_context(profile_home, is_setup=is_setup):
+                yield
         return
 
-    async with get_wincred_async_lock():
-        with profile_credential_context(profile_home, is_setup=is_setup):
-            yield
+    with profile_credential_context(profile_home, is_setup=is_setup):
+        yield
+

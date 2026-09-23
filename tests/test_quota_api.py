@@ -10,8 +10,12 @@ from unittest import mock
 
 from agym.profiles import Profile
 from agym.quota_api import (
+    CLOUDCODE_HOSTS,
     OAUTH_TOKEN_URL,
+    OAuthRefreshError,
+    QuotaUnauthorizedError,
     fetch_quota_direct_async,
+    get_candidate_oauth_credentials,
     get_oauth_client_credentials,
     get_valid_access_token_async,
     is_token_expired,
@@ -21,7 +25,7 @@ from agym.quota_api import (
     refresh_oauth_token_async,
     update_profile_tokens,
 )
-from agym.usage import AccountUsage, fetch_account_usage_async
+from agym.usage import DIRECT_QUOTA_WAIT_SECONDS, AccountUsage, fetch_account_usage_async, parse_iso_datetime
 from agym.wincred import save_profile_token
 
 SAMPLE_GOOGLE_API_RESPONSE = {
@@ -218,19 +222,28 @@ class QuotaApiUnitTests(unittest.TestCase):
         self.assertEqual(mock_post.call_count, 2)
 
     @mock.patch("agym.quota_api._http_post_sync")
-    def test_query_quota_api_async_fallback_host(self, mock_post: mock.Mock) -> None:
-        # First host returns 500, second host returns 200
-        mock_post.side_effect = [
-            (500, "Internal Server Error"),
-            (200, json.dumps(SAMPLE_GOOGLE_API_RESPONSE)),
-        ]
+    def test_quota_401_has_safe_typed_error(self, mock_post: mock.Mock) -> None:
+        mock_post.return_value = (401, '{"error":"expired","secret":"do-not-log"}')
+
+        async def _run() -> None:
+            with self.assertRaises(QuotaUnauthorizedError) as caught:
+                await query_quota_api_async("test_token")
+            self.assertNotIn("do-not-log", str(caught.exception))
+
+        asyncio.run(_run())
+
+    @mock.patch("agym.quota_api._http_post_sync")
+    def test_query_quota_api_uses_matching_host(self, mock_post: mock.Mock) -> None:
+        mock_post.return_value = (200, json.dumps(SAMPLE_GOOGLE_API_RESPONSE))
 
         async def _run() -> None:
             data = await query_quota_api_async("test_token")
             self.assertIn("groups", data)
 
         asyncio.run(_run())
-        self.assertEqual(mock_post.call_count, 2)
+        self.assertEqual(CLOUDCODE_HOSTS, ("daily-cloudcode-pa.googleapis.com",))
+        self.assertIn(CLOUDCODE_HOSTS[0], mock_post.call_args.args[0])
+        self.assertEqual(mock_post.call_count, 1)
 
     def test_fetch_quota_direct_async_returns_none_without_token(self) -> None:
         async def _run() -> None:
@@ -239,11 +252,44 @@ class QuotaApiUnitTests(unittest.TestCase):
 
         asyncio.run(_run())
 
-    @mock.patch("agym.usage.fetch_quota_direct_async")
-    def test_fetch_account_usage_async_fast_path(self, mock_direct: mock.Mock) -> None:
+    @mock.patch("agym.usage._default_subprocess_runner", new_callable=mock.AsyncMock)
+    @mock.patch("agym.usage.fetch_quota_direct_async", new_callable=mock.AsyncMock)
+    def test_fetch_account_usage_prefers_parallel_api(
+        self, mock_direct: mock.AsyncMock, mock_runner: mock.AsyncMock
+    ) -> None:
         self._setup_token_file()
-        usage, synth_out = normalize_api_quota_response(SAMPLE_GOOGLE_API_RESPONSE, "test_user")
-        mock_direct.return_value = (usage, synth_out)
+        usage, synthetic = normalize_api_quota_response(SAMPLE_GOOGLE_API_RESPONSE, "test_user")
+        mock_direct.return_value = (usage, synthetic)
+
+        async def _run() -> None:
+            result = await fetch_account_usage_async(Path("/bin/agy"), self.profile, asyncio.Semaphore(1))
+            self.assertEqual(result.groups[0].buckets[0].percentage, 62)
+
+        asyncio.run(_run())
+        mock_direct.assert_awaited_once()
+        mock_runner.assert_not_awaited()
+
+    @mock.patch("agym.usage._default_subprocess_runner", new_callable=mock.AsyncMock)
+    @mock.patch("agym.usage.fetch_quota_direct_async", new_callable=mock.AsyncMock)
+    def test_fetch_account_usage_uses_cli_when_api_fails(
+        self, mock_direct: mock.AsyncMock, mock_runner: mock.AsyncMock
+    ) -> None:
+        self._setup_token_file()
+        mock_direct.return_value = None
+        cli_response = {
+            "status": "SUCCESS",
+            "command": {
+                "name": "usage",
+                "data": {"groups": [{
+                    "name": "Gemini Models",
+                    "buckets": [{
+                        "id": "gemini-weekly", "name": "Weekly Limit Remaining",
+                        "window": "weekly", "remaining_fraction": 0.4224,
+                    }],
+                }]},
+            },
+        }
+        mock_runner.return_value = (0, json.dumps(cli_response), "")
 
         async def _run() -> None:
             sem = asyncio.Semaphore(1)
@@ -254,15 +300,38 @@ class QuotaApiUnitTests(unittest.TestCase):
             )
             self.assertEqual(result.status, "success")
             self.assertEqual(result.account, "test_user")
-            self.assertEqual(len(result.groups), 2)
+            self.assertEqual(result.groups[0].buckets[0].percentage, 42)
 
         asyncio.run(_run())
-        mock_direct.assert_called_once()
+        mock_direct.assert_awaited_once()
+        mock_runner.assert_awaited_once()
 
-    @mock.patch("agym.usage.fetch_quota_direct_async", return_value=None)
-    def test_fetch_account_usage_async_falls_back_to_subprocess(
-        self, mock_direct: mock.Mock
+    @mock.patch("agym.usage._default_subprocess_runner", new_callable=mock.AsyncMock)
+    @mock.patch("agym.usage.fetch_quota_direct_async", new_callable=mock.AsyncMock)
+    def test_api_deadline_falls_back_to_cli(
+        self, mock_direct: mock.AsyncMock, mock_runner: mock.AsyncMock
     ) -> None:
+        self._setup_token_file()
+        self.assertEqual(DIRECT_QUOTA_WAIT_SECONDS, 2.5)
+
+        async def stalled_api(*args: object, **kwargs: object) -> None:
+            await asyncio.Event().wait()
+
+        mock_direct.side_effect = stalled_api
+        mock_runner.return_value = (
+            0, json.dumps({"status": "SUCCESS", "command": {"name": "usage", "data": {"groups": []}}}), "",
+        )
+
+        async def _run() -> None:
+            with mock.patch("agym.usage.DIRECT_QUOTA_WAIT_SECONDS", 0.01):
+                result = await fetch_account_usage_async(Path("/bin/agy"), self.profile, asyncio.Semaphore(1))
+            self.assertEqual(result.status, "success")
+
+        asyncio.run(_run())
+        mock_direct.assert_awaited_once()
+        mock_runner.assert_awaited_once()
+
+    def test_fetch_account_usage_async_uses_injected_runner(self) -> None:
         self._setup_token_file()
 
         async def mock_runner(argv: list[str], env: dict[str, str], timeout: float) -> tuple[int, str, str]:
@@ -285,6 +354,138 @@ class QuotaApiUnitTests(unittest.TestCase):
         cid, sec = get_oauth_client_credentials()
         self.assertTrue(len(cid) > 10)
         self.assertTrue(len(sec) > 10)
+
+    def test_load_and_update_native_oauth_token_data(self) -> None:
+        native_dir = self.home / ".gemini" / "antigravity-cli"
+        native_dir.mkdir(parents=True, exist_ok=True)
+        native_file = native_dir / "antigravity-oauth-token"
+        token_payload = {
+            "token": {
+                "access_token": "ya29.native_tok",
+                "refresh_token": "native_ref",
+                "expiry": "2026-09-22T20:00:00Z",
+            },
+            "auth_method": "consumer",
+        }
+        native_file.write_text(json.dumps(token_payload), encoding="utf-8")
+
+        data = load_profile_token_data(self.home)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["format"], "native")
+        self.assertEqual(data["access_token"], "ya29.native_tok")
+        self.assertEqual(data["refresh_token"], "native_ref")
+
+        new_exp = datetime.now(timezone.utc) + timedelta(hours=1)
+        ok = update_profile_tokens(self.home, "ya29.refreshed", new_exp, "ref_updated")
+        self.assertTrue(ok)
+
+        data2 = load_profile_token_data(self.home)
+        self.assertEqual(data2["access_token"], "ya29.refreshed")
+        self.assertEqual(data2["refresh_token"], "ref_updated")
+
+    def test_candidate_credentials_contains_fallback(self) -> None:
+        candidates = get_candidate_oauth_credentials()
+        self.assertGreaterEqual(len(candidates), 1)
+        cid, sec = candidates[0]
+        self.assertTrue(cid.startswith("1071006060591-") or "apps.googleusercontent.com" in cid)
+        self.assertTrue(sec.startswith("GOCSPX-"))
+
+    @mock.patch("agym.quota_api._http_post_sync")
+    def test_refresh_oauth_token_retries_next_candidate_on_invalid_client(
+        self, mock_post: mock.Mock
+    ) -> None:
+        # First candidate fails with 401 invalid_client, second candidate succeeds with 200
+        mock_post.side_effect = [
+            (401, json.dumps({"error": "invalid_client", "error_description": "invalid client secret"})),
+            (200, json.dumps({"access_token": "fallback_refreshed_tok", "expires_in": 3600})),
+        ]
+
+        async def _run() -> None:
+            with mock.patch(
+                "agym.quota_api.get_candidate_oauth_credentials",
+                return_value=[("bad_cid", "bad_sec"), ("good_cid", "good_sec")],
+            ):
+                tok, exp = await refresh_oauth_token_async("test_ref")
+                self.assertEqual(tok, "fallback_refreshed_tok")
+
+        asyncio.run(_run())
+        self.assertEqual(mock_post.call_count, 2)
+
+    @mock.patch("agym.quota_api._http_post_sync")
+    def test_refresh_invalid_grant_does_not_expose_response(self, mock_post: mock.Mock) -> None:
+        mock_post.return_value = (400, '{"error":"invalid_grant","detail":"do-not-log"}')
+
+        async def _run() -> None:
+            with mock.patch("agym.quota_api.get_candidate_oauth_credentials", return_value=[("cid", "secret")]):
+                with self.assertRaises(OAuthRefreshError) as caught:
+                    await refresh_oauth_token_async("test_ref")
+            self.assertEqual(caught.exception.code, "invalid_grant")
+            self.assertNotIn("do-not-log", str(caught.exception))
+
+        asyncio.run(_run())
+
+    @mock.patch("agym.quota_api.refresh_oauth_token_async", new_callable=mock.AsyncMock)
+    @mock.patch("agym.quota_api.query_quota_api_async", new_callable=mock.AsyncMock)
+    def test_expired_token_refresh_failure_is_not_retried_twice(
+        self, mock_query: mock.AsyncMock, mock_refresh: mock.AsyncMock
+    ) -> None:
+        past = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        self._setup_token_file(expiry=past)
+        mock_refresh.side_effect = OAuthRefreshError("invalid_grant")
+        mock_query.side_effect = QuotaUnauthorizedError("Quota API rejected the access token (HTTP 401)")
+
+        result = asyncio.run(fetch_quota_direct_async(self.profile))
+        self.assertIsNone(result)
+        mock_refresh.assert_awaited_once()
+        mock_query.assert_awaited_once()
+
+    @mock.patch("agym.quota_api.refresh_oauth_token_async")
+    @mock.patch("agym.quota_api.query_quota_api_async")
+    def test_fetch_quota_direct_retries_with_refresh_on_401(
+        self, mock_query: mock.Mock, mock_refresh: mock.Mock
+    ) -> None:
+        self._setup_token_file(access_token="initial_tok", refresh_token="valid_ref", expiry="2099-01-01T00:00:00Z")
+        future_exp = datetime.now(timezone.utc) + timedelta(hours=1)
+        mock_refresh.return_value = ("retried_tok", future_exp)
+
+        # First query raises 401 Unauthorized, second query succeeds
+        mock_query.side_effect = [
+            QuotaUnauthorizedError("Quota API rejected the access token (HTTP 401)"),
+            SAMPLE_GOOGLE_API_RESPONSE,
+        ]
+
+        async def _run() -> None:
+            res = await fetch_quota_direct_async(self.profile)
+            self.assertIsNotNone(res)
+            usage, _ = res  # type: ignore
+            self.assertEqual(usage.status, "success")
+
+        asyncio.run(_run())
+        self.assertEqual(mock_query.call_count, 2)
+        mock_refresh.assert_called_once()
+
+    @mock.patch("agym.quota_api.refresh_oauth_token_async", side_effect=RuntimeError("refresh failed"))
+    def test_get_valid_access_token_does_not_log_warning_on_refresh_failure(
+        self, mock_refresh: mock.Mock
+    ) -> None:
+        past = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        self._setup_token_file(access_token="old_token", expiry=past)
+
+        async def _run() -> None:
+            with mock.patch("agym.quota_api.logger.warning") as mock_warn:
+                tok = await get_valid_access_token_async(self.home)
+                self.assertEqual(tok, "old_token")
+                mock_warn.assert_not_called()
+
+        asyncio.run(_run())
+
+    def test_parse_iso_datetime_nanoseconds(self) -> None:
+        raw_nano = "2026-09-22T20:37:41.572328817+01:00"
+        dt = parse_iso_datetime(raw_nano)
+        self.assertIsNotNone(dt)
+        self.assertEqual(dt.year, 2026)
+        self.assertEqual(dt.month, 9)
+        self.assertEqual(dt.day, 22)
 
 
 if __name__ == "__main__":

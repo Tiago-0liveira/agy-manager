@@ -29,7 +29,7 @@ from agym.profiles import Profile, ProfileSettings
 class LauncherTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.home_a = self.root / "a" / "home"
         self.home_b = self.root / "b" / "home"
         self.home_a.mkdir(parents=True)

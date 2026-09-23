@@ -4,6 +4,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -359,15 +360,18 @@ class InstallationAndSyncTests(unittest.TestCase):
     def test_install_statusline_script(self) -> None:
         script_path = install_statusline_script(self.data_root)
         self.assertTrue(script_path.is_file())
-        if sys.platform != "win32" and os.name != "nt":
+        py_target = script_path.parent / "statusline.py"
+        self.assertTrue(py_target.is_file())
+        self.assertIn("from agym.statusline import main", py_target.read_text())
+        if sys.platform != "win32":
             mode = script_path.stat().st_mode
             self.assertTrue(bool(mode & 0o111), "Script should be executable")
             content = script_path.read_text()
-            self.assertIn("from agym.statusline import main", content)
+            self.assertIn("#!/bin/sh", content)
+            self.assertIn("statusline.py", content)
         else:
-            py_target = script_path.parent / "statusline.py"
-            self.assertTrue(py_target.is_file())
-            self.assertIn("from agym.statusline import main", py_target.read_text())
+            cmd_content = script_path.read_text()
+            self.assertIn("statusline.py", cmd_content)
 
     def test_sync_profile_statusline_preserves_existing_settings(self) -> None:
         profile = self.store.create("work")
@@ -396,7 +400,8 @@ class InstallationAndSyncTests(unittest.TestCase):
         if sys.platform == "win32":
             expected_cmd = str(_get_short_path(script_path))
         else:
-            expected_cmd = str(script_path.resolve())
+            resolved = str(script_path.resolve())
+            expected_cmd = f'"{resolved}"' if " " in resolved else resolved
         self.assertEqual(new_data["statusLine"]["command"], expected_cmd)
         self.assertTrue(new_data["statusLine"]["enabled"])
 
@@ -429,8 +434,37 @@ class InstallationAndSyncTests(unittest.TestCase):
     def test_get_statusline_command_posix(self) -> None:
         with patch("sys.platform", "linux"):
             cmd = get_statusline_command(self.data_root)
-            expected = str((self.data_root / "bin" / "statusline").resolve())
+            resolved = str((self.data_root / "bin" / "statusline").resolve())
+            expected = f'"{resolved}"' if " " in resolved else resolved
             self.assertEqual(cmd, expected)
+
+    def test_get_statusline_command_posix_with_spaces(self) -> None:
+        space_root = self.data_root / "space path" / "agym"
+        with patch("sys.platform", "darwin"):
+            cmd = get_statusline_command(space_root)
+            expected = f'"{space_root.resolve() / "bin" / "statusline"}"'
+            self.assertEqual(cmd, expected)
+
+    def test_sync_profile_statusline_with_spaces_executable(self) -> None:
+        space_root = self.data_root / "Library" / "Application Support" / "agym"
+        profile = self.store.create("test_spaces")
+        settings_file = get_profile_settings_path(profile.home)
+
+        script_path = install_statusline_script(space_root)
+        self.assertTrue(script_path.is_file())
+        self.assertTrue((space_root / "bin" / "statusline.py").is_file())
+
+        updated = sync_profile_statusline(profile.home, script_path, enabled=True)
+        self.assertTrue(updated)
+
+        with settings_file.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        cmd = data["statusLine"]["command"]
+        self.assertEqual(cmd, get_statusline_command(space_root))
+
+        if sys.platform != "win32":
+            res = subprocess.run(["sh", "-c", f"{cmd}"], input="{}", text=True, capture_output=True)
+            self.assertEqual(res.returncode, 0)
 
     def test_sync_all_profiles(self) -> None:
         p1 = self.store.create("acc1")

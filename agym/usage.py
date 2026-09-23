@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -35,6 +34,7 @@ from .wincred import (
 )
 
 logger = logging.getLogger("agym.usage")
+DIRECT_QUOTA_WAIT_SECONDS = 2.5
 
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -100,6 +100,7 @@ def parse_iso_datetime(raw: str | None) -> datetime | None:
     cleaned = raw.strip()
     if cleaned.endswith("Z") or cleaned.endswith("z"):
         cleaned = cleaned[:-1] + "+00:00"
+    cleaned = re.sub(r"(\.\d{6})\d+", r"\1", cleaned)
     try:
         dt = datetime.fromisoformat(cleaned)
         if dt.tzinfo is None:
@@ -780,23 +781,26 @@ async def fetch_account_usage_async(
             subscription_date=profile.subscription_date,
         )
 
-    # Fast path: Direct Cloud Code Quota API (runs in parallel across all profiles without wincred lock)
+    # The daily quota host matches agy's /usage results. Keep this path parallel,
+    # especially on Windows where the CLI's credential context is serialized.
     if runner is None and has_profile_token(profile.home):
         async with semaphore:
             try:
-                direct_res = await fetch_quota_direct_async(profile, timeout=min(timeout, 15.0))
+                direct_timeout = min(timeout, DIRECT_QUOTA_WAIT_SECONDS)
+                direct_res = await asyncio.wait_for(
+                    fetch_quota_direct_async(profile, timeout=direct_timeout),
+                    timeout=direct_timeout,
+                )
                 if direct_res is not None:
                     usage, raw_out = direct_res
                     if usage.status == "success":
                         if cache_manager is not None:
                             cache_manager.set_usage(profile.name, account_usage_to_dict(usage), raw_out)
                         return usage
+            except asyncio.TimeoutError:
+                logger.debug("Direct quota API timed out for profile '%s'; using agy /usage", profile.name)
             except Exception as exc:
-                logger.debug(
-                    "Direct quota API query failed for profile '%s', falling back to agy subprocess: %s",
-                    profile.name,
-                    exc,
-                )
+                logger.debug("Direct quota API query failed for profile '%s': %s", profile.name, exc)
 
     async with semaphore:
         if runner is None and is_windows_platform() and not has_profile_token(profile.home):
@@ -865,7 +869,7 @@ async def fetch_account_usage_async(
 async def fetch_all_usage(
     agy_path: Path,
     profiles: Sequence[Profile],
-    concurrency_limit: int = 8,
+    concurrency_limit: int = 12,
     timeout: float = 30.0,
     force_refresh: bool = False,
     cache_manager: CacheManager | None = None,
@@ -1040,7 +1044,7 @@ async def run_usage(
     json_mode: bool = False,
     refresh: bool = False,
     timeout: float = 30.0,
-    concurrency_limit: int = 8,
+    concurrency_limit: int = 12,
     view: str = "table",
     sort_by: str = "usage",
     show_claude: bool = False,
@@ -1142,7 +1146,7 @@ async def fetch_and_cache_usage_async(
     *,
     agy_path: Path | None = None,
     cache_manager: CacheManager | None = None,
-    concurrency_limit: int = 8,
+    concurrency_limit: int = 12,
     timeout: float = 30.0,
     runner: Callable[..., Coroutine[Any, Any, tuple[int, str, str]]] | None = None,
     on_progress: Callable[[AccountUsage], None] | None = None,
@@ -1210,4 +1214,3 @@ def fetch_and_cache_usage(
             return executor.submit(asyncio.run, coro).result()
     else:
         return asyncio.run(coro)
-
