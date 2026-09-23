@@ -291,14 +291,18 @@ class ConcurrencyAndProgressivenessTests(unittest.IsolatedAsyncioTestCase):
             p2 = store.create("account-2")
             p3 = store.create("account-3")
 
-            barrier = asyncio.Barrier(3)
+            entered = asyncio.Event()
+            ready = 0
             entered_homes: list[str] = []
 
             async def barrier_runner(argv: list[str], env: dict[str, str], timeout: float) -> tuple[int, str, str]:
+                nonlocal ready
                 entered_homes.append(env["HOME"])
-                # If tasks were run sequentially, barrier.wait() would time out because
-                # subsequent tasks wouldn't enter until this task finishes.
-                await asyncio.wait_for(barrier.wait(), timeout=2.0)
+                ready += 1
+                if ready == 3:
+                    entered.set()
+                # Sequential execution cannot set the event before the first task times out.
+                await asyncio.wait_for(entered.wait(), timeout=2.0)
                 return 0, SAMPLE_REAL_RESPONSE, ""
 
             usages = await fetch_all_usage(
@@ -1110,5 +1114,4 @@ class UsageGraphsTests(unittest.TestCase):
         self.assertIn("Claude", narrow_text)
         dev_narrow = [l for l in narrow_lines if "dev" in l or "Claude" in l]
         self.assertGreaterEqual(len(dev_narrow), 2)
-
 

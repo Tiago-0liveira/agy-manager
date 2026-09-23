@@ -37,6 +37,7 @@ from .subscription import (
 )
 from .statusline import get_statusline_status, render_statusline, sync_all_profiles
 from .tokens import run_tokens
+from .updater import maybe_prompt_startup_update, run_update_cli
 from .usage import fetch_and_cache_usage, run_usage
 from .wincred import get_profile_email
 
@@ -50,6 +51,7 @@ Usage:
   agym select [-f|--fresh] [-- [agy args...]]
   agym rotate [--file <file>] [--status] [--reset] [--simulate [N]] [-- [agy args...]]
   agym config <profile> [--model <model>|default] [-y|--dsp|--skip-perms|--[no-]dangerously-skip-permissions]
+  agym update [--check] [-f|--force]
 
 Commands:
   setup <profile>                     Create a new profile and complete Google sign-in
@@ -65,6 +67,7 @@ Commands:
   remove <profile>                    Delete a profile and its isolated data
   doctor [profile]                    Check environment, executable, permissions, and state
   auto-pr [profile]                   Create a pull request from current branch into base branch
+  update                              Check for and install updates to agym
 
 Launching Antigravity:
   agym <profile>                      Launch Antigravity under the specified profile.
@@ -1020,13 +1023,26 @@ def main(argv: list[str] | None = None) -> int:
                     pass
 
     args = list(sys.argv[1:] if argv is None else argv)
+    if args == ["--version"]:
+        from . import __version__
+        print(__version__)
+        return 0
+    if args == ["--statusline-render"]:
+        from .statusline import main as render_statusline_main
+        return render_statusline_main()
     if not args or args[0] in {"-h", "--help", "help"}:
         print(USAGE.rstrip())
         return 0 if args else 2
 
     store = ProfileStore()
     command, rest = args[0], args[1:]
+
+    # Prompt startup update check if running interactively and not dismissed in 24h
+    maybe_prompt_startup_update(args)
+
     try:
+        if command == "update":
+            return run_update_cli(rest)
         if command == "setup":
             return _setup(rest, store)
         if command == "config":

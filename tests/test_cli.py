@@ -174,8 +174,9 @@ class CliTests(unittest.TestCase):
             )
             mock_run_agy.assert_not_called()
 
+    @mock.patch("agym.cli.resolve_agy", return_value=Path("/usr/bin/agy"))
     @mock.patch("agym.cli.ProfileStore")
-    def test_auto_prompt_errors(self, Store: mock.Mock) -> None:
+    def test_auto_prompt_errors(self, Store: mock.Mock, _resolve: mock.Mock) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ProfileStore(Path(tmp) / "config", Path(tmp) / "data")
             store.create("personal")

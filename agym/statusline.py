@@ -686,6 +686,23 @@ def install_statusline_script(data_root: Path | None = None) -> Path:
     package_root = str(Path(__file__).resolve().parent.parent)
 
     is_windows = sys.platform == "win32"
+    if getattr(sys, "frozen", False):
+        if is_windows:
+            content = f'@echo off\r\n"{python_bin}" --statusline-render %*\r\n'
+        else:
+            content = f'#!/bin/sh\nexec "{python_bin}" --statusline-render "$@"\n'
+        fd, tmp_name = tempfile.mkstemp(prefix=".statusline.", suffix=".tmp", dir=script_path.parent)
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+            if not is_windows:
+                tmp.chmod(0o755)
+            os.replace(tmp, script_path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+        return script_path
     py_target = script_path.parent / "statusline.py"
     content = (
         f"#!{python_bin}\n"

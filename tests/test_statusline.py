@@ -460,7 +460,7 @@ class InstallationAndSyncTests(unittest.TestCase):
         with settings_file.open("r", encoding="utf-8") as f:
             data = json.load(f)
         cmd = data["statusLine"]["command"]
-        self.assertEqual(cmd, f'"{script_path.resolve()}"')
+        self.assertEqual(cmd, get_statusline_command(space_root))
 
         if sys.platform != "win32":
             res = subprocess.run(["sh", "-c", f"{cmd}"], input="{}", text=True, capture_output=True)
@@ -502,6 +502,13 @@ class InstallationAndSyncTests(unittest.TestCase):
             py_script = self.data_root / "bin" / "statusline.py"
             self.assertTrue(py_script.is_file())
             self.assertIn("from agym.statusline import main", py_script.read_text())
+
+    def test_frozen_statusline_script_calls_binary(self) -> None:
+        with patch.object(sys, "frozen", True, create=True):
+            script_path = install_statusline_script(self.data_root)
+        content = script_path.read_text()
+        self.assertIn("--statusline-render", content)
+        self.assertIn(sys.executable, content)
 
     def test_detect_profile_escape_roots_windows(self) -> None:
         from agym.profiles import _detect_profile_escape_roots
@@ -849,4 +856,3 @@ class StatuslineVCSTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

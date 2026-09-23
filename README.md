@@ -18,16 +18,48 @@ On Windows, it redirects `USERPROFILE`, `HOMEDRIVE`, `HOMEPATH`, `LOCALAPPDATA`,
 
 ## Install
 
-Requires Python 3.10+ and an existing `agy` installation.
+### One-Line Install (Recommended)
 
-```bash
-pipx install .
+**Windows (PowerShell)**:
+```powershell
+irm https://raw.githubusercontent.com/Tiago-0liveira/agy-manager/main/install.ps1 | iex
 ```
 
-or:
+**Linux / macOS (Bash)**:
+```bash
+curl -fsSL https://raw.githubusercontent.com/Tiago-0liveira/agy-manager/main/install.sh | bash
+```
+
+The installer automatically downloads the pre-built standalone executable (no Python required) or configures an isolated virtual environment, placing `agym` in your user PATH.
+
+### Alternative / Manual Install
+
+Requires Python 3.10+ and an existing `agy` installation:
+
+```bash
+pipx install git+https://github.com/Tiago-0liveira/agy-manager.git
+```
+
+or locally:
 
 ```bash
 pip install .
+```
+
+## Updates
+
+`agym` automatically checks GitHub Releases on startup in interactive sessions. When a newer version is available, it prompts:
+```text
+[agym] A new version is available: 0.1.0 -> 0.1.1
+Would you like to update now? [y/N]:
+```
+If you decline (`N`), `agym` remembers your choice and suppresses prompts for **24 hours**.
+
+You can also check or update manually at any time:
+```bash
+agym update --check      # Check if an update is available without installing
+agym update              # Update agym to latest version
+agym update --force      # Reinstall / force update to latest release
 ```
 
 ## Usage
