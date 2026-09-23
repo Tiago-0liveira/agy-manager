@@ -1023,6 +1023,9 @@ def main(argv: list[str] | None = None) -> int:
                     pass
 
     args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "integration":
+        from .integration.cli import main as integration_main
+        return integration_main(args[1:])
     if args == ["--version"]:
         from . import __version__
         print(__version__)
