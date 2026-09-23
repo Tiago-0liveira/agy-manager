@@ -550,11 +550,15 @@ def maybe_prompt_startup_update(argv: list[str]) -> None:
         pass
 
 
-def run_update_cli(argv: list[str]) -> int:
-    """Entry point for 'agym update' command."""
+def build_update_parser() -> argparse.ArgumentParser:
+    usage = """update
+  [--check]
+  [-f | --force]"""
     parser = argparse.ArgumentParser(
         prog="agym update",
+        usage=usage,
         description="Check for and install updates to agym.",
+        add_help=True,
     )
     parser.add_argument(
         "--check",
@@ -566,6 +570,12 @@ def run_update_cli(argv: list[str]) -> int:
         action="store_true",
         help="Force reinstall / update even if already on latest version",
     )
+    return parser
+
+
+def run_update_cli(argv: list[str]) -> int:
+    """Entry point for 'agym update' command."""
+    parser = build_update_parser()
     ns = parser.parse_args(argv)
 
     print("Checking for updates on GitHub...")
