@@ -1026,7 +1026,7 @@ def main(argv: list[str] | None = None) -> int:
     if args and args[0] == "integration":
         from .integration.cli import main as integration_main
         return integration_main(args[1:])
-    if args == ["--version"]:
+    if args in (["--version"], ["-v"]):
         from . import __version__
         print(__version__)
         return 0

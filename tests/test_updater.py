@@ -1,4 +1,4 @@
-"""Unit tests for agym updater, release checking, and 24-hour negation logic."""
+"""Unit tests for agym updater, release checking, verification, rollback, and platform updates."""
 
 from __future__ import annotations
 
@@ -20,6 +20,8 @@ from agym.updater import (
     COOLDOWN_SECONDS,
     check_for_updates,
     do_update,
+    execute_binary_update,
+    execute_python_update,
     fetch_latest_release,
     is_newer_version,
     load_update_state,
@@ -27,31 +29,15 @@ from agym.updater import (
     parse_semver,
     record_dismissal,
     run_update_cli,
+    safe_replace_posix,
     save_update_state,
     should_prompt_user,
+    spawn_windows_deferred_replacement,
+    verify_binary,
 )
 
 
 class TestUpdaterVersionLogic(unittest.TestCase):
-    def test_release_asset_matches_platform_architecture(self):
-        release = {
-            "tag_name": "v0.2.0",
-            "assets": [
-                {"name": "agym-darwin-arm64", "browser_download_url": "https://example/arm"},
-                {"name": "agym-linux-amd64", "browser_download_url": "https://example/linux"},
-                {"name": "agym-0.2.0-py3-none-any.whl", "browser_download_url": "https://example/wheel"},
-            ],
-        }
-        response = mock.MagicMock()
-        response.read.return_value = json.dumps(release).encode()
-        response.__enter__.return_value = response
-        with mock.patch("agym.updater.urllib.request.urlopen", return_value=response), \
-             mock.patch("agym.updater.platform.system", return_value="Darwin"), \
-             mock.patch("agym.updater.platform.machine", return_value="x86_64"):
-            info = fetch_latest_release()
-        self.assertEqual(info["standalone_url"], "")
-        self.assertEqual(info["wheel_url"], "https://example/wheel")
-
     def test_parse_semver_standard(self):
         self.assertEqual(parse_semver("0.1.0"), (0, 1, 0))
         self.assertEqual(parse_semver("v1.2.3"), (1, 2, 3))
@@ -60,6 +46,7 @@ class TestUpdaterVersionLogic(unittest.TestCase):
     def test_parse_semver_prerelease_and_metadata(self):
         self.assertEqual(parse_semver("v0.2.0-rc1"), (0, 2, 0))
         self.assertEqual(parse_semver("1.0.0+build.42"), (1, 0, 0))
+        self.assertEqual(parse_semver("agym 0.1.2"), (0, 1, 2))
 
     def test_is_newer_version(self):
         self.assertTrue(is_newer_version("0.1.1", "0.1.0"))
@@ -68,6 +55,50 @@ class TestUpdaterVersionLogic(unittest.TestCase):
         self.assertFalse(is_newer_version("0.1.0", "0.1.0"))
         self.assertFalse(is_newer_version("0.1.0", "0.1.1"))
         self.assertFalse(is_newer_version("0.0.9", "0.1.0"))
+
+    def test_correct_platform_assets(self):
+        release = {
+            "tag_name": "v0.2.0",
+            "assets": [
+                {"name": "agym-windows-amd64.exe", "browser_download_url": "https://example/win"},
+                {"name": "agym-darwin-arm64", "browser_download_url": "https://example/darwin-arm"},
+                {"name": "agym-darwin-amd64", "browser_download_url": "https://example/darwin-intel"},
+                {"name": "agym-linux-amd64", "browser_download_url": "https://example/linux"},
+                {"name": "agym-0.2.0-py3-none-any.whl", "browser_download_url": "https://example/wheel"},
+            ],
+        }
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps(release).encode()
+        response.__enter__.return_value = response
+
+        # Test Windows AMD64
+        with mock.patch("agym.updater.urllib.request.urlopen", return_value=response), \
+             mock.patch("agym.updater.platform.system", return_value="Windows"), \
+             mock.patch("agym.updater.platform.machine", return_value="AMD64"):
+            info = fetch_latest_release()
+            self.assertEqual(info["standalone_url"], "https://example/win")
+            self.assertEqual(info["wheel_url"], "https://example/wheel")
+
+        # Test Linux AMD64
+        with mock.patch("agym.updater.urllib.request.urlopen", return_value=response), \
+             mock.patch("agym.updater.platform.system", return_value="Linux"), \
+             mock.patch("agym.updater.platform.machine", return_value="x86_64"):
+            info = fetch_latest_release()
+            self.assertEqual(info["standalone_url"], "https://example/linux")
+
+        # Test macOS ARM64
+        with mock.patch("agym.updater.urllib.request.urlopen", return_value=response), \
+             mock.patch("agym.updater.platform.system", return_value="Darwin"), \
+             mock.patch("agym.updater.platform.machine", return_value="arm64"):
+            info = fetch_latest_release()
+            self.assertEqual(info["standalone_url"], "https://example/darwin-arm")
+
+        # Test macOS Intel
+        with mock.patch("agym.updater.urllib.request.urlopen", return_value=response), \
+             mock.patch("agym.updater.platform.system", return_value="Darwin"), \
+             mock.patch("agym.updater.platform.machine", return_value="x86_64"):
+            info = fetch_latest_release()
+            self.assertEqual(info["standalone_url"], "https://example/darwin-intel")
 
 
 class TestUpdaterStateAndCooldown(unittest.TestCase):
@@ -114,10 +145,16 @@ class TestUpdaterStateAndCooldown(unittest.TestCase):
             # 25 hours later (t=1000 + 90000) -> 24h passed, should prompt again!
             self.assertTrue(should_prompt_user(release_info, now_ts=1000.0 + 90000))
 
-            # What if a brand new version arrives (0.2.1) within 1 hour of dismissing 0.2.0?
-            brand_new_release = {"version": "0.2.1", "tag": "v0.2.1"}
-            # It should prompt immediately because 0.2.1 was never dismissed!
-            self.assertTrue(should_prompt_user(brand_new_release, now_ts=4600.0))
+    def test_newer_version_bypasses_dismissal(self):
+        release_info = {"version": "0.2.0", "tag": "v0.2.0"}
+        with mock.patch("agym.updater.__version__", "0.1.0"):
+            # User dismisses 0.2.0 at t=1000
+            record_dismissal("0.2.0", now_ts=1000.0)
+            self.assertFalse(should_prompt_user(release_info, now_ts=4600.0))
+
+            # A newer version 0.2.1 arrives within 1 hour: should prompt immediately!
+            newer_release = {"version": "0.2.1", "tag": "v0.2.1"}
+            self.assertTrue(should_prompt_user(newer_release, now_ts=4600.0))
 
     def test_should_not_prompt_if_same_or_older_version(self):
         release_info = {"version": "0.1.0", "tag": "v0.1.0"}
@@ -135,8 +172,12 @@ class TestStartupPromptFiltering(unittest.TestCase):
         self.cache_file = Path(self.temp_dir) / "updater.json"
         self._patcher = mock.patch("agym.updater.get_update_cache_file", return_value=self.cache_file)
         self._patcher.start()
+        self._env_patch = mock.patch.dict(os.environ, {}, clear=False)
+        self._env_patch.start()
+        os.environ.pop("AGYM_NO_UPDATE_CHECK", None)
 
     def tearDown(self):
+        self._env_patch.stop()
         self._patcher.stop()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
@@ -152,14 +193,30 @@ class TestStartupPromptFiltering(unittest.TestCase):
                 maybe_prompt_startup_update(["list"])
                 mock_check.assert_not_called()
 
-    def test_bypassed_for_statusline_and_json(self):
+    def test_bypassed_for_help_version_statusline_update_and_json(self):
         with mock.patch("sys.stdin.isatty", return_value=True):
             with mock.patch("agym.updater.check_for_updates") as mock_check:
+                # --help / -h / help
+                maybe_prompt_startup_update(["--help"])
+                maybe_prompt_startup_update(["personal", "-h"])
+                maybe_prompt_startup_update(["help"])
+
+                # --version / -v
+                maybe_prompt_startup_update(["--version"])
+                maybe_prompt_startup_update(["-v"])
+
+                # update
+                maybe_prompt_startup_update(["update"])
+                maybe_prompt_startup_update(["update", "--check"])
+
+                # statusline
                 maybe_prompt_startup_update(["statusline"])
+                maybe_prompt_startup_update(["--statusline-render"])
+
+                # --json / -j
                 maybe_prompt_startup_update(["usage", "--json"])
                 maybe_prompt_startup_update(["tokens", "-j"])
-                maybe_prompt_startup_update(["update"])
-                maybe_prompt_startup_update(["--help"])
+
                 mock_check.assert_not_called()
 
     def test_interactive_prompt_user_says_no(self):
@@ -177,8 +234,10 @@ class TestStartupPromptFiltering(unittest.TestCase):
                 maybe_prompt_startup_update(["personal"])
 
             mock_do_update.assert_not_called()
-            self.assertIn("A new version is available", out.getvalue())
-            self.assertIn("Update postponed", out.getvalue())
+            output = out.getvalue()
+            self.assertIn("[agym] Update available: ", output)
+            self.assertIn("Update now? [y/N]:", output)
+            self.assertIn("Update postponed.", output)
 
             # Verify dismissal was recorded
             state = load_update_state()
@@ -203,7 +262,7 @@ class TestStartupPromptFiltering(unittest.TestCase):
 
 
 class TestUpdateCliCommand(unittest.TestCase):
-    def test_update_check_flag(self):
+    def test_update_check_flag_when_newer(self):
         fake_release = {
             "version": "0.2.0",
             "tag": "v0.2.0",
@@ -247,6 +306,19 @@ class TestUpdateCliCommand(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("already up to date", out.getvalue())
 
+    def test_update_run_force_flag_reinstalls(self):
+        fake_release = {
+            "version": "0.1.0",
+            "tag": "v0.1.0",
+            "html_url": "https://github.com/example",
+        }
+        with mock.patch("agym.updater.check_for_updates", return_value=(fake_release, False)), \
+             mock.patch("agym.updater.__version__", "0.1.0"), \
+             mock.patch("agym.updater.do_update", return_value=0) as mock_do:
+            code = run_update_cli(["--force"])
+            self.assertEqual(code, 0)
+            mock_do.assert_called_once_with(fake_release)
+
     def test_update_run_calls_do_update_when_newer(self):
         fake_release = {
             "version": "0.2.0",
@@ -259,6 +331,196 @@ class TestUpdateCliCommand(unittest.TestCase):
             code = run_update_cli([])
             self.assertEqual(code, 0)
             mock_do.assert_called_once_with(fake_release)
+
+    def test_offline_github_failure(self):
+        # Offline network failure in check_for_updates(force_network=True)
+        with mock.patch("agym.updater.fetch_latest_release", return_value=None):
+            release_info, is_newer = check_for_updates(force_network=True)
+            self.assertIsNone(release_info)
+            self.assertFalse(is_newer)
+
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                code = run_update_cli([])
+            self.assertEqual(code, 1)
+            self.assertIn("Failed to reach GitHub Releases API", err.getvalue())
+
+
+class TestBinaryVerification(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp(prefix="test_verify_")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_verify_binary_missing_or_empty(self):
+        non_existent = Path(self.temp_dir) / "agym_missing"
+        with self.assertRaises(RuntimeError) as ctx:
+            verify_binary(non_existent, "0.2.0")
+        self.assertIn("missing or empty", str(ctx.exception))
+
+        empty_file = Path(self.temp_dir) / "agym_empty"
+        empty_file.touch()
+        with self.assertRaises(RuntimeError) as ctx:
+            verify_binary(empty_file, "0.2.0")
+        self.assertIn("missing or empty", str(ctx.exception))
+
+    def test_verify_binary_execution_failure(self):
+        binary = Path(self.temp_dir) / "agym_mock"
+        binary.write_text("#!/bin/sh\nexit 1\n")
+        completed = mock.MagicMock(returncode=127, stdout="", stderr="command failed")
+        with mock.patch("agym.updater.subprocess.run", return_value=completed):
+            with self.assertRaises(RuntimeError) as ctx:
+                verify_binary(binary, "0.2.0")
+            self.assertIn("exit code 127", str(ctx.exception))
+
+    def test_verify_binary_version_mismatch(self):
+        binary = Path(self.temp_dir) / "agym_mock"
+        binary.write_text("#!/bin/sh\n")
+        completed = mock.MagicMock(returncode=0, stdout="0.1.9\n", stderr="")
+        with mock.patch("agym.updater.subprocess.run", return_value=completed):
+            with self.assertRaises(RuntimeError) as ctx:
+                verify_binary(binary, "0.2.0")
+            self.assertIn("version mismatch", str(ctx.exception))
+
+    def test_verify_binary_success(self):
+        binary = Path(self.temp_dir) / "agym_mock"
+        binary.write_text("#!/bin/sh\n")
+        completed = mock.MagicMock(returncode=0, stdout="0.2.0\n", stderr="")
+        with mock.patch("agym.updater.subprocess.run", return_value=completed):
+            # Should not raise
+            verify_binary(binary, "0.2.0")
+            verify_binary(binary, "v0.2.0")
+
+
+class TestBinaryReplacementRollback(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp(prefix="test_replace_")
+        self.current_exe = Path(self.temp_dir) / "agym"
+        self.new_exe = Path(self.temp_dir) / "agym.new"
+        self.old_exe = Path(self.temp_dir) / "agym.old"
+        self.current_exe.write_text("ORIGINAL_BINARY_CONTENT")
+        self.new_exe.write_text("NEW_BINARY_CONTENT")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_posix_replacement_success(self):
+        safe_replace_posix(self.current_exe, self.new_exe)
+        # current_exe now has new content
+        self.assertEqual(self.current_exe.read_text(), "NEW_BINARY_CONTENT")
+        # agym.new and agym.old are gone
+        self.assertFalse(self.new_exe.exists())
+        self.assertFalse(self.current_exe.with_name("agym.old").exists())
+
+    def test_failed_binary_replacement_rollback(self):
+        orig_rename = Path.rename
+        call_count = [0]
+
+        def mock_rename(target, *args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 2:
+                # Fail on Step 2 (moving agym.new -> agym)
+                raise OSError("Simulated disk error during replacement")
+            # Step 1 (agym -> agym.old) and Step 3 (rollback agym.old -> agym) succeed
+            # In unittest mock, call the unpatched orig_rename
+            return orig_rename(self.old_exe if call_count[0] == 3 else self.current_exe, target)
+
+        with mock.patch.object(Path, "rename", side_effect=mock_rename):
+            with self.assertRaises(RuntimeError) as ctx:
+                safe_replace_posix(self.current_exe, self.new_exe)
+
+            self.assertIn("Restored original executable", str(ctx.exception))
+
+        # Verification: original binary was restored via rollback!
+        self.assertTrue(self.current_exe.exists())
+        self.assertEqual(self.current_exe.read_text(), "ORIGINAL_BINARY_CONTENT")
+
+
+class TestWindowsDeferredReplacement(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp(prefix="test_win_")
+        self.current_exe = Path(self.temp_dir) / "agym.exe"
+        self.new_exe = Path(self.temp_dir) / "agym.exe.new"
+        self.old_exe = Path(self.temp_dir) / "agym.exe.old"
+        self.current_exe.write_text("WIN_ORIGINAL")
+        self.new_exe.write_text("WIN_NEW")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_windows_deferred_replacement_spawns_helper_and_exits(self):
+        with mock.patch("agym.updater.subprocess.Popen") as mock_popen, \
+             mock.patch("sys.exit") as mock_exit:
+            spawn_windows_deferred_replacement(
+                self.current_exe,
+                self.new_exe,
+                self.old_exe,
+                pid=12345,
+            )
+
+            mock_popen.assert_called_once()
+            args, kwargs = mock_popen.call_args
+            cmd = args[0]
+            self.assertEqual(cmd[0], "cmd.exe")
+            self.assertEqual(cmd[1], "/c")
+            bat_path = Path(cmd[2])
+            self.assertTrue(bat_path.exists())
+
+            bat_content = bat_path.read_text()
+            self.assertIn("set PID=12345", bat_content)
+            self.assertIn(str(self.current_exe), bat_content)
+            self.assertIn(str(self.old_exe), bat_content)
+            self.assertIn(str(self.new_exe), bat_content)
+            self.assertIn("move /y", bat_content)
+
+            mock_exit.assert_called_once_with(0)
+
+            # Cleanup helper script
+            try:
+                bat_path.unlink()
+            except OSError:
+                pass
+
+
+class TestPythonWheelUpdate(unittest.TestCase):
+    def test_python_wheel_update_success(self):
+        proc = mock.MagicMock(returncode=0)
+        with mock.patch("agym.updater.subprocess.run", return_value=proc) as mock_run, \
+             mock.patch("agym.updater.shutil.which", return_value=None):
+            execute_python_update("https://github.com/example/agym-0.2.0-py3-none-any.whl")
+            mock_run.assert_called_once()
+            cmd = mock_run.call_args[0][0]
+            self.assertEqual(cmd[0], sys.executable)
+            self.assertEqual(cmd[1:4], ["-m", "pip", "install"])
+            self.assertIn("--upgrade", cmd)
+            self.assertEqual(cmd[-1], "https://github.com/example/agym-0.2.0-py3-none-any.whl")
+
+    def test_python_wheel_update_no_wheel_raises_error(self):
+        # Must NOT install from main / git repository if wheel is missing
+        with mock.patch("agym.updater.subprocess.run") as mock_run:
+            with self.assertRaises(RuntimeError) as ctx:
+                execute_python_update(None)
+            self.assertIn("No wheel (.whl) asset found", str(ctx.exception))
+            mock_run.assert_not_called()
+
+    def test_python_wheel_update_pip_failure(self):
+        proc = mock.MagicMock(returncode=1)
+        with mock.patch("agym.updater.subprocess.run", return_value=proc), \
+             mock.patch("agym.updater.shutil.which", return_value=None):
+            with self.assertRaises(RuntimeError) as ctx:
+                execute_python_update("https://example/agym.whl")
+            self.assertIn("failed with exit code 1", str(ctx.exception))
+
+    def test_python_pipx_update_success(self):
+        proc = mock.MagicMock(returncode=0)
+        with mock.patch("agym.updater.subprocess.run", return_value=proc) as mock_run, \
+             mock.patch("agym.updater.shutil.which", return_value="/usr/bin/pipx"), \
+             mock.patch.object(sys, "prefix", "/home/user/.local/pipx/venvs/agym"):
+            execute_python_update("https://github.com/example/agym-0.2.0-py3-none-any.whl")
+            mock_run.assert_called_once_with([
+                "/usr/bin/pipx", "install", "--force", "https://github.com/example/agym-0.2.0-py3-none-any.whl"
+            ])
 
 
 class TestCliIntegration(unittest.TestCase):

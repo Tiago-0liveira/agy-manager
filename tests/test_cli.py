@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 os.environ["AGYM_DISABLE_WINCRED"] = "1"
+os.environ["AGYM_NO_UPDATE_CHECK"] = "1"
 import tempfile
 import unittest
 from pathlib import Path
