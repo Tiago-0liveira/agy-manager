@@ -12,8 +12,49 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  merged_pr:
+    name: Confirm main push came from a merged PR
+    runs-on: ubuntu-latest
+    outputs:
+      merged: ${{ steps.check.outputs.merged }}
+    steps:
+      - name: Check merged PR association
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import time
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          sha = os.environ["GITHUB_SHA"]
+          merged = False
+          for attempt in range(5):
+              prs = json.loads(subprocess.check_output(
+                  ["gh", "api", f"repos/{repo}/commits/{sha}/pulls"], text=True
+              ))
+              merged = any(
+                  pr.get("merged_at")
+                  and pr.get("merge_commit_sha") == sha
+                  and pr.get("base", {}).get("ref") == "main"
+                  for pr in prs
+              )
+              if merged:
+                  break
+              if attempt < 4:
+                  time.sleep(3)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"merged={str(merged).lower()}\n")
+          print(f"Merged PR commit: {merged}")
+          PY
+
   version:
     name: Reconcile Release Version
+    needs: merged_pr
+    if: needs.merged_pr.outputs.merged == 'true'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version_step.outputs.version }}

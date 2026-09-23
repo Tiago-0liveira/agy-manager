@@ -483,7 +483,7 @@ class LauncherTests(unittest.TestCase):
             "sys.stdout.buffer.write('Plan: \u2014 \U0001f680 '.encode('utf-8') + b'\\x81\\n'); "
             "sys.stdout.buffer.flush()"
         )
-        res = run_agy_capture(Path(sys.executable), {}, ["-c", script])
+        res = run_agy_capture(Path(sys.executable), os.environ, ["-c", script])
         self.assertEqual(res.returncode, 0)
         self.assertIn("Plan: — 🚀", res.stdout)
         self.assertIn("\ufffd", res.stdout)
