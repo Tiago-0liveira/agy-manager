@@ -37,12 +37,14 @@ case "${OS}" in
     ;;
 esac
 
-# 1. Attempt Standalone Binary Download from Latest GitHub Release
+# 1. Read the latest release once, then choose a compatible binary or wheel.
+API_URL="https://api.github.com/repos/${REPO}/releases/latest"
+RELEASE_JSON=$(curl -fsSL -H "User-Agent: agym-installer-sh" "${API_URL}" 2>/dev/null || true)
+LATEST_TAG=$(printf '%s\n' "${RELEASE_JSON}" | grep '"tag_name"' | head -n 1 | cut -d '"' -f 4 || true)
+WHEEL_URL=$(printf '%s\n' "${RELEASE_JSON}" | grep '"browser_download_url".*\.whl"' | head -n 1 | cut -d '"' -f 4 || true)
 if [ -n "${TARGET_ASSET}" ]; then
-  echo "Checking latest release on GitHub for standalone binary (${TARGET_ASSET})..."
-  API_URL="https://api.github.com/repos/${REPO}/releases/latest"
-  DOWNLOAD_URL=$(curl -sSL -H "User-Agent: agym-installer-sh" "${API_URL}" 2>/dev/null | \
-    grep "browser_download_url.*${TARGET_ASSET}" | cut -d '"' -f 4 | head -n 1 || true)
+  echo "Checking latest release for standalone binary (${TARGET_ASSET})..."
+  DOWNLOAD_URL=$(printf '%s\n' "${RELEASE_JSON}" | grep "\"browser_download_url\".*/${TARGET_ASSET}\"" | head -n 1 | cut -d '"' -f 4 || true)
 
   if [ -n "${DOWNLOAD_URL}" ]; then
     echo "Found standalone binary. Downloading..."
@@ -91,8 +93,16 @@ if [ "${INSTALLED}" -eq 0 ]; then
   VENV_PIP="${VENV_DIR}/bin/pip"
   VENV_AGYM="${VENV_DIR}/bin/agym"
 
-  echo "Installing agym from GitHub..."
-  "${VENV_PIP}" install --upgrade "git+https://github.com/${REPO}.git"
+  if [ -n "${WHEEL_URL}" ]; then
+    echo "Installing release wheel..."
+    "${VENV_PIP}" install --upgrade "${WHEEL_URL}"
+  elif [ -n "${LATEST_TAG}" ]; then
+    echo "Installing release tag ${LATEST_TAG}..."
+    "${VENV_PIP}" install --upgrade "git+https://github.com/${REPO}.git@${LATEST_TAG}"
+  else
+    echo "Installing agym from GitHub..."
+    "${VENV_PIP}" install --upgrade "git+https://github.com/${REPO}.git"
+  fi
 
   ln -sf "${VENV_AGYM}" "${EXE_PATH}"
   chmod +x "${EXE_PATH}"

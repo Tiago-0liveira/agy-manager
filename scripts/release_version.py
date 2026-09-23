@@ -13,6 +13,7 @@ Determines the target release version for pushes to main:
 from __future__ import annotations
 
 import json
+import argparse
 import os
 import re
 import sys
@@ -124,7 +125,14 @@ def update_source_version(root_dir: Path, new_version: str) -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--set-version", metavar="VERSION", help="Write an already reconciled version into source files")
+    args = parser.parse_args()
     repo_root = Path(__file__).resolve().parent.parent
+    if args.set_version:
+        parse_semver(args.set_version)
+        update_source_version(repo_root, args.set_version)
+        return 0
     base_version = get_local_version(repo_root)
 
     repo_slug = os.environ.get("GITHUB_REPOSITORY", "Tiago-0liveira/agy-manager")

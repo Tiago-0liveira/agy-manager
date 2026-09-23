@@ -405,13 +405,13 @@ class InstallationAndSyncTests(unittest.TestCase):
         self.assertFalse(updated2)
 
     def test_resolve_python_executable_windows_gui(self) -> None:
-        with patch("sys.platform", "win32"), patch("os.name", "nt"):
+        with patch("sys.platform", "win32"):
             with patch("pathlib.Path.is_file", return_value=True):
                 resolved = resolve_python_executable(gui=True)
                 self.assertEqual(resolved.name.lower(), "pythonw.exe")
 
     def test_resolve_python_executable_windows_console(self) -> None:
-        with patch("sys.platform", "win32"), patch("os.name", "nt"):
+        with patch("sys.platform", "win32"):
             resolved = resolve_python_executable(gui=False)
             self.assertEqual(resolved, Path(sys.executable).resolve())
 
@@ -468,6 +468,13 @@ class InstallationAndSyncTests(unittest.TestCase):
             py_script = self.data_root / "bin" / "statusline.py"
             self.assertTrue(py_script.is_file())
             self.assertIn("from agym.statusline import main", py_script.read_text())
+
+    def test_frozen_statusline_script_calls_binary(self) -> None:
+        with patch.object(sys, "frozen", True, create=True):
+            script_path = install_statusline_script(self.data_root)
+        content = script_path.read_text()
+        self.assertIn("--statusline-render", content)
+        self.assertIn(sys.executable, content)
 
     def test_detect_profile_escape_roots_windows(self) -> None:
         from agym.profiles import _detect_profile_escape_roots
@@ -815,4 +822,3 @@ class StatuslineVCSTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

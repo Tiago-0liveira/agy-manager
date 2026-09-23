@@ -1023,6 +1023,13 @@ def main(argv: list[str] | None = None) -> int:
                     pass
 
     args = list(sys.argv[1:] if argv is None else argv)
+    if args == ["--version"]:
+        from . import __version__
+        print(__version__)
+        return 0
+    if args == ["--statusline-render"]:
+        from .statusline import main as render_statusline_main
+        return render_statusline_main()
     if not args or args[0] in {"-h", "--help", "help"}:
         print(USAGE.rstrip())
         return 0 if args else 2

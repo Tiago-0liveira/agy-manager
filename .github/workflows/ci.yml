@@ -1,12 +1,12 @@
 name: CI Test Suite
 
 on:
-  push:
-    branches-ignore:
-      - main
   pull_request:
-    branches:
-      - main
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -27,6 +27,46 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Run Core Test Suite (Zero Dependencies)
+      - name: Install test parser for Python 3.10
+        run: python -m pip install "tomli; python_version < '3.11'"
+
+      - name: Run core and distribution tests
+        run: >-
+          python -m unittest
+          tests.test_auto_pr tests.test_cache tests.test_cli tests.test_diagnostics
+          tests.test_host_safety tests.test_launcher tests.test_picker tests.test_profiles
+          tests.test_quota_api tests.test_rotator tests.test_statusline tests.test_subscription
+          tests.test_tokens tests.test_usage tests.test_updater tests.test_wincred
+          tests.council.test_packaging tests.test_release_version
+
+  package:
+    name: Package smoke test (${{ matrix.os }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build standalone executable
         run: |
-          python -m unittest tests/test_auto_pr.py tests/test_cache.py tests/test_cli.py tests/test_diagnostics.py tests/test_host_safety.py tests/test_launcher.py tests/test_picker.py tests/test_profiles.py tests/test_quota_api.py tests/test_rotator.py tests/test_statusline.py tests/test_subscription.py tests/test_tokens.py tests/test_usage.py tests/test_wincred.py tests/council/test_packaging.py
+          python -m pip install pyinstaller
+          python -m PyInstaller --onefile --name agym --clean --paths . --collect-data agym scripts/agym_entry.py
+      - name: Smoke test executable
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then executable=./dist/agym.exe; else executable=./dist/agym; fi
+          "$executable" --help
+          test "$("$executable" --version)" = "$(python -c 'import agym; print(agym.__version__)')"
+          printf '{}' | "$executable" --statusline-render
+      - name: Build and inspect Python distributions
+        if: runner.os == 'Linux'
+        run: |
+          python -m pip install build
+          python -m build
+          python -m pip install --force-reinstall dist/*.whl
+          python -m agym --version

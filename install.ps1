@@ -28,7 +28,7 @@ try {
     $Release = Invoke-RestMethod -Uri $ApiUrl -Headers $Headers -TimeoutSec 15
     $Version = $Release.tag_name
 
-    $Asset = $Release.assets | Where-Object { $_.name -like "*windows-amd64*.exe" -or $_.name -eq "agym.exe" } | Select-Object -First 1
+    $Asset = $Release.assets | Where-Object { $env:PROCESSOR_ARCHITECTURE -eq "AMD64" -and $_.name -eq "agym-windows-amd64.exe" } | Select-Object -First 1
 
     if ($Asset) {
         Write-Host "Found standalone binary $Version ($($Asset.name)). Downloading..." -ForegroundColor Green
@@ -81,8 +81,18 @@ if (-not $Installed) {
     $VenvPip = Join-Path $VenvDir "Scripts\pip.exe"
     $VenvAgym = Join-Path $VenvDir "Scripts\agym.exe"
 
-    Write-Host "Installing agym from GitHub..." -ForegroundColor Yellow
-    & $VenvPip install --upgrade "git+https://github.com/$Repo.git"
+    $Wheel = $Release.assets | Where-Object { $_.name -like "*.whl" } | Select-Object -First 1
+    if ($Wheel) {
+        Write-Host "Installing release wheel..." -ForegroundColor Yellow
+        & $VenvPip install --upgrade $Wheel.browser_download_url
+    } elseif ($Version) {
+        Write-Host "Installing release tag $Version..." -ForegroundColor Yellow
+        & $VenvPip install --upgrade "git+https://github.com/$Repo.git@$Version"
+    } else {
+        Write-Host "Installing agym from GitHub..." -ForegroundColor Yellow
+        & $VenvPip install --upgrade "git+https://github.com/$Repo.git"
+    }
+    if ($LASTEXITCODE -ne 0) { throw "agym package installation failed" }
 
     # Create wrapper cmd in BinDir
     $CmdWrapper = Join-Path $BinDir "agym.cmd"

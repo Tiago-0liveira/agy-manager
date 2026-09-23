@@ -33,6 +33,25 @@ from agym.updater import (
 
 
 class TestUpdaterVersionLogic(unittest.TestCase):
+    def test_release_asset_matches_platform_architecture(self):
+        release = {
+            "tag_name": "v0.2.0",
+            "assets": [
+                {"name": "agym-darwin-arm64", "browser_download_url": "https://example/arm"},
+                {"name": "agym-linux-amd64", "browser_download_url": "https://example/linux"},
+                {"name": "agym-0.2.0-py3-none-any.whl", "browser_download_url": "https://example/wheel"},
+            ],
+        }
+        response = mock.MagicMock()
+        response.read.return_value = json.dumps(release).encode()
+        response.__enter__.return_value = response
+        with mock.patch("agym.updater.urllib.request.urlopen", return_value=response), \
+             mock.patch("agym.updater.platform.system", return_value="Darwin"), \
+             mock.patch("agym.updater.platform.machine", return_value="x86_64"):
+            info = fetch_latest_release()
+        self.assertEqual(info["standalone_url"], "")
+        self.assertEqual(info["wheel_url"], "https://example/wheel")
+
     def test_parse_semver_standard(self):
         self.assertEqual(parse_semver("0.1.0"), (0, 1, 0))
         self.assertEqual(parse_semver("v1.2.3"), (1, 2, 3))

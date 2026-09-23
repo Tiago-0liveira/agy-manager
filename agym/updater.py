@@ -132,27 +132,15 @@ def fetch_latest_release(
             sys_name = platform.system().lower()
             machine = platform.machine().lower()
 
-            if sys_name == "windows":
-                for name, d_url in asset_map.items():
-                    if "windows" in name.lower() and name.endswith(".exe"):
-                        standalone_url = d_url
-                        break
+            if sys_name == "windows" and machine in {"amd64", "x86_64"}:
+                standalone_url = asset_map.get("agym-windows-amd64.exe", "")
             elif sys_name == "darwin":
                 if "arm" in machine or "aarch" in machine:
-                    for name, d_url in asset_map.items():
-                        if "darwin-arm64" in name or "macos-arm64" in name:
-                            standalone_url = d_url
-                            break
-                if not standalone_url:
-                    for name, d_url in asset_map.items():
-                        if "darwin" in name or "macos" in name:
-                            standalone_url = d_url
-                            break
-            elif sys_name == "linux":
-                for name, d_url in asset_map.items():
-                    if "linux" in name.lower():
-                        standalone_url = d_url
-                        break
+                    standalone_url = asset_map.get("agym-darwin-arm64", "")
+                elif machine in {"amd64", "x86_64"}:
+                    standalone_url = asset_map.get("agym-darwin-amd64", "")
+            elif sys_name == "linux" and machine in {"amd64", "x86_64"}:
+                standalone_url = asset_map.get("agym-linux-amd64", "")
 
             return {
                 "tag": tag,
@@ -334,8 +322,8 @@ def do_update(release_info: dict[str, Any] | None = None) -> int:
     try:
         if is_frozen and standalone_url:
             execute_binary_update(standalone_url)
-        elif standalone_url and Path(sys.executable).name.lower() in {"agym.exe", "agym"}:
-            execute_binary_update(standalone_url)
+        elif is_frozen:
+            raise RuntimeError("No standalone update is available for this platform")
         else:
             execute_python_update(release_info.get("wheel_url"))
         print(f"agym has been updated to version {target_ver}!")
