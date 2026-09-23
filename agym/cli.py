@@ -40,6 +40,12 @@ from .tokens import run_tokens
 from .updater import maybe_prompt_startup_update, run_update_cli
 from .usage import fetch_and_cache_usage, run_usage
 from .wincred import get_profile_email
+from .orchestration.contracts import RunId, RunMode, RunState, RunStatus
+from .orchestration.ui import format_duration
+from .orchestration.wiring import (
+    OrchestrationDependencies,
+    build_orchestration_dependencies,
+)
 
 USAGE = """agym — Explicit isolated-profile manager for Google Antigravity CLI
 
@@ -48,6 +54,9 @@ Usage:
   agym <profile> [--] [agy args...]
   agym <profile> --auto-prompt "<prompt>"
   agym <profile> --auto-pr [-b <branch>] [--title <title>] [--body <body>] [--draft] [--no-push]
+  agym orchestrate "<task>" [--mode plan|implement] [--dry-run]
+  agym orchestrate status <run-id>
+  agym orchestrate resume <run-id>
   agym select [-f|--fresh] [-- [agy args...]]
   agym rotate [--file <file>] [--status] [--reset] [--simulate [N]] [-- [agy args...]]
   agym config <profile> [--model <model>|default] [-y|--dsp|--skip-perms|--[no-]dangerously-skip-permissions]
@@ -55,6 +64,7 @@ Usage:
 
 Commands:
   setup <profile>                     Create a new profile and complete Google sign-in
+  orchestrate <task>                  Orchestrate multi-agent reasoning or implementation
   config <profile>                    Configure profile model and permission settings
   edit <profile>                      Edit profile settings (e.g. subscription renewal date, rename)
   rename <profile> <new-name>         Rename a profile and its isolated directory (alias: mv)
@@ -152,9 +162,17 @@ Command Options:
       --no-push                       Skip pushing current branch to origin before PR creation
       -n, --dry-run                   Preview PR creation without pushing or creating a PR
 
+  agym orchestrate "<task>" [--mode {plan,implement}] [-n, --dry-run]
+      --mode {plan,implement}         Operating mode: plan (default) or implement
+      -n, --dry-run                   Preview execution plan without worker execution
+  agym orchestrate status <run-id>    Show status and progress of an orchestration run
+  agym orchestrate resume <run-id>    Resume an interrupted or failed orchestration run
+
 Examples:
   agym setup personal                 Create profile and authenticate with Google
   agym setup work -s 14/03/2027       Create profile with known subscription renewal date
+  agym orchestrate "Refactor auth"    Plan orchestration for a task
+  agym orchestrate status run-123     Check status of a run
   agym select                         Interactively pick an account based on quota health
   agym select -f                      Force live refresh of quotas before selection
   agym personal                       Open an interactive Antigravity session
@@ -1013,6 +1031,204 @@ def _launch(profile_name: str, argv: list[str], store: ProfileStore) -> int:
     return run_agy(agy, profile, argv, replace_process=True)
 
 
+ORCHESTRATE_USAGE = """agym orchestrate — Multi-agent orchestration for Google Antigravity CLI
+
+Usage:
+  agym orchestrate "<task>" [--mode plan|implement] [--dry-run]
+  agym orchestrate status <run-id>
+  agym orchestrate resume <run-id>
+
+Options:
+  --mode {plan,implement}   Operating mode: plan (default) or implement
+  -n, --dry-run             Preview execution plan without worker execution
+  -h, --help                Show this help message and exit
+
+Commands:
+  status <run-id>           Display status of a run from persisted state
+  resume <run-id>           Resume an interrupted or failed run
+"""
+
+
+def _format_run_status(state: RunState, results: Sequence[Any] | None = None) -> str:
+    lines = [
+        f"Run ID:        {state.run_id}",
+        f"Status:        {state.status.value}",
+        f"Mode:          {state.mode.value}",
+        f"Task:          {state.task}",
+        f"Rounds:        {state.round_number}",
+        f"Invocations:   {state.budget_usage.invocations}",
+        f"Runtime:       {format_duration(state.budget_usage.runtime_seconds) if state.budget_usage.runtime_seconds else '0s'}",
+    ]
+    if state.created_at:
+        lines.append(f"Created:       {state.created_at}")
+    if state.updated_at:
+        lines.append(f"Updated:       {state.updated_at}")
+    if state.assessment:
+        lines.append(f"Complexity:    {state.assessment.complexity.value}")
+    if results:
+        lines.append(f"Results ({len(results)}):")
+        for r in results:
+            wid = getattr(r, "worker_id", "unknown")
+            role = getattr(r, "role", "")
+            r_val = role.value if hasattr(role, "value") else str(role)
+            st = getattr(r, "status", "")
+            st_val = st.value if hasattr(st, "value") else str(st)
+            lines.append(f"  - [{wid}] {r_val}: {st_val}")
+    if state.final_result:
+        lines.append("")
+        lines.append("Final Result:")
+        lines.append(state.final_result)
+    return "\n".join(lines)
+
+
+def _orchestrate(
+    argv: list[str],
+    store: ProfileStore,
+    *,
+    deps: OrchestrationDependencies | None = None,
+) -> int:
+    if any(arg in {"-h", "--help", "help"} for arg in argv):
+        print(ORCHESTRATE_USAGE.rstrip())
+        return 0
+
+    if not argv:
+        _print_err("orchestrate requires a task or subcommand (status, resume)")
+        return 2
+
+    subcommand = argv[0]
+
+    # Subcommand: status
+    if subcommand == "status":
+        if len(argv) < 2 or not argv[1].strip():
+            _print_err("missing run ID for status")
+            return 2
+        if len(argv) > 2:
+            _print_err("status takes exactly one run ID")
+            return 2
+        run_id = argv[1].strip()
+        d = deps or build_orchestration_dependencies(profile_store=store)
+        state = d.run_store.get_run(RunId(run_id))
+        if state is None:
+            _print_err(f"run not found: {run_id}")
+            return 1
+        results = (
+            d.run_store.get_results(RunId(run_id))
+            if hasattr(d.run_store, "get_results")
+            else None
+        )
+        print(_format_run_status(state, results))
+        return 0
+
+    # Subcommand: resume
+    if subcommand == "resume":
+        if len(argv) < 2 or not argv[1].strip():
+            _print_err("missing run ID for resume")
+            return 2
+        if len(argv) > 2:
+            _print_err("resume takes exactly one run ID")
+            return 2
+        run_id = argv[1].strip()
+        d = deps or build_orchestration_dependencies(profile_store=store)
+        try:
+            state = d.engine.resume(RunId(run_id))
+            if state.status == RunStatus.COMPLETED:
+                return 0
+            if state.status == RunStatus.INTERRUPTED:
+                _print_err("interrupted")
+                return 130
+            return 1
+        except KeyboardInterrupt:
+            _print_err("interrupted")
+            return 130
+        except Exception as exc:
+            _print_err(str(exc))
+            return 1
+
+    # Check for unrecognized subcommand
+    KNOWN_SUBCOMMANDS = {"status", "resume", "run"}
+    UNKNOWN_SUBCOMMANDS = {
+        "cancel",
+        "stop",
+        "kill",
+        "inspect",
+        "info",
+        "show",
+        "list",
+        "delete",
+        "remove",
+        "get",
+        "unknown",
+        "invalid",
+        "unknown-subcommand",
+        "badsubcommand",
+    }
+    if subcommand in UNKNOWN_SUBCOMMANDS:
+        _print_err(f"unknown subcommand: '{subcommand}'")
+        return 2
+
+    if (
+        len(argv) >= 2
+        and argv[0] not in KNOWN_SUBCOMMANDS
+        and not argv[0].startswith("-")
+        and not argv[1].startswith("-")
+    ):
+        _print_err(f"unknown subcommand: '{argv[0]}'")
+        return 2
+
+    # Task execution
+    args_to_parse = argv[1:] if subcommand == "run" else argv
+    parser = argparse.ArgumentParser(prog="agym orchestrate", add_help=False)
+    parser.add_argument("task", nargs="?", default=None)
+    parser.add_argument(
+        "--mode",
+        dest="mode",
+        default="plan",
+        choices=["plan", "implement"],
+        type=str.lower,
+    )
+    parser.add_argument("-n", "--dry-run", dest="dry_run", action="store_true")
+
+    try:
+        ns = parser.parse_args(args_to_parse)
+    except SystemExit:
+        return 2
+
+    if not ns.task or not ns.task.strip():
+        _print_err("a task is required")
+        return 2
+
+    task = ns.task.strip()
+    run_mode = RunMode.IMPLEMENT if ns.mode == "implement" else RunMode.PLAN
+    d = deps or build_orchestration_dependencies(profile_store=store)
+
+    if ns.dry_run:
+        try:
+            plan = d.engine.dry_run(task, mode=run_mode)
+            print(plan.format_display())
+            return 0 if plan.is_valid else 1
+        except KeyboardInterrupt:
+            _print_err("interrupted")
+            return 130
+        except Exception as exc:
+            _print_err(str(exc))
+            return 1
+
+    try:
+        state = d.engine.run(task, mode=run_mode)
+        if state.status == RunStatus.COMPLETED:
+            return 0
+        if state.status == RunStatus.INTERRUPTED:
+            _print_err("interrupted")
+            return 130
+        return 1
+    except KeyboardInterrupt:
+        _print_err("interrupted")
+        return 130
+    except Exception as exc:
+        _print_err(str(exc))
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     if sys.platform == "win32":
         for stream in (sys.stdout, sys.stderr):
@@ -1072,6 +1288,8 @@ def main(argv: list[str] | None = None) -> int:
             return _doctor(rest, store)
         if command in {"auto-pr", "--auto-pr"}:
             return _auto_pr(rest, store)
+        if command == "orchestrate":
+            return _orchestrate(rest, store)
         return _launch(command, rest, store)
     except (InvalidProfileName, ProfileExists, ProfileNotFound, ProfileError, AgyNotFound, SubscriptionError, AutoPrError) as exc:
         _print_err(str(exc))

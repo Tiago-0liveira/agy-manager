@@ -11,6 +11,16 @@ from unittest import mock
 
 from agym import cli
 from agym.profiles import ProfileStore
+from agym.orchestration.contracts import (
+    BudgetUsage,
+    OrchestrationBudget,
+    RunId,
+    RunMode,
+    RunState,
+    RunStatus,
+)
+from agym.orchestration.engine import DryRunPlan
+from agym.orchestration.wiring import OrchestrationDependencies
 
 
 class CliTests(unittest.TestCase):
@@ -474,3 +484,364 @@ class CliTests(unittest.TestCase):
             p = store.get("AI2")
             self.assertEqual(p.name, "AI2")
             self.assertEqual(p.subscription_date, "2027-03-14")
+
+
+class OrchestrateCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.store = ProfileStore(self.root / "config", self.root / "data")
+        self.store.create("test-prof")
+
+        self.mock_engine = mock.MagicMock()
+        self.mock_store = mock.MagicMock()
+        self.mock_runner = mock.MagicMock()
+        self.mock_coord = mock.MagicMock()
+        self.mock_sink = mock.MagicMock()
+        self.mock_sched = mock.MagicMock()
+        self.mock_lease = mock.MagicMock()
+        self.mock_cache = mock.MagicMock()
+
+        self.deps = OrchestrationDependencies(
+            profile_store=self.store,
+            cache_manager=self.mock_cache,
+            lease_manager=self.mock_lease,
+            scheduler=self.mock_sched,
+            run_store=self.mock_store,
+            runner=self.mock_runner,
+            coordinator=self.mock_coord,
+            event_sink=self.mock_sink,
+            engine=self.mock_engine,
+            budget=OrchestrationBudget(),
+        )
+
+        self.default_state = RunState(
+            run_id=RunId("run-test-1"),
+            task="Default task",
+            mode=RunMode.PLAN,
+            status=RunStatus.COMPLETED,
+            budget_usage=BudgetUsage(invocations=3, rounds=2, runtime_seconds=12.5),
+            final_result="Plan created successfully",
+        )
+        self.mock_engine.run.return_value = self.default_state
+        self.mock_engine.resume.return_value = self.default_state
+
+        self.default_plan = DryRunPlan(
+            run_id=RunId("dry-test-1"),
+            task="Dry run task",
+            mode=RunMode.PLAN,
+            is_valid=True,
+        )
+        self.mock_engine.dry_run.return_value = self.default_plan
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    @mock.patch("agym.cli.run_agy")
+    @mock.patch("agym.cli.resolve_agy")
+    @mock.patch("agym.cli.build_orchestration_dependencies")
+    def test_orchestrate_dispatch(
+        self,
+        mock_build: mock.Mock,
+        mock_resolve: mock.Mock,
+        mock_run_agy: mock.Mock,
+    ) -> None:
+        mock_build.return_value = self.deps
+        code = cli.main(["orchestrate", "Analyze architecture"])
+        self.assertEqual(code, 0)
+        self.mock_engine.run.assert_called_once_with("Analyze architecture", mode=RunMode.PLAN)
+        mock_run_agy.assert_not_called()
+        mock_resolve.assert_not_called()
+
+    @mock.patch("agym.cli.build_orchestration_dependencies")
+    def test_orchestrate_task_parsing_default_plan(self, mock_build: mock.Mock) -> None:
+        mock_build.return_value = self.deps
+        code = cli.main(["orchestrate", "Build auth module"])
+        self.assertEqual(code, 0)
+        self.mock_engine.run.assert_called_once_with("Build auth module", mode=RunMode.PLAN)
+
+    @mock.patch("agym.cli.build_orchestration_dependencies")
+    def test_orchestrate_plan_mode_explicit(self, mock_build: mock.Mock) -> None:
+        mock_build.return_value = self.deps
+        code = cli.main(["orchestrate", "Review tests", "--mode", "plan"])
+        self.assertEqual(code, 0)
+        self.mock_engine.run.assert_called_once_with("Review tests", mode=RunMode.PLAN)
+
+    @mock.patch("agym.cli.build_orchestration_dependencies")
+    def test_orchestrate_implement_mode(self, mock_build: mock.Mock) -> None:
+        mock_build.return_value = self.deps
+        code = cli.main(["orchestrate", "Implement feature X", "--mode", "implement"])
+        self.assertEqual(code, 0)
+        self.mock_engine.run.assert_called_once_with("Implement feature X", mode=RunMode.IMPLEMENT)
+
+    @mock.patch("agym.cli.build_orchestration_dependencies")
+    def test_orchestrate_dry_run(self, mock_build: mock.Mock) -> None:
+        mock_build.return_value = self.deps
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            code = cli.main(["orchestrate", "Dry run task", "--dry-run"])
+        self.assertEqual(code, 0)
+        self.mock_engine.dry_run.assert_called_once_with("Dry run task", mode=RunMode.PLAN)
+        self.mock_engine.run.assert_not_called()
+        self.assertIn("Dry Run Plan", out.getvalue())
+
+        # Test -n shortcut and implement mode
+        self.mock_engine.dry_run.reset_mock()
+        code2 = cli.main(["orchestrate", "Dry run task 2", "-n", "--mode", "implement"])
+        self.assertEqual(code2, 0)
+        self.mock_engine.dry_run.assert_called_once_with("Dry run task 2", mode=RunMode.IMPLEMENT)
+        self.mock_engine.run.assert_not_called()
+
+    @mock.patch("agym.cli.build_orchestration_dependencies")
+    def test_orchestrate_status(self, mock_build: mock.Mock) -> None:
+        mock_build.return_value = self.deps
+        self.mock_store.get_run.return_value = self.default_state
+        self.mock_store.get_results.return_value = []
+
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            code = cli.main(["orchestrate", "status", "run-test-1"])
+        self.assertEqual(code, 0)
+        self.mock_store.get_run.assert_called_once_with(RunId("run-test-1"))
+        self.assertIn("Run ID:        run-test-1", out.getvalue())
+        self.assertIn("Status:        COMPLETED", out.getvalue())
+        self.assertIn("Task:          Default task", out.getvalue())
+        self.mock_engine.run.assert_not_called()
+        self.mock_runner.run.assert_not_called()
+
+        # Nonexistent run returns 1
+        self.mock_store.get_run.return_value = None
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            code_not_found = cli.main(["orchestrate", "status", "run-ghost"])
+        self.assertEqual(code_not_found, 1)
+        self.assertIn("run not found: run-ghost", err.getvalue())
+
+    @mock.patch("agym.cli.build_orchestration_dependencies")
+    def test_orchestrate_resume(self, mock_build: mock.Mock) -> None:
+        mock_build.return_value = self.deps
+        code = cli.main(["orchestrate", "resume", "run-test-1"])
+        self.assertEqual(code, 0)
+        self.mock_engine.resume.assert_called_once_with(RunId("run-test-1"))
+
+        # Resume resulting in interrupted returns 130
+        int_state = RunState(run_id=RunId("run-int"), task="t", status=RunStatus.INTERRUPTED)
+        self.mock_engine.resume.return_value = int_state
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            code_int = cli.main(["orchestrate", "resume", "run-int"])
+        self.assertEqual(code_int, 130)
+        self.assertIn("interrupted", err.getvalue())
+
+        # Resume resulting in failure returns 1
+        fail_state = RunState(run_id=RunId("run-fail"), task="t", status=RunStatus.FAILED)
+        self.mock_engine.resume.return_value = fail_state
+        code_fail = cli.main(["orchestrate", "resume", "run-fail"])
+        self.assertEqual(code_fail, 1)
+
+    @mock.patch("agym.cli.build_orchestration_dependencies")
+    def test_orchestrate_unknown_subcommand(self, mock_build: mock.Mock) -> None:
+        mock_build.return_value = self.deps
+        for bad_cmd in [
+            ["orchestrate", "unknown"],
+            ["orchestrate", "invalid"],
+            ["orchestrate", "unknown-subcommand", "foo"],
+            ["orchestrate", "cancel", "run-123"],
+            ["orchestrate", "inspect", "run-123"],
+            ["orchestrate", "foobar", "extra"],
+        ]:
+            err = io.StringIO()
+            with self.subTest(bad_cmd=bad_cmd), mock.patch("sys.stderr", err):
+                code = cli.main(bad_cmd)
+                self.assertEqual(code, 2)
+                self.assertIn("unknown subcommand", err.getvalue())
+
+    @mock.patch("agym.cli.build_orchestration_dependencies")
+    def test_orchestrate_missing_run_id(self, mock_build: mock.Mock) -> None:
+        mock_build.return_value = self.deps
+        for args in [
+            ["orchestrate", "status"],
+            ["orchestrate", "status", ""],
+            ["orchestrate", "status", "   "],
+            ["orchestrate", "resume"],
+            ["orchestrate", "resume", ""],
+            ["orchestrate", "resume", "   "],
+        ]:
+            err = io.StringIO()
+            with self.subTest(args=args), mock.patch("sys.stderr", err):
+                code = cli.main(args)
+                self.assertEqual(code, 2)
+                self.assertIn("run ID", err.getvalue())
+
+    @mock.patch("agym.cli.ProfileStore")
+    def test_orchestrate_reserved_profile_name(self, Store: mock.Mock) -> None:
+        Store.return_value = self.store
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            code = cli.main(["setup", "orchestrate"])
+        self.assertEqual(code, 2)
+        self.assertIn("reserved", err.getvalue())
+
+    @mock.patch("agym.cli.build_orchestration_dependencies")
+    def test_orchestrate_keyboard_interrupt(self, mock_build: mock.Mock) -> None:
+        mock_build.return_value = self.deps
+        # KeyboardInterrupt in engine.run
+        self.mock_engine.run.side_effect = KeyboardInterrupt
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            code = cli.main(["orchestrate", "task to cancel"])
+        self.assertEqual(code, 130)
+        self.assertIn("interrupted", err.getvalue())
+
+        # KeyboardInterrupt in engine.resume
+        self.mock_engine.resume.side_effect = KeyboardInterrupt
+        err2 = io.StringIO()
+        with mock.patch("sys.stderr", err2):
+            code2 = cli.main(["orchestrate", "resume", "run-123"])
+        self.assertEqual(code2, 130)
+        self.assertIn("interrupted", err2.getvalue())
+
+    @mock.patch("agym.cli.build_orchestration_dependencies")
+    def test_orchestrate_exit_codes(self, mock_build: mock.Mock) -> None:
+        mock_build.return_value = self.deps
+
+        # 0: Completed run
+        self.mock_engine.run.return_value = RunState(run_id=RunId("r1"), task="t", status=RunStatus.COMPLETED)
+        self.assertEqual(cli.main(["orchestrate", "task"]), 0)
+
+        # 1: Failed run
+        self.mock_engine.run.return_value = RunState(run_id=RunId("r2"), task="t", status=RunStatus.FAILED)
+        self.assertEqual(cli.main(["orchestrate", "task"]), 1)
+
+        # 130: Interrupted run status
+        self.mock_engine.run.return_value = RunState(run_id=RunId("r3"), task="t", status=RunStatus.INTERRUPTED)
+        self.assertEqual(cli.main(["orchestrate", "task"]), 130)
+
+        # 2: Missing task / no arguments
+        self.assertEqual(cli.main(["orchestrate"]), 2)
+
+        # 2: Invalid mode
+        self.assertEqual(cli.main(["orchestrate", "task", "--mode", "invalid_mode"]), 2)
+
+        # 2: Missing run ID
+        self.assertEqual(cli.main(["orchestrate", "status"]), 2)
+        self.assertEqual(cli.main(["orchestrate", "resume"]), 2)
+
+        # 2: Unknown subcommand
+        self.assertEqual(cli.main(["orchestrate", "badsubcommand", "foo"]), 2)
+
+        # 1: Nonexistent status run
+        self.mock_store.get_run.return_value = None
+        self.assertEqual(cli.main(["orchestrate", "status", "nonexistent-id"]), 1)
+
+        # 1: Invalid dry-run plan
+        self.mock_engine.dry_run.return_value = DryRunPlan(
+            run_id=RunId("d1"), task="t", mode=RunMode.PLAN, is_valid=False, validation_error="Capacity error"
+        )
+        self.assertEqual(cli.main(["orchestrate", "task", "--dry-run"]), 1)
+
+    def test_orchestrate_help(self) -> None:
+        for flag in ["-h", "--help"]:
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = cli.main(["orchestrate", flag])
+            self.assertEqual(code, 0)
+            self.assertIn("agym orchestrate", out.getvalue())
+            self.assertIn("Usage:", out.getvalue())
+            self.assertIn("status <run-id>", out.getvalue())
+            self.assertIn("resume <run-id>", out.getvalue())
+
+    @mock.patch("agym.cli.build_orchestration_dependencies")
+    def test_orchestrate_run_alias(self, mock_build: mock.Mock) -> None:
+        mock_build.return_value = self.deps
+        code = cli.main(["orchestrate", "run", "Refactor module"])
+        self.assertEqual(code, 0)
+        self.mock_engine.run.assert_called_once_with("Refactor module", mode=RunMode.PLAN)
+
+
+class WiringTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.store = ProfileStore(self.root / "config", self.root / "data")
+        self.store.create("p1")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_default_budget_values(self) -> None:
+        from agym.orchestration.wiring import (
+            DEFAULT_MAX_BOOST_INVOCATIONS,
+            DEFAULT_MAX_INVOCATIONS,
+            DEFAULT_MAX_PARALLEL,
+            DEFAULT_MAX_RETRIES,
+            DEFAULT_MAX_ROUNDS,
+            DEFAULT_MAX_RUNTIME_SECONDS,
+            DEFAULT_MIN_QUOTA_REMAINING_PERCENT,
+            build_default_budget,
+        )
+
+        b = build_default_budget()
+        self.assertEqual(b.max_parallel, DEFAULT_MAX_PARALLEL)
+        self.assertEqual(b.max_invocations, DEFAULT_MAX_INVOCATIONS)
+        self.assertEqual(b.max_rounds, DEFAULT_MAX_ROUNDS)
+        self.assertEqual(b.max_boost_invocations, DEFAULT_MAX_BOOST_INVOCATIONS)
+        self.assertEqual(b.max_retries, DEFAULT_MAX_RETRIES)
+        self.assertEqual(b.max_runtime_seconds, DEFAULT_MAX_RUNTIME_SECONDS)
+        self.assertEqual(b.min_quota_remaining, DEFAULT_MIN_QUOTA_REMAINING_PERCENT)
+
+    def test_build_orchestration_dependencies_defaults(self) -> None:
+        from agym.orchestration.wiring import build_orchestration_dependencies
+
+        deps = build_orchestration_dependencies(
+            profile_store=self.store,
+            stream=io.StringIO(),
+            is_tty=False,
+            use_color=False,
+        )
+        self.assertIsNotNone(deps.profile_store)
+        self.assertIsNotNone(deps.cache_manager)
+        self.assertIsNotNone(deps.lease_manager)
+        self.assertIsNotNone(deps.scheduler)
+        self.assertIsNotNone(deps.run_store)
+        self.assertIsNotNone(deps.runner)
+        self.assertIsNotNone(deps.coordinator)
+        self.assertIsNotNone(deps.event_sink)
+        self.assertIsNotNone(deps.engine)
+        self.assertIsNotNone(deps.budget)
+
+    def test_broadcast_run_store(self) -> None:
+        from agym.orchestration.contracts import EventType, OrchestrationEvent, RunId
+        from agym.orchestration.wiring import BroadcastRunStore
+
+        mock_store = mock.MagicMock()
+        mock_sink = mock.MagicMock()
+        broadcaster = BroadcastRunStore(mock_store, mock_sink)
+
+        evt = OrchestrationEvent(
+            event_id="e1",
+            run_id=RunId("r1"),
+            type=EventType.RUN_CREATED,
+        )
+        broadcaster.emit(evt)
+        mock_store.emit.assert_called_once_with(evt)
+        mock_sink.emit.assert_called_once_with(evt)
+
+        # Delegated methods
+        broadcaster.get_run(RunId("r1"))
+        mock_store.get_run.assert_called_once_with(RunId("r1"))
+
+        broadcaster.save_run(mock.MagicMock())
+        mock_store.save_run.assert_called_once()
+
+        broadcaster.list_runs()
+        mock_store.list_runs.assert_called_once()
+
+        broadcaster.save_result(RunId("r1"), mock.MagicMock())
+        mock_store.save_result.assert_called_once()
+
+        broadcaster.get_results(RunId("r1"))
+        mock_store.get_results.assert_called_once_with(RunId("r1"))
+
+        broadcaster.get_events(RunId("r1"))
+        mock_store.get_events.assert_called_once_with(RunId("r1"))

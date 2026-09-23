@@ -45,6 +45,7 @@ class ProfileTests(unittest.TestCase):
             "remove",
             "doctor",
             "config",
+            "orchestrate",
         ]:
             with self.subTest(bad=bad), self.assertRaises(InvalidProfileName):
                 validate_profile_name(bad)
@@ -99,7 +100,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(p.settings.validation_errors, ())
 
     def test_reserved_profile_names(self) -> None:
-        for reserved in ["setup", "list", "remove", "doctor", "usage", "edit", "help", "rotate", "rename", "mv"]:
+        for reserved in ["setup", "list", "remove", "doctor", "usage", "edit", "help", "rotate", "rename", "mv", "orchestrate"]:
             with self.subTest(reserved=reserved), self.assertRaises(InvalidProfileName):
                 validate_profile_name(reserved)
 
@@ -280,7 +281,7 @@ class ProfileTests(unittest.TestCase):
 
     def test_rename_invalid_names(self) -> None:
         self.store.create("prof1")
-        for bad in ["bad name", "setup", "list", "rename", "mv", "..", ""]:
+        for bad in ["bad name", "setup", "list", "rename", "mv", "..", "", "orchestrate"]:
             with self.subTest(bad=bad), self.assertRaises(InvalidProfileName):
                 self.store.rename("prof1", bad)
 
