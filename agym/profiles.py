@@ -8,6 +8,7 @@ import shutil
 import stat
 import tempfile
 import threading
+import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -37,6 +38,8 @@ RESERVED_NAMES = {
     "rename",
     "mv",
     "auto-pr",
+    "all",
+    "smartrename",
     "update",
 }
 
@@ -521,6 +524,67 @@ class ProfileStore:
     def profile_dir(self, name: str) -> Path:
         validate_profile_name(name)
         return self.profiles_root / name
+
+
+    def smart_rename(self, mode: str) -> list[tuple[str, str]]:
+        normalized_mode = mode.strip().lower()
+        if normalized_mode not in {"num", "letter"}:
+            raise ValueError(f"Invalid mode '{mode}'. Expected 'num' or 'letter'.")
+
+        with self._profile_lock():
+            accounts = self.list()
+            if not accounts:
+                return []
+
+            accounts = sorted(accounts, key=lambda p: (p.created_at, p.name))
+            count = len(accounts)
+
+            from .naming import generate_account_names
+
+            target_names = generate_account_names(count, normalized_mode)
+            orig_names = [p.name for p in accounts]
+
+            uuid_tag = uuid.uuid4().hex[:8]
+            temp_names = [f"tmp_sr_{uuid_tag}_{k}" for k in range(count)]
+
+            # Phase 1 (Staging): Rename all accounts to collision-free temporary names
+            staged_count = 0
+            try:
+                for k in range(count):
+                    self.rename(orig_names[k], temp_names[k])
+                    staged_count += 1
+            except Exception as exc:
+                for m in range(staged_count - 1, -1, -1):
+                    try:
+                        self.rename(temp_names[m], orig_names[m])
+                    except Exception:
+                        pass
+                raise ProfileError(f"smartrename failed during staging phase: {exc}") from exc
+
+            # Phase 2 (Commit): Rename each staged account to its calculated target name
+            committed_count = 0
+            try:
+                for k in range(count):
+                    self.rename(temp_names[k], target_names[k])
+                    committed_count += 1
+            except Exception as exc:
+                for m in range(committed_count - 1, -1, -1):
+                    try:
+                        self.rename(target_names[m], temp_names[m])
+                    except Exception:
+                        pass
+                for m in range(count - 1, -1, -1):
+                    try:
+                        self.rename(temp_names[m], orig_names[m])
+                    except Exception:
+                        pass
+                raise ProfileError(f"smartrename failed during commit phase: {exc}") from exc
+
+            return list(zip(orig_names, target_names))
+
+    def smart_rename_accounts(self, mode: str) -> list[tuple[str, str]]:
+        """Alias for smart_rename."""
+        return self.smart_rename(mode)
 
 
 def unix_permissions_warning(path: Path) -> str | None:

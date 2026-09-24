@@ -452,6 +452,7 @@ def format_main_help() -> str:
         "  edit        Edit profile settings",
         "  config      Configure profile defaults",
         "  rename      Rename a profile",
+        "  smartrename Sequentially rename accounts",
         "  remove      Delete a profile",
         "",
         "Usage & Monitoring",
@@ -462,6 +463,7 @@ def format_main_help() -> str:
         "Launching",
         "  select      Pick an account",
         "  rotate      Rotate accounts",
+        "  all         Launch all profiles in terminal panes",
         "  <profile>   Launch Antigravity",
         "",
         "Tools",
@@ -482,6 +484,9 @@ def format_launch_help() -> str:
         "                                      Replaces the current process on POSIX, preserving native",
         "                                      terminal, TTY, working directory, and signal handling.",
         "",
+        "  agym all [agy args...]              Launch all configured profiles simultaneously in evenly",
+        "                                      subdivided terminal panes across Windows, Linux, and macOS.",
+        "",
         "  agym rotate [agy args...]           Rotate to next account/profile and launch Antigravity.",
         "                                      Ensures non-repeating execution, atomic state updates,",
         "                                      and cross-platform Chromium lock cleanup on Windows.",
@@ -500,6 +505,18 @@ def format_launch_help() -> str:
         "                                      pushes current branch, and opens a PR via GitHub CLI.",
     ]
     return "\n".join(lines)
+
+
+def _special_command_help(name: str) -> str | None:
+    if name == "all":
+        from .panes.runner import HELP_TEXT
+        return HELP_TEXT
+    if name == "smartrename":
+        return (
+            "Usage: smartrename <num|letter>\n\n"
+            "Sequentially rename all accounts using numbers (1..n) or letters (A..Z, Aa..Az, etc.)."
+        )
+    return None
 
 
 def _has_help_flag(argv: list[str]) -> bool:
@@ -612,6 +629,43 @@ def _rename(argv: list[str], store: ProfileStore) -> int:
     profile = store.rename(ns.old_profile, ns.new_name)
     print(f"Renamed profile '{ns.old_profile}' to '{profile.name}'.")
     print(f"Profile home: {profile.home}")
+    return 0
+
+
+def _smartrename(argv: list[str], store: ProfileStore) -> int:
+    if argv and argv[0] in {"-h", "--help"}:
+        print(
+            "Usage: smartrename <num|letter>\n\n"
+            "Sequentially rename all accounts using numbers (1..n) or letters (A..Z, Aa..Az, etc.)."
+        )
+        return 0
+
+    if not argv:
+        print("Usage: smartrename <num|letter>", file=sys.stderr)
+        print("Error: Invalid argument ''. Expected 'num' or 'letter'.", file=sys.stderr)
+        return 2
+
+    if len(argv) > 1:
+        print("Usage: smartrename <num|letter>", file=sys.stderr)
+        print(f"Error: Invalid argument '{' '.join(argv)}'. Expected 'num' or 'letter'.", file=sys.stderr)
+        return 2
+
+    raw_arg = argv[0]
+    mode = raw_arg.strip().lower()
+    if mode not in {"num", "letter"}:
+        print("Usage: smartrename <num|letter>", file=sys.stderr)
+        print(f"Error: Invalid argument '{raw_arg}'. Expected 'num' or 'letter'.", file=sys.stderr)
+        return 2
+
+    results = store.smart_rename(mode)
+    if not results:
+        print("No accounts found to rename.")
+        return 0
+
+    total = len(results)
+    print(f"Renamed {total} accounts using '{mode}' sequence:")
+    for i, (old_name, new_name) in enumerate(results):
+        print(f"  [{i+1}/{total}] {old_name} -> {new_name}")
     return 0
 
 
@@ -1034,6 +1088,11 @@ def _auto_pr(argv: list[str], store: ProfileStore) -> int:
     )
 
 
+def _all(argv: list[str], store: ProfileStore) -> int:
+    from .panes.runner import run_all
+    return run_all(argv, store)
+
+
 def _launch(profile_name: str, argv: list[str], store: ProfileStore) -> int:
     validate_profile_name(profile_name)
     profile = store.get(profile_name)
@@ -1085,12 +1144,14 @@ COMMAND_REGISTRY: list[CommandSpec] = [
     CommandSpec(name="edit", group="Accounts", description="Edit profile settings", parser_builder=build_edit_parser, handler=_edit),
     CommandSpec(name="config", group="Accounts", description="Configure profile defaults", parser_builder=build_config_parser, handler=_config),
     CommandSpec(name="rename", aliases=("mv",), group="Accounts", description="Rename a profile", parser_builder=build_rename_parser, handler=_rename),
+    CommandSpec(name="smartrename", group="Accounts", description="Sequentially rename accounts", handler=_smartrename),
     CommandSpec(name="remove", group="Accounts", description="Delete a profile", parser_builder=build_remove_parser, handler=_remove),
     # Usage & Monitoring
     CommandSpec(name="usage", group="Usage & Monitoring", description="Show quota usage", parser_builder=build_usage_parser, handler=_usage),
     CommandSpec(name="tokens", aliases=("token", "token-usage"), group="Usage & Monitoring", description="Show token usage", parser_builder=build_tokens_parser, handler=_tokens),
     CommandSpec(name="statusline", group="Usage & Monitoring", description="Manage statusline", parser_builder=build_statusline_parser, handler=_statusline),
     # Launching
+    CommandSpec(name="all", group="Launching", description="Launch all profiles in terminal panes", handler=_all),
     CommandSpec(name="select", aliases=("pick",), group="Launching", description="Pick an account", parser_builder=build_select_parser, handler=_select),
     CommandSpec(name="rotate", group="Launching", description="Rotate accounts", parser_builder=build_rotate_parser, handler=_rotate),
     # Tools
@@ -1144,6 +1205,11 @@ def _handle_help_command(rest: list[str]) -> int:
 
     cmd_spec = resolve_command(topic)
     if cmd_spec is not None:
+        special_help = _special_command_help(cmd_spec.name)
+        if special_help is not None:
+            print(special_help, end="" if special_help.endswith("\n") else "\n")
+            return 0
+
         if cmd_spec.name == "integration":
             from .integration import cli as integration_cli
             sub_path = clean_rest[1:]
@@ -1165,6 +1231,11 @@ def _handle_help_command(rest: list[str]) -> int:
 
 
 def _handle_command_help(cmd_spec: CommandSpec, rest: list[str]) -> int:
+    special_help = _special_command_help(cmd_spec.name)
+    if special_help is not None:
+        print(special_help, end="" if special_help.endswith("\n") else "\n")
+        return 0
+
     if cmd_spec.name == "integration":
         from .integration import cli as integration_cli
         sub_path = [a for a in rest if a not in {"-h", "--help", "help"}]
