@@ -663,6 +663,8 @@ class CliUsageTests(unittest.TestCase):
                 [p1, p2],
                 json_mode=True,
                 timeout=15.0,
+                cache_ttl=300.0,
+                data_root=Path(tmp) / "data",
             )
 
     @mock.patch("agym.cli.ProfileStore")
@@ -688,6 +690,8 @@ class CliUsageTests(unittest.TestCase):
                 [p1],
                 json_mode=False,
                 timeout=30.0,
+                cache_ttl=300.0,
+                data_root=Path(tmp) / "data",
             )
 
     @mock.patch("agym.cli.ProfileStore")
@@ -1116,4 +1120,88 @@ class UsageGraphsTests(unittest.TestCase):
         self.assertIn("Claude", narrow_text)
         dev_narrow = [l for l in narrow_lines if "dev" in l or "Claude" in l]
         self.assertGreaterEqual(len(dev_narrow), 2)
+
+    def test_usage_grid_renders_sess_column(self) -> None:
+        from agym.usage import render_usage_view_lines
+
+        p1 = Profile(name="ttb", home=Path("/h1"), created_at="", subscription_date="2027-03-21")
+        p2 = Profile(name="main", home=Path("/h2"), created_at="", subscription_date=None)
+        u1 = parse_usage_response(SAMPLE_REAL_RESPONSE, "ttb", subscription_date="2027-03-21")
+        u2 = parse_usage_response(SAMPLE_REAL_RESPONSE, "main", subscription_date=None)
+        completed = {"ttb": u1, "main": u2}
+
+        session_counts = {"ttb": 2, "main": 0}
+        lines = render_usage_view_lines(
+            [p1, p2],
+            completed,
+            session_counts=session_counts,
+            use_color=False,
+            include_summary=False,
+        )
+        rendered = "\n".join(lines)
+        self.assertIn("Account", rendered)
+        self.assertIn("Sess", rendered)
+        self.assertIn("Gemini 5h", rendered)
+        self.assertIn("Gemini Wk", rendered)
+        self.assertIn("Sub", rendered)
+
+        # Check rows contain session numbers
+        ttb_line = next(l for l in lines if "ttb" in l)
+        self.assertIn("2", ttb_line)
+        main_line = next(l for l in lines if "main" in l)
+        self.assertIn("0", main_line)
+
+    def test_usage_json_includes_open_sessions(self) -> None:
+        u1 = parse_usage_response(SAMPLE_REAL_RESPONSE, "ttb")
+        u2 = parse_usage_response(SAMPLE_REAL_RESPONSE, "main")
+
+        payload = usage_payload_to_dict([u1, u2], session_counts={"ttb": 3, "main": 0})
+        acc_ttb = next(a for a in payload["accounts"] if a["account"] == "ttb")
+        acc_main = next(a for a in payload["accounts"] if a["account"] == "main")
+
+        self.assertEqual(acc_ttb["open_sessions"], 3)
+        self.assertEqual(acc_main["open_sessions"], 0)
+
+    def test_usage_cache_does_not_store_open_sessions(self) -> None:
+        from agym.cache import CacheManager
+        with tempfile.TemporaryDirectory() as tmp:
+            cm = CacheManager(cache_root=Path(tmp) / "cache")
+            u = parse_usage_response(SAMPLE_REAL_RESPONSE, "ttb")
+            cm.set_usage("ttb", account_usage_to_dict(u), SAMPLE_REAL_RESPONSE)
+
+            cached_data, _ = cm.get_cached_usage_with_meta("ttb")
+            self.assertIsNotNone(cached_data)
+            self.assertNotIn("open_sessions", cached_data)
+
+    def test_usage_view_renders_cache_freshness_summary(self) -> None:
+        from agym.usage import render_usage_view_lines
+
+        p1 = Profile(name="ttb", home=Path("/h1"), created_at="")
+        # Cached usage 90s ago
+        u1 = parse_usage_response(SAMPLE_REAL_RESPONSE, "ttb", cached=True, age_seconds=90.0)
+        lines = render_usage_view_lines([p1], {"ttb": u1}, use_color=False, include_summary=False)
+        rendered = "\n".join(lines)
+        self.assertIn("Data: Cached · 1m ago", rendered)
+
+        # Live usage
+        u_live = parse_usage_response(SAMPLE_REAL_RESPONSE, "ttb", cached=False, age_seconds=0.0)
+        lines_live = render_usage_view_lines([p1], {"ttb": u_live}, use_color=False, include_summary=False)
+        rendered_live = "\n".join(lines_live)
+        self.assertIn("Data: Live", rendered_live)
+
+    def test_cli_usage_passes_configured_cache_ttl_and_data_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = ProfileStore(config_root=tmp_path / "config", data_root=tmp_path / "data")
+            store.create("p1")
+            store.set_usage_cache_ttl(600.0)
+
+            with mock.patch("agym.cli.ProfileStore", return_value=store), \
+                 mock.patch("agym.cli.resolve_agy", return_value=Path("/fake/agy")), \
+                 mock.patch("agym.cli.run_usage", return_value=[]) as mock_run:
+                code = cli.main(["usage"])
+                self.assertEqual(code, 0)
+                mock_run.assert_called_once()
+                self.assertEqual(mock_run.call_args.kwargs["cache_ttl"], 600.0)
+                self.assertEqual(mock_run.call_args.kwargs["data_root"], tmp_path / "data")
 

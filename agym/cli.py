@@ -769,6 +769,8 @@ def _usage(argv: list[str], store: ProfileStore) -> int:
     kwargs: dict[str, Any] = {
         "json_mode": ns.json_mode,
         "timeout": ns.timeout,
+        "cache_ttl": store.get_usage_cache_ttl(),
+        "data_root": store.data_root,
     }
     if ns.refresh:
         kwargs["refresh"] = True
