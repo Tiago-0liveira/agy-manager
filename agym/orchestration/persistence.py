@@ -863,6 +863,8 @@ class FileRunStore:
                 "invocation_id": str(iid),
                 "worker_id": str(wid),
                 "role": role.value,
+                "strategy": strategy.value,
+                "objective": prompt[:300],
             },
         )
         self.emit(event)
@@ -965,6 +967,8 @@ class FileRunStore:
             payload={
                 "invocation_id": str(iid),
                 "worker_id": str(record.worker_id),
+                "role": record.role.value,
+                "strategy": record.strategy.value,
                 "status": InvocationStatus.SUCCEEDED.value,
             },
         )

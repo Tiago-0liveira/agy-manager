@@ -383,6 +383,11 @@ class OrchestrationEngine:
         self.coordinator = coordinator
         self.default_budget = default_budget or OrchestrationBudget()
         self.artifact_writer = ArtifactWriter(self.store)
+        if hasattr(self.runner, "set_activity_callback"):
+            try:
+                self.runner.set_activity_callback(self._on_runner_activity)
+            except Exception:
+                logger.debug("Runner does not accept activity callback", exc_info=True)
 
         # Per-run active registries (Do not use global process tracking)
         self._active_tasks: dict[RunId, dict[InvocationId, asyncio.Task[Any]]] = {}
@@ -434,6 +439,23 @@ class OrchestrationEngine:
             except Exception as exc:
                 logger.warning("Failed to emit event %s for run %s: %s", event_type, run_id, exc)
         return evt
+
+    def _on_runner_activity(
+        self,
+        run_id: RunId,
+        invocation_id: InvocationId,
+        worker_id: str,
+        activity: str,
+    ) -> None:
+        self._emit_event(
+            EventType.INVOCATION_ACTIVITY,
+            run_id,
+            {
+                "invocation_id": str(invocation_id),
+                "worker_id": worker_id,
+                "activity": activity[:120],
+            },
+        )
 
     # ========================================================================
     # Action & Budget Validation
@@ -1634,7 +1656,21 @@ class OrchestrationEngine:
             state.assessment = assessment
             if hasattr(self.store, "save_assessment"):
                 self.store.save_assessment(state.run_id, assessment)
-            self._emit_event(EventType.TASK_ASSESSED, state.run_id, {"assessment": assessment.to_dict()})
+            self._emit_event(
+                EventType.TASK_ASSESSED,
+                state.run_id,
+                {
+                    "assessment": assessment.to_dict(),
+                    "budget": state.budget.to_dict(),
+                    "budget_usage": state.budget_usage.to_dict(),
+                    "fleet_view": fleet_view.to_dict(),
+                    "coordinator_profile": getattr(coord, "profile_name", None),
+                    "coordinator_strategy": (
+                        getattr(getattr(coord, "strategy", None), "value", None)
+                        or str(getattr(coord, "strategy", ExecutionStrategy.HIGH_EFFORT))
+                    ),
+                },
+            )
             self.store.save_run(state)
 
             if hasattr(coord, "conversation_id") and getattr(coord, "conversation_id") is not None:
@@ -1671,7 +1707,11 @@ class OrchestrationEngine:
                     self._emit_event(
                         EventType.ROUND_STARTED,
                         state.run_id,
-                        {"round_number": state.round_number},
+                        {
+                            "round_number": state.round_number,
+                            "budget": state.budget.to_dict(),
+                            "budget_usage": state.budget_usage.to_dict(),
+                        },
                     )
                     emitted_rounds.add(state.round_number)
 
@@ -2199,7 +2239,11 @@ class OrchestrationEngine:
                     self._emit_event(
                         EventType.ROUND_STARTED,
                         state.run_id,
-                        {"round_number": state.round_number},
+                        {
+                            "round_number": state.round_number,
+                            "budget": state.budget.to_dict(),
+                            "budget_usage": state.budget_usage.to_dict(),
+                        },
                     )
                     raw_action = coord.decide_action(observation, conversation_id=state.coordinator_conversation_id)
                     if isinstance(raw_action, CoordinatorAction):
