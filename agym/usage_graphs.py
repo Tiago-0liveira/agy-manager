@@ -109,13 +109,14 @@ def display_width(s: str) -> int:
 class FleetTelemetry:
     total_accounts: int
     gemini_avg_pct: float
-    claude_avg_pct: float
+    weekly_avg_pct: float
     ready_count: int      # >= 70%
     consuming_count: int  # 20% - 69%
     depleted_count: int   # < 20%
     next_reset_acc: str | None
     next_reset_time_str: str | None
     next_reset_dt: datetime | None
+    claude_avg_pct: float = 0.0
 
 
 def compute_fleet_telemetry(
@@ -128,16 +129,18 @@ def compute_fleet_telemetry(
         return FleetTelemetry(
             total_accounts=0,
             gemini_avg_pct=0.0,
-            claude_avg_pct=0.0,
+            weekly_avg_pct=0.0,
             ready_count=0,
             consuming_count=0,
             depleted_count=0,
             next_reset_acc=None,
             next_reset_time_str=None,
             next_reset_dt=None,
+            claude_avg_pct=0.0,
         )
 
     g_pcts: list[float] = []
+    w_pcts: list[float] = []
     c_pcts: list[float] = []
     ready = 0
     consuming = 0
@@ -154,6 +157,9 @@ def compute_fleet_telemetry(
             continue
 
         b_g = extract_bucket_fn(usage, "gemini", "5h")
+        b_w = extract_bucket_fn(usage, "gemini", "week")
+        if not b_w:
+            b_w = extract_bucket_fn(usage, "claude", "week")
         b_c = extract_bucket_fn(usage, "claude", "5h")
 
         if b_g is None:
@@ -163,12 +169,16 @@ def compute_fleet_telemetry(
         g_pct = float(b_g.percentage)
         g_pcts.append(g_pct)
 
+        if b_w is not None:
+            w_pct = float(b_w.percentage)
+            w_pcts.append(w_pct)
+            eff_pct = min(g_pct, w_pct)
+        else:
+            eff_pct = g_pct
+
         if b_c is not None:
             c_pct = float(b_c.percentage)
             c_pcts.append(c_pct)
-            eff_pct = min(g_pct, c_pct)
-        else:
-            eff_pct = g_pct
 
         if eff_pct >= 70.0:
             ready += 1
@@ -178,7 +188,7 @@ def compute_fleet_telemetry(
             depleted += 1
 
         # Check reset time
-        for b in [b_g, b_c]:
+        for b in [b_g, b_w, b_c]:
             if b and b.reset_time and b.remaining_fraction < 0.5:
                 dt = b.reset_time
                 if dt.tzinfo is None:
@@ -188,6 +198,7 @@ def compute_fleet_telemetry(
                         earliest_reset = (dt, acc)
 
     g_avg = sum(g_pcts) / len(g_pcts) if g_pcts else 0.0
+    w_avg = sum(w_pcts) / len(w_pcts) if w_pcts else 0.0
     c_avg = sum(c_pcts) / len(c_pcts) if c_pcts else 0.0
 
     reset_str = None
@@ -208,13 +219,14 @@ def compute_fleet_telemetry(
     return FleetTelemetry(
         total_accounts=total,
         gemini_avg_pct=g_avg,
-        claude_avg_pct=c_avg,
+        weekly_avg_pct=w_avg,
         ready_count=ready,
         consuming_count=consuming,
         depleted_count=depleted,
         next_reset_acc=reset_acc,
         next_reset_time_str=reset_str,
         next_reset_dt=reset_dt,
+        claude_avg_pct=c_avg,
     )
 
 
@@ -261,15 +273,15 @@ def render_fleet_summary_banner(
     pad_g = " " * max(0, content_width - dw_g)
     line_1 = f"{dim}│{reset} {g_line_content}{pad_g} {dim}│{reset}"
 
-    c_bar = format_smooth_bar(telemetry.claude_avg_pct / 100.0, width=bar_width, use_color=use_color)
-    c_line_content = f"Claude Pool: {c_bar} {telemetry.claude_avg_pct:3.0f}% avg"
+    w_bar = format_smooth_bar(telemetry.weekly_avg_pct / 100.0, width=bar_width, use_color=use_color)
+    w_line_content = f"Weekly Pool: {w_bar} {telemetry.weekly_avg_pct:3.0f}% avg"
     if telemetry.next_reset_acc and telemetry.next_reset_time_str:
         reset_label = "Next Reset:" if content_width >= 72 else "Next:"
         reset_info = f"{reset_label} {cyan}{telemetry.next_reset_acc}{reset} in {cyan}{telemetry.next_reset_time_str}{reset}"
-        c_line_content += f"   {reset_info}"
-    dw_c = display_width(c_line_content)
-    pad_c = " " * max(0, content_width - dw_c)
-    line_2 = f"{dim}│{reset} {c_line_content}{pad_c} {dim}│{reset}"
+        w_line_content += f"   {reset_info}"
+    dw_w = display_width(w_line_content)
+    pad_w = " " * max(0, content_width - dw_w)
+    line_2 = f"{dim}│{reset} {w_line_content}{pad_w} {dim}│{reset}"
 
     return [top_border, line_1, line_2, bottom_border]
 
