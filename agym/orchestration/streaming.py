@@ -1,6 +1,7 @@
 """Decode final responses while leaving the full provider stream in the trace."""
 from __future__ import annotations
 import json
+import re
 from typing import Any
 
 
@@ -104,11 +105,36 @@ def decode_response(stream: str) -> tuple[str, str | None, dict[str, Any] | None
 
 
 
-def extract_activity_description(line: str, *, max_length: int = 120) -> str | None:
-    """Extract a short, safe lifecycle description from one stream-json line.
+def _clean_activity_text(value: Any, *, max_length: int = 120) -> str:
+    """Normalize provider text so it is safe and compact in a live terminal."""
+    text = str(value or "")
+    text = re.sub(r"\\x1b\\[[0-?]*[ -/]*[@-~]", "", text)
+    text = "".join(ch if ch == "\\t" or ord(ch) >= 32 else " " for ch in text)
+    return " ".join(text.split())[:max_length]
 
-    Unknown provider events intentionally return None and remain available in
-    the raw attempt trace instead of polluting the main TTY.
+
+def _activity_target(payload: dict[str, Any]) -> str:
+    """Extract the most useful target from a provider tool/activity payload."""
+    for key in ("path", "file", "query", "target", "command", "url", "pattern"):
+        value = payload.get(key)
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            return str(value).strip()
+
+    args = payload.get("arguments") or payload.get("args") or payload.get("input")
+    if isinstance(args, dict):
+        for key in ("path", "file", "query", "target", "command", "url", "pattern"):
+            value = args.get(key)
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                return str(value).strip()
+    return ""
+
+
+def extract_activity_description(line: str, *, max_length: int = 120) -> str | None:
+    """Extract one concise, safe, user-facing activity line from stream-json.
+
+    The live TUI intentionally surfaces provider lifecycle/tool activity only.
+    Assistant deltas, hidden reasoning, final responses, and unknown event blobs
+    stay in the persisted attempt trace instead of being dumped into the screen.
     """
     try:
         event = json.loads(line.strip())
@@ -126,28 +152,48 @@ def extract_activity_description(line: str, *, max_length: int = 120) -> str | N
         return None
 
     candidates: list[str] = []
+
+    # Prefer an explicit tool description. Antigravity has emitted both nested
+    # tool_info records and top-level tool_call shapes across versions.
+    tool = update.get("tool_info")
+    if not isinstance(tool, dict):
+        raw_tool = update.get("tool")
+        tool = raw_tool if isinstance(raw_tool, dict) else None
+
+    if isinstance(tool, dict):
+        tool_name = str(
+            tool.get("display_name")
+            or tool.get("name")
+            or tool.get("action")
+            or tool.get("tool_name")
+            or ""
+        ).strip()
+        target = _activity_target(tool)
+        if tool_name:
+            candidates.append(f"{tool_name} {target}".strip())
+
+    if not candidates and ("tool" in kind or "function" in kind):
+        tool_name = str(
+            update.get("display_name")
+            or update.get("tool_name")
+            or update.get("name")
+            or update.get("action")
+            or ""
+        ).strip()
+        target = _activity_target(update)
+        if tool_name:
+            candidates.append(f"{tool_name} {target}".strip())
+
+    # Provider-authored short summaries are useful; raw response/delta fields
+    # are intentionally excluded because they can be noisy or contain reasoning.
     for key in ("activity", "summary", "message", "title", "description"):
         value = update.get(key)
         if isinstance(value, str) and value.strip():
             candidates.append(value.strip())
 
-    tool = update.get("tool_info")
-    if isinstance(tool, dict):
-        tool_name = str(tool.get("display_name") or tool.get("name") or tool.get("action") or "").strip()
-        target = str(
-            tool.get("path")
-            or tool.get("file")
-            or tool.get("query")
-            or tool.get("target")
-            or ""
-        ).strip()
-        if tool_name:
-            candidates.insert(0, f"{tool_name} {target}".strip())
-
     if not candidates:
         return None
 
-    activity = " ".join(candidates[0].split())
-    if not activity:
-        return None
-    return activity[:max_length]
+    activity = _clean_activity_text(candidates[0], max_length=max_length)
+    return activity or None
+
