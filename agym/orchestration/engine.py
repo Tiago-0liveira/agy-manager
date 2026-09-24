@@ -2265,6 +2265,7 @@ class OrchestrationEngine:
                 for r in f_wave:
                     known_worker_ids.add(r.worker_id)
 
+                self._record_quality_evidence(state, action, c_wave)
                 state.round_number += 1
                 state.budget_usage.rounds = state.round_number
                 self.store.save_run(state)

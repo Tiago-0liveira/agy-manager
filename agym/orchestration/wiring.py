@@ -216,7 +216,7 @@ def build_orchestration_dependencies(
                     WorkerRequest(
                         worker_id=WorkerId("coordinator"),
                         role="GENERAL",
-                        strategy=ExecutionStrategy.STANDARD,
+                        strategy=ExecutionStrategy.HIGH_EFFORT,
                     )
                 )
             except Exception:
@@ -230,6 +230,7 @@ def build_orchestration_dependencies(
         runner=mdl_runner,
         run_store=r_store,
         profile_name=coord_prof,
+        strategy=ExecutionStrategy.HIGH_EFFORT,
     )
     bgt = budget or build_default_budget()
     eng = engine or OrchestrationEngine(
