@@ -737,6 +737,8 @@ class TerminalEventSink(EventSink):
                 wp.completed_at = payload.get("completed_at") or event.timestamp
                 if "profile_name" in payload and payload["profile_name"]:
                     wp.profile_name = str(payload["profile_name"])
+                if payload.get("strategy"):
+                    wp.strategy = str(payload["strategy"])
                 if "duration" in payload or "duration_seconds" in payload:
                     try:
                         wp.duration_seconds = float(payload.get("duration") or payload.get("duration_seconds"))
@@ -935,7 +937,16 @@ class TerminalEventSink(EventSink):
                     spinner_char = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
                     icon = colorize(spinner_char, YELLOW, use_color)
                     p_name = w.profile_name or ""
-                    line = f"  {name_col}{icon} {p_name}".rstrip()
+                    suffix_parts: list[str] = []
+                    if w.current_activity and w.started_at:
+                        started = _parse_timestamp(w.started_at)
+                        if started is not None:
+                            now = datetime.now(started.tzinfo) if started.tzinfo else datetime.now()
+                            suffix_parts.append(format_duration(max(0.0, (now - started).total_seconds())))
+                    if w.strategy:
+                        suffix_parts.append(w.strategy.lower())
+                    suffix = f" · {' · '.join(suffix_parts)}" if suffix_parts else ""
+                    line = f"  {name_col}{icon} {p_name}{suffix}".rstrip()
 
                 elif w.status == WorkerStatus.FAILED:
                     icon = colorize(ICON_FAILED, RED, use_color)
@@ -987,7 +998,13 @@ class TerminalEventSink(EventSink):
             lines.append("")
 
         if self.state.activity_feed:
-            lines.append(colorize(f"Live activity · last {LIVE_ACTIVITY_LIMIT}", BOLD, use_color))
+            running_count = sum(w.status == WorkerStatus.RUNNING for w in self.state.workers.values())
+            completed_count = sum(w.status == WorkerStatus.SUCCEEDED for w in self.state.workers.values())
+            activity_title = (
+                f"Live activity · last {LIVE_ACTIVITY_LIMIT} · "
+                f"{running_count} running · {completed_count} done"
+            )
+            lines.append(colorize(activity_title, BOLD, use_color))
             for entry in self.state.activity_feed[-LIVE_ACTIVITY_LIMIT:]:
                 worker = self.state.workers.get(entry.worker_id)
                 label = worker.display_name if worker is not None else entry.worker_id
