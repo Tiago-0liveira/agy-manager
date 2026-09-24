@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Collection, Sequence
 
 from agym.orchestration.locking import FileLock, LockTimeoutError
+from agym.orchestration.artifacts import ArtifactWriter
 
 from agym.orchestration.recording import capture_attempt
 from agym.orchestration.contracts import (
@@ -381,6 +382,7 @@ class OrchestrationEngine:
 
         self.coordinator = coordinator
         self.default_budget = default_budget or OrchestrationBudget()
+        self.artifact_writer = ArtifactWriter(self.store)
 
         # Per-run active registries (Do not use global process tracking)
         self._active_tasks: dict[RunId, dict[InvocationId, asyncio.Task[Any]]] = {}
@@ -715,6 +717,71 @@ class OrchestrationEngine:
             )
 
         return True, None
+
+    def _write_action_artifacts(
+        self,
+        action: CoordinatorAction,
+        state: RunState,
+        completed: Sequence[WorkerResult | AuditResult],
+    ) -> None:
+        """Mirror successful action outputs as human-readable Markdown artifacts."""
+        successful = [r for r in completed if r.status == InvocationStatus.SUCCEEDED]
+        if not successful:
+            return
+
+        request_by_id: dict[str, WorkerRequest | AuditRequest] = {
+            str(req.worker_id): req for req in [*action.workers, *action.auditors]
+        }
+        synthesis_targets = set(state.quality_state.synthesis_worker_ids)
+        next_synthesis = state.quality_state.synthesis_completed + 1
+        next_critique = state.quality_state.final_critique_completed + 1
+
+        for result in successful:
+            request = request_by_id.get(str(result.worker_id))
+            synthesis_version: int | None = None
+            critique_version: int | None = None
+
+            if action.kind == ActionKind.RUN_SYNTHESIS:
+                synthesis_version = next_synthesis
+                next_synthesis += 1
+            elif action.kind == ActionKind.RUN_AUDITORS and isinstance(request, AuditRequest):
+                targets = {str(t) for t in request.target_worker_ids}
+                if targets & synthesis_targets:
+                    critique_version = next_critique
+                    next_critique += 1
+
+            try:
+                path = self.artifact_writer.write_result(
+                    state.run_id,
+                    result,
+                    request,
+                    round_number=state.round_number + 1,
+                    synthesis_version=synthesis_version,
+                    critique_version=critique_version,
+                )
+            except Exception as exc:
+                logger.warning("Failed to write artifact for %s: %s", result.worker_id, exc)
+                continue
+
+            try:
+                relative = path.relative_to(Path(self.store.run_dir(state.run_id)).resolve())
+                artifact_path = str(relative)
+            except Exception:
+                artifact_path = str(path)
+            self._emit_event(
+                EventType.ARTIFACT_WRITTEN,
+                state.run_id,
+                {
+                    "worker_id": str(result.worker_id),
+                    "role": (
+                        WorkerRole.AUDITOR.value
+                        if isinstance(result, AuditResult)
+                        else result.role.value
+                    ),
+                    "round_number": state.round_number + 1,
+                    "artifact_path": artifact_path,
+                },
+            )
 
     # ========================================================================
     # Resource Cleanup & Interruption
@@ -1697,11 +1764,23 @@ class OrchestrationEngine:
                         )
                         state = finalized
                     else:
+                        try:
+                            final_path = self.artifact_writer._write(
+                                state.run_id,
+                                Path("deliverables") / "final.md",
+                                (state.final_result or "").rstrip() + "\n",
+                            )
+                            state.final_artifact_path = str(final_path)
+                        except Exception:
+                            pass
                         self.store.save_run(state)
                         self._emit_event(
                             EventType.RUN_COMPLETED,
                             state.run_id,
-                            {"final_result": state.final_result},
+                            {
+                                "summary": (state.final_result or "")[:200],
+                                "final_artifact_path": state.final_artifact_path,
+                            },
                         )
                     self._cleanup_leases(state.run_id)
                     return state
@@ -1763,6 +1842,7 @@ class OrchestrationEngine:
                 for r in failed:
                     known_worker_ids.add(r.worker_id)
 
+                self._write_action_artifacts(action, state, completed)
                 self._record_quality_evidence(state, action, completed)
                 state.round_number += 1
                 state.budget_usage.rounds = state.round_number
@@ -2203,11 +2283,23 @@ class OrchestrationEngine:
                         )
                         state = finalized
                     else:
+                        try:
+                            final_path = self.artifact_writer._write(
+                                state.run_id,
+                                Path("deliverables") / "final.md",
+                                (state.final_result or "").rstrip() + "\n",
+                            )
+                            state.final_artifact_path = str(final_path)
+                        except Exception:
+                            pass
                         self.store.save_run(state)
                         self._emit_event(
                             EventType.RUN_COMPLETED,
                             state.run_id,
-                            {"final_result": state.final_result},
+                            {
+                                "summary": (state.final_result or "")[:200],
+                                "final_artifact_path": state.final_artifact_path,
+                            },
                         )
                     self._cleanup_leases(state.run_id)
                     return state
@@ -2265,6 +2357,7 @@ class OrchestrationEngine:
                 for r in f_wave:
                     known_worker_ids.add(r.worker_id)
 
+                self._write_action_artifacts(action, state, c_wave)
                 self._record_quality_evidence(state, action, c_wave)
                 state.round_number += 1
                 state.budget_usage.rounds = state.round_number
