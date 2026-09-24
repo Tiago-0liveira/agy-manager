@@ -32,6 +32,7 @@ from agym.orchestration.persistence import FileRunStore
 from agym.orchestration.runner import AntigravityRunner
 from agym.orchestration.scheduler import ProfileScheduler
 from agym.orchestration.ui import TerminalEventSink
+from agym.orchestration.usage_monitor import UsagePollingEventSink
 from agym.profiles import ProfileStore
 
 logger = logging.getLogger(__name__)
@@ -206,6 +207,7 @@ def build_orchestration_dependencies(
     is_tty: bool | None = None,
     use_color: bool | None = None,
     min_reserve: float | None = None,
+    usage_refresh_interval: float = 60.0,
 ) -> OrchestrationDependencies:
     """Centralized factory for constructing orchestration subsystems.
 
@@ -222,9 +224,28 @@ def build_orchestration_dependencies(
         min_reserve=min_reserve if min_reserve is not None else DEFAULT_MIN_QUOTA_RESERVE_FRACTION,
     )
     r_store = run_store or FileRunStore()
-    e_sink = event_sink or TerminalEventSink(stream=stream, is_tty=is_tty, use_color=use_color)
-    effective_store = BroadcastRunStore(r_store, e_sink)
+    base_sink = event_sink or TerminalEventSink(stream=stream, is_tty=is_tty, use_color=use_color)
     mdl_runner = runner or AntigravityRunner(profile_store=p_store)
+
+    # Live TTY runs get a quota poller equivalent to periodically running:
+    #   agym usage <all profiles> --json -f
+    # Reuse the underlying usage API directly instead of recursively spawning agym.
+    e_sink: EventSink = base_sink
+    if (
+        event_sink is None
+        and isinstance(base_sink, TerminalEventSink)
+        and base_sink.is_tty
+        and hasattr(mdl_runner, "agy_path")
+    ):
+        e_sink = UsagePollingEventSink(
+            base_sink,
+            profile_store=p_store,
+            agy_path=getattr(mdl_runner, "agy_path"),
+            cache_manager=c_mgr,
+            interval_seconds=usage_refresh_interval,
+        )
+
+    effective_store = BroadcastRunStore(r_store, e_sink)
 
     coord_prof = coordinator_profile
     if coord_prof is None and coordinator is None:
