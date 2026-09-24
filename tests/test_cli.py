@@ -20,6 +20,7 @@ from agym.orchestration.contracts import (
     RunStatus,
 )
 from agym.orchestration.engine import DryRunPlan
+from agym.orchestration.persistence import FileRunStore
 from agym.orchestration.wiring import OrchestrationDependencies
 
 
@@ -618,6 +619,36 @@ class OrchestrateCliTests(unittest.TestCase):
         self.assertIn("run not found: run-ghost", err.getvalue())
 
     @mock.patch("agym.cli.build_orchestration_dependencies")
+    def test_orchestrate_inspect_and_logs(self, mock_build: mock.Mock) -> None:
+        mock_build.return_value = self.deps
+        with tempfile.TemporaryDirectory() as tmp:
+            store = FileRunStore(tmp)
+            store.create_run("run-test-insp", "Inspect task")
+            self.mock_store.run_dir.side_effect = lambda rid: store.run_dir(rid)
+
+            # Test inspect
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = cli.main(["orchestrate", "inspect", "run-test-insp"])
+            self.assertEqual(code, 0)
+            self.assertIn("=== Run Inspection: run-test-insp ===", out.getvalue())
+
+            # Test logs
+            out_logs = io.StringIO()
+            with mock.patch("sys.stdout", out_logs):
+                code_logs = cli.main(["orchestrate", "logs", "run-test-insp"])
+            self.assertEqual(code_logs, 0)
+
+            # Test inspect & logs -h/--help
+            for subcmd in ["inspect", "logs"]:
+                for flag in ["-h", "--help"]:
+                    out_h = io.StringIO()
+                    with mock.patch("sys.stdout", out_h):
+                        code_h = cli.main(["orchestrate", subcmd, flag])
+                    self.assertEqual(code_h, 0)
+                    self.assertIn(f"usage: agym orchestrate {subcmd}", out_h.getvalue())
+
+    @mock.patch("agym.cli.build_orchestration_dependencies")
     def test_orchestrate_resume(self, mock_build: mock.Mock) -> None:
         mock_build.return_value = self.deps
         code = cli.main(["orchestrate", "resume", "run-test-1"])
@@ -639,6 +670,22 @@ class OrchestrateCliTests(unittest.TestCase):
         code_fail = cli.main(["orchestrate", "resume", "run-fail"])
         self.assertEqual(code_fail, 1)
 
+        # Resume raising exception prints artifacts and inspect hint
+        fake_run_dir = mock.MagicMock(spec=Path)
+        fake_run_dir.exists.return_value = True
+        fake_run_dir.__str__.return_value = "/fake/runs/run-crash"
+        self.mock_store.run_dir.return_value = fake_run_dir
+        self.mock_engine.resume.side_effect = RuntimeError("Resume failed")
+        out_exc = io.StringIO()
+        err_exc = io.StringIO()
+        with mock.patch("sys.stdout", out_exc), mock.patch("sys.stderr", err_exc):
+            code_exc = cli.main(["orchestrate", "resume", "run-crash"])
+        self.assertEqual(code_exc, 1)
+        self.assertIn("Run artifacts: /fake/runs/run-crash", out_exc.getvalue())
+        self.assertIn("Inspect with: agym orchestrate inspect run-crash", out_exc.getvalue())
+        self.assertIn("Resume failed", err_exc.getvalue())
+        self.mock_engine.resume.side_effect = None
+
     @mock.patch("agym.cli.build_orchestration_dependencies")
     def test_orchestrate_unknown_subcommand(self, mock_build: mock.Mock) -> None:
         mock_build.return_value = self.deps
@@ -647,7 +694,7 @@ class OrchestrateCliTests(unittest.TestCase):
             ["orchestrate", "invalid"],
             ["orchestrate", "unknown-subcommand", "foo"],
             ["orchestrate", "cancel", "run-123"],
-            ["orchestrate", "inspect", "run-123"],
+            ["orchestrate", "terminate", "run-123"],
             ["orchestrate", "foobar", "extra"],
         ]:
             err = io.StringIO()
@@ -666,6 +713,12 @@ class OrchestrateCliTests(unittest.TestCase):
             ["orchestrate", "resume"],
             ["orchestrate", "resume", ""],
             ["orchestrate", "resume", "   "],
+            ["orchestrate", "inspect"],
+            ["orchestrate", "inspect", ""],
+            ["orchestrate", "inspect", "   "],
+            ["orchestrate", "logs"],
+            ["orchestrate", "logs", ""],
+            ["orchestrate", "logs", "   "],
         ]:
             err = io.StringIO()
             with self.subTest(args=args), mock.patch("sys.stderr", err):
