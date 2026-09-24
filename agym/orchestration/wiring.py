@@ -45,9 +45,11 @@ __all__ = [
     "DEFAULT_MAX_RUNTIME_SECONDS",
     "DEFAULT_MIN_QUOTA_REMAINING_PERCENT",
     "DEFAULT_MIN_QUOTA_RESERVE_FRACTION",
+    "DEPTH_PRESETS",
     "BroadcastRunStore",
     "OrchestrationDependencies",
     "build_default_budget",
+    "build_budget_for_depth",
     "build_orchestration_dependencies",
 ]
 
@@ -57,25 +59,43 @@ __all__ = [
 
 DEFAULT_MAX_PARALLEL: int = 4
 DEFAULT_MAX_INVOCATIONS: int = 20
-DEFAULT_MAX_ROUNDS: int = 10
+DEFAULT_MAX_ROUNDS: int = 8
 DEFAULT_MAX_BOOST_INVOCATIONS: int = 2
 DEFAULT_MAX_RETRIES: int = 3
 DEFAULT_MAX_RUNTIME_SECONDS: float = 1800.0  # 30 minutes
 DEFAULT_MIN_QUOTA_REMAINING_PERCENT: float = 10.0  # 10% min reserve for budget
 DEFAULT_MIN_QUOTA_RESERVE_FRACTION: float = 0.05  # 5% reserve for scheduler
 
+DEPTH_PRESETS: dict[str, dict[str, int]] = {
+    "quick": {"max_parallel": 2, "max_invocations": 8, "max_rounds": 4},
+    "balanced": {"max_parallel": 4, "max_invocations": 20, "max_rounds": 8},
+    "deep": {"max_parallel": 6, "max_invocations": 36, "max_rounds": 12},
+}
 
-def build_default_budget() -> OrchestrationBudget:
-    """Create an OrchestrationBudget configured with conservative V1 defaults."""
+
+def build_budget_for_depth(depth: str = "balanced") -> OrchestrationBudget:
+    """Build hard upper bounds for one orchestration depth preset."""
+    normalized = str(depth or "balanced").strip().lower()
+    if normalized not in DEPTH_PRESETS:
+        raise ValueError(
+            f"Unknown orchestration depth '{depth}'. Expected one of: "
+            + ", ".join(sorted(DEPTH_PRESETS))
+        )
+    preset = DEPTH_PRESETS[normalized]
     return OrchestrationBudget(
-        max_parallel=DEFAULT_MAX_PARALLEL,
-        max_invocations=DEFAULT_MAX_INVOCATIONS,
-        max_rounds=DEFAULT_MAX_ROUNDS,
+        max_parallel=preset["max_parallel"],
+        max_invocations=preset["max_invocations"],
+        max_rounds=preset["max_rounds"],
         max_boost_invocations=DEFAULT_MAX_BOOST_INVOCATIONS,
         max_retries=DEFAULT_MAX_RETRIES,
         max_runtime_seconds=DEFAULT_MAX_RUNTIME_SECONDS,
         min_quota_remaining=DEFAULT_MIN_QUOTA_REMAINING_PERCENT,
     )
+
+
+def build_default_budget() -> OrchestrationBudget:
+    """Create the default balanced orchestration budget."""
+    return build_budget_for_depth("balanced")
 
 
 # ============================================================================
@@ -181,6 +201,7 @@ def build_orchestration_dependencies(
     event_sink: EventSink | None = None,
     engine: OrchestrationEngine | None = None,
     budget: OrchestrationBudget | None = None,
+    depth: str = "balanced",
     stream: TextIO | None = None,
     is_tty: bool | None = None,
     use_color: bool | None = None,
@@ -232,7 +253,7 @@ def build_orchestration_dependencies(
         profile_name=coord_prof,
         strategy=ExecutionStrategy.HIGH_EFFORT,
     )
-    bgt = budget or build_default_budget()
+    bgt = budget or build_budget_for_depth(depth)
     eng = engine or OrchestrationEngine(
         scheduler=sched,
         lease_manager=l_mgr,

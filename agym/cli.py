@@ -453,12 +453,14 @@ def build_doctor_parser() -> argparse.ArgumentParser:
 ORCHESTRATE_USAGE = """agym orchestrate — Multi-agent orchestration for Google Antigravity CLI
 
 Usage:
-  agym orchestrate "<task>" [--mode plan|implement] [--dry-run]
+  agym orchestrate "<task>" [--mode plan|implement] [--depth quick|balanced|deep] [--dry-run]
   agym orchestrate status <run-id>
   agym orchestrate resume <run-id>
 
 Options:
   --mode {plan,implement}   Operating mode: plan (default) or implement
+  --depth {quick,balanced,deep}
+                            Maximum orchestration budget preset (default: balanced)
   -n, --dry-run             Preview execution plan without worker execution
   -h, --help                Show this help message and exit
 
@@ -1246,6 +1248,13 @@ def _orchestrate(
         choices=["plan", "implement"],
         type=str.lower,
     )
+    parser.add_argument(
+        "--depth",
+        dest="depth",
+        default="balanced",
+        choices=["quick", "balanced", "deep"],
+        type=str.lower,
+    )
     parser.add_argument("-n", "--dry-run", dest="dry_run", action="store_true")
     parser.add_argument("--profile", dest="profile", default=None, help="Profile to use for the coordinator")
 
@@ -1260,7 +1269,11 @@ def _orchestrate(
 
     task = ns.task.strip()
     run_mode = RunMode.IMPLEMENT if ns.mode == "implement" else RunMode.PLAN
-    d = deps or build_orchestration_dependencies(profile_store=store, coordinator_profile=ns.profile)
+    d = deps or build_orchestration_dependencies(
+        profile_store=store,
+        coordinator_profile=ns.profile,
+        depth=ns.depth,
+    )
 
     if ns.dry_run:
         try:
