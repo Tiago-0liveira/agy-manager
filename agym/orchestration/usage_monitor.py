@@ -113,6 +113,16 @@ class UsagePollingEventSink(EventSink):
             self._emit_snapshot(run_id, [], error="no profiles configured")
             return
 
+        self._sink.emit(
+            OrchestrationEvent(
+                event_id=f"usage-refresh-{datetime.now(timezone.utc).timestamp()}",
+                run_id=run_id,
+                type=EventType.USAGE_UPDATED,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                payload={"fetching": True, "forced": True},
+            )
+        )
+
         try:
             usages = asyncio.run(
                 self._fetcher(
