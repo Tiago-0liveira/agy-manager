@@ -55,13 +55,22 @@ def is_pid_alive(pid: int | None) -> bool:
     if os.name == "nt":
         try:
             import ctypes
+            from ctypes import wintypes
+
             kernel32 = ctypes.windll.kernel32
             # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
             handle = kernel32.OpenProcess(0x1000, False, pid)
             if handle == 0:
                 return False
-            kernel32.CloseHandle(handle)
-            return True
+            try:
+                exit_code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return False
+                # STILL_ACTIVE = 259. A terminated Windows process object may
+                # remain openable while another handle still references it.
+                return exit_code.value == 259
+            finally:
+                kernel32.CloseHandle(handle)
         except Exception:
             return False
     else:
