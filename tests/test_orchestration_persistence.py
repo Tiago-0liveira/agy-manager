@@ -167,6 +167,29 @@ class TestRunCreationAndLayout(TestPersistenceBase):
         self.assertEqual(events[0].type, EventType.RUN_CREATED)
         self.assertEqual(events[0].run_id, run_id)
 
+    def test_create_run_broadcasts_initial_event_to_live_sink(self) -> None:
+        class CaptureSink:
+            def __init__(self) -> None:
+                self.events = []
+
+            def emit(self, event) -> None:
+                self.events.append(event)
+
+        sink = CaptureSink()
+        self.store.event_sink = sink
+
+        run_id = RunId("run-live-created")
+        self.store.create_run(
+            run_id=run_id,
+            task="Show this task immediately",
+            mode=RunMode.PLAN,
+        )
+
+        self.assertEqual(len(sink.events), 1)
+        self.assertEqual(sink.events[0].type, EventType.RUN_CREATED)
+        self.assertEqual(sink.events[0].payload["task"], "Show this task immediately")
+        self.assertEqual(sink.events[0].payload["mode"], "PLAN")
+
     def test_duplicate_run(self) -> None:
         """Attempting to create a duplicate run raises RunAlreadyExistsError."""
         run_id = RunId("run-dup-001")
