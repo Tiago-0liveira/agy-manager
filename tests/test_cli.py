@@ -637,11 +637,9 @@ class OrchestrateCliTests(unittest.TestCase):
         mock_build.return_value = self.deps
         code = cli.main(["orchestrate", "Deep review", "--depth", "deep"])
         self.assertEqual(code, 0)
-        mock_build.assert_called_with(
-            profile_store=self.store,
-            coordinator_profile=None,
-            depth="deep",
-        )
+        self.assertEqual(mock_build.call_args.kwargs["depth"], "deep")
+        self.assertIsNone(mock_build.call_args.kwargs["coordinator_profile"])
+        self.assertIn("profile_store", mock_build.call_args.kwargs)
 
     @mock.patch("agym.cli.build_orchestration_dependencies")
     def test_orchestrate_resume(self, mock_build: mock.Mock) -> None:

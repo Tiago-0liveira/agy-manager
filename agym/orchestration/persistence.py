@@ -1367,7 +1367,6 @@ class FileRunStore:
 
         state.status = RunStatus.INTERRUPTED
         state.updated_at = now
-        state.final_artifact_path = str(final_md)
         self.save_run(state)
 
         # Emit RUN_INTERRUPTED event with active invocations list

@@ -13,6 +13,7 @@ from agym.orchestration.contracts import (
     AuditRequest,
     AuditResult,
     ComplexityLevel,
+    CoordinatorAction,
     CoordinatorObservation,
     EventType,
     ExecutionStrategy,

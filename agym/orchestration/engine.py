@@ -465,7 +465,11 @@ class OrchestrationEngine:
 
     @staticmethod
     def _quality_tier(state: RunState) -> str:
-        complexity = state.assessment.complexity if state.assessment else ComplexityLevel.MEDIUM
+        # Historical/interrupted runs may predate persisted assessment state.
+        # Do not silently upgrade those runs to MEDIUM quality requirements.
+        if state.assessment is None:
+            return "LOW"
+        complexity = state.assessment.complexity
         if complexity in (ComplexityLevel.TRIVIAL, ComplexityLevel.SMALL):
             return "LOW"
         if complexity == ComplexityLevel.MEDIUM:
@@ -488,7 +492,7 @@ class OrchestrationEngine:
         attempted_workers = [r for r in results if isinstance(r, WorkerResult)]
 
         if attempted_workers and not any(r.status == InvocationStatus.SUCCEEDED for r in attempted_workers):
-            missing.append("no delegated worker completed successfully")
+            missing.append("No workers succeeded after delegation")
 
         if tier == "LOW":
             # Direct completion is allowed for genuinely self-contained low-complexity tasks.
