@@ -58,6 +58,7 @@ Commands:
   config <profile>                    Configure profile model and permission settings
   edit <profile>                      Edit profile settings (e.g. subscription renewal date, rename)
   rename <profile> <new-name>         Rename a profile and its isolated directory (alias: mv)
+  smartrename <num|letter>            Sequentially rename all accounts using numbers or letters
   list                                List all configured profiles and subscription status
   select                              Interactively select account by quota health and launch (alias: pick)
   rotate                              Rotate through accounts/profiles sequentially and launch
@@ -107,6 +108,9 @@ Command Options:
 
   agym rename <old-profile> <new-name>
       Rename a profile, its isolated data directory, and associated caches (alias: mv)
+
+  agym smartrename <num|letter>
+      Sequentially rename all accounts using numbers (1..n) or letters (A..Z, Aa..Az, etc.)
 
   agym edit <profile> [--name NEW_NAME] [-s, --subscription-date DATE | --clear-subscription-date]
       --name, --rename NEW_NAME       Rename the profile to a new name
@@ -166,6 +170,8 @@ Examples:
   agym work --auto-pr --draft         Create draft PR from current branch
   agym rename personal main           Rename profile 'personal' to 'main'
   agym rename jmcar AI1               Rename profile 'jmcar' to 'AI1'
+  agym smartrename num                Rename all accounts sequentially to 1, 2, 3...
+  agym smartrename letter             Rename all accounts sequentially to A, B, C...
   agym list                           Check status and renewal timeline of all profiles
   agym usage                          View live quota table and subscription health
   agym tokens                         View token consumption and fleet statistics
@@ -321,6 +327,43 @@ def _rename(argv: list[str], store: ProfileStore) -> int:
     profile = store.rename(ns.old_profile, ns.new_name)
     print(f"Renamed profile '{ns.old_profile}' to '{profile.name}'.")
     print(f"Profile home: {profile.home}")
+    return 0
+
+
+def _smartrename(argv: list[str], store: ProfileStore) -> int:
+    if argv and argv[0] in {"-h", "--help"}:
+        print(
+            "Usage: smartrename <num|letter>\n\n"
+            "Sequentially rename all accounts using numbers (1..n) or letters (A..Z, Aa..Az, etc.)."
+        )
+        return 0
+
+    if not argv:
+        print("Usage: smartrename <num|letter>", file=sys.stderr)
+        print("Error: Invalid argument ''. Expected 'num' or 'letter'.", file=sys.stderr)
+        return 2
+
+    if len(argv) > 1:
+        print("Usage: smartrename <num|letter>", file=sys.stderr)
+        print(f"Error: Invalid argument '{' '.join(argv)}'. Expected 'num' or 'letter'.", file=sys.stderr)
+        return 2
+
+    raw_arg = argv[0]
+    mode = raw_arg.strip().lower()
+    if mode not in {"num", "letter"}:
+        print("Usage: smartrename <num|letter>", file=sys.stderr)
+        print(f"Error: Invalid argument '{raw_arg}'. Expected 'num' or 'letter'.", file=sys.stderr)
+        return 2
+
+    results = store.smart_rename(mode)
+    if not results:
+        print("No accounts found to rename.")
+        return 0
+
+    total = len(results)
+    print(f"Renamed {total} accounts using '{mode}' sequence:")
+    for i, (old_name, new_name) in enumerate(results):
+        print(f"  [{i+1}/{total}] {old_name} -> {new_name}")
     return 0
 
 
@@ -1047,6 +1090,8 @@ def main(argv: list[str] | None = None) -> int:
             return _edit(rest, store)
         if command in {"rename", "mv"}:
             return _rename(rest, store)
+        if command == "smartrename":
+            return _smartrename(rest, store)
         if command == "list":
             return _list(rest, store)
         if command in {"select", "pick"}:

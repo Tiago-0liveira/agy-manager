@@ -60,6 +60,8 @@ agym all -- -p "fleet review"             # Pass arguments to all launched profi
 agym list
 agym rename personal main
 agym rename jmcar AI1
+agym smartrename num                      # Sequentially renames all accounts: 1, 2, 3...
+agym smartrename letter                   # Sequentially renames all accounts: A, B, ..., Aa...
 agym rotate                           # Sequentially rotates to next profile and launches agy
 agym rotate -p "run review"           # Rotates to next profile and executes prompt
 agym rotate --simulate 3              # Dry-run simulate next 3 rotations without launching
@@ -269,6 +271,43 @@ agym edit <old-profile> --name <new-name>
 ```
 
 This updates the configuration, moves the profile's home directory (`~/.local/share/agym/profiles/<profile>/`), preserves all profile settings and subscription tracking, and migrates local usage and token caches to the new name.
+
+### `smartrename`
+
+Renames all available accounts in a clean, sequential order.
+
+**Usage**:
+```bash
+agym smartrename <num|letter>
+```
+
+**Arguments**:
+- `num`: Renames accounts to numeric identifiers starting at `1` up to `n` (e.g., `1`, `2`, `3`, ...).
+- `letter`: Renames accounts to alphabetical identifiers:
+  - Accounts 1–26: `A` to `Z`
+  - Accounts 27–52: `Aa` to `Az`
+  - Accounts 53–78: `Ba` to `Bz`
+  - Accounts 703+: `Aaa`, `Aab`, ...
+
+**Collision Safety**:
+Renames execute via a safe two-phase staging strategy (`Phase 1`: rename all accounts to temporary collision-free identifiers; `Phase 2`: commit target names). This prevents unique naming collisions even when existing account names overlap with the target sequence.
+
+**Examples**:
+```bash
+$ agym smartrename num
+Renamed 3 accounts using 'num' sequence:
+  [1/3] OldName1 -> 1
+  [2/3] OldName2 -> 2
+  [3/3] OldName3 -> 3
+
+$ agym smartrename letter
+Renamed 28 accounts using 'letter' sequence:
+  [1/28] old1 -> A
+  ...
+  [26/28] old26 -> Z
+  [27/28] old27 -> Aa
+  [28/28] old28 -> Ab
+```
 
 ### Shell Integration & Aliases
 
