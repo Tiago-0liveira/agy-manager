@@ -431,6 +431,26 @@ class TestV2Presentation(unittest.TestCase):
         self.assertIn("Inspecting lifecycle tests", rendered)
         self.assertIn("artifacts/wave-01/debugging-failure-analysis.md", rendered)
 
+    def test_non_tty_action_and_activity_are_safe_summaries(self) -> None:
+        stream = io.StringIO()
+        sink = TerminalEventSink(stream=stream, is_tty=False, use_color=False, run_id="ui-log")
+        sink.emit(type_event("1", EventType.ACTION_REQUESTED, {
+            "action": {
+                "kind": "RUN_AUDITORS",
+                "reason": "Review synthesis assumptions.",
+                "workers": [],
+                "auditors": [],
+            },
+        }))
+        sink.emit(type_event("2", EventType.INVOCATION_ACTIVITY, {
+            "worker_id": "audit-1",
+            "activity": "Reviewing worker outputs",
+        }))
+        output = stream.getvalue()
+        self.assertIn("[action] requested RUN_AUDITORS - Review synthesis assumptions.", output)
+        self.assertIn("[worker] audit-1: Reviewing worker outputs", output)
+        self.assertNotIn("step_update", output)
+
     def test_completion_does_not_dump_full_final_response(self) -> None:
         sink = TerminalEventSink(stream=io.StringIO(), is_tty=False, use_color=False, run_id="ui-final")
         giant = "SECRET-FINAL-" + ("x" * 5000)

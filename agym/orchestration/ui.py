@@ -977,16 +977,26 @@ class TerminalEventSink(EventSink):
 
         if etype == EventType.ACTION_REQUESTED:
             act = payload.get("action")
-            kind = payload.get("kind") or (getattr(act, "kind", "") if act else "")
+            if isinstance(act, dict):
+                kind = payload.get("kind") or act.get("kind", "")
+                reason = act.get("reason") or act.get("reason_summary") or ""
+            else:
+                kind = payload.get("kind") or (getattr(act, "kind", "") if act else "")
+                reason = getattr(act, "reason", "") or getattr(act, "reason_summary", "") if act else ""
             if hasattr(kind, "value"):
                 kind = kind.value
-            return f"[action] requested {kind}".rstrip()
+            suffix = f" - {str(reason)[:120]}" if reason else ""
+            return f"[action] requested {kind}{suffix}".rstrip()
 
         if etype == EventType.ACTION_ACCEPTED:
             act = payload.get("action")
-            kind = payload.get("kind") or (getattr(act, "kind", "") if act else "")
+            if isinstance(act, dict):
+                kind = payload.get("kind") or act.get("kind", "")
+            else:
+                kind = payload.get("kind") or (getattr(act, "kind", "") if act else "")
             if hasattr(kind, "value"):
                 kind = kind.value
+            kind = kind or self.state.current_action_kind
             return f"[action] accepted {kind}".rstrip()
 
         if etype == EventType.ACTION_REJECTED:
@@ -1020,6 +1030,16 @@ class TerminalEventSink(EventSink):
             dur = payload.get("duration") or payload.get("duration_seconds")
             dur_info = f" ({int(round(float(dur)))}s)" if dur is not None else ""
             return f"[worker] {name} completed{dur_info}"
+
+        if etype == EventType.INVOCATION_ACTIVITY:
+            wid = str(payload.get("worker_id") or "")
+            name = self._resolve_worker_display_name(wid, None)
+            activity = str(payload.get("activity") or "")[:120]
+            return f"[worker] {name}: {activity}" if activity else None
+
+        if etype == EventType.ARTIFACT_WRITTEN:
+            path = str(payload.get("artifact_path") or "")
+            return f"[artifact] {path}" if path else None
 
         if etype == EventType.INVOCATION_FAILED:
             res = payload.get("result")
