@@ -463,6 +463,9 @@ class TestV2Presentation(unittest.TestCase):
         }))
         rendered = sink.render(use_color=False)
         self.assertIn("/tmp/run/deliverables/final.md", rendered)
+        self.assertIn("Workers:", rendered)
+        self.assertIn("Audits:", rendered)
+        self.assertIn("agym orchestrate inspect ui-final", rendered)
         self.assertNotIn(giant, rendered)
 
 

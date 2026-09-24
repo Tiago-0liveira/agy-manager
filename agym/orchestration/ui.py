@@ -630,8 +630,11 @@ class TerminalEventSink(EventSink):
             p_name = payload.get("profile_name") or payload.get("profile") or (getattr(lease, "profile_name", None) if lease else None)
             wid = payload.get("worker_id") or payload.get("worker") or (getattr(lease, "worker_id", None) if lease else None)
             if wid and p_name:
-                wp = self._ensure_worker(str(wid))
-                wp.profile_name = str(p_name)
+                if str(wid) == "coordinator":
+                    self.state.coordinator_profile = str(p_name)
+                else:
+                    wp = self._ensure_worker(str(wid))
+                    wp.profile_name = str(p_name)
 
         elif etype == EventType.INVOCATION_STARTED:
             inv = payload.get("invocation")
@@ -910,11 +913,27 @@ class TerminalEventSink(EventSink):
             if self.state.final_artifact_path:
                 lines.append("")
                 lines.append(f"Final: {self.state.final_artifact_path}")
-            lines.append(
-                f"Rounds: {self.state.budget_rounds} · "
-                f"Invocations: {self.state.budget_invocations} · "
-                f"Runtime: {format_duration(self.state.runtime_seconds)}"
-            )
+
+            succeeded = [
+                w for w in self.state.workers.values()
+                if w.status == WorkerStatus.SUCCEEDED and w.worker_id != "coordinator"
+            ]
+            audit_count = sum(1 for w in succeeded if str(w.role).upper() == WorkerRole.AUDITOR.value)
+            worker_count = len(succeeded) - audit_count
+            lines.extend([
+                "",
+                f"Rounds:       {self.state.budget_rounds}",
+                f"Workers:      {worker_count}",
+                f"Audits:       {audit_count}",
+                f"Invocations:  {self.state.budget_invocations}",
+                f"Runtime:      {format_duration(self.state.runtime_seconds)}",
+            ])
+            if self.state.run_id:
+                lines.extend([
+                    "",
+                    "Inspect:",
+                    f"  agym orchestrate inspect {self.state.run_id}",
+                ])
         elif self.state.run_status == RunStatus.FAILED.value:
             reason = f": {self.state.failure_reason}" if self.state.failure_reason else ""
             lines.append(colorize(f"✗ Orchestration FAILED{reason}", RED + BOLD, use_color))
@@ -1014,6 +1033,8 @@ class TerminalEventSink(EventSink):
             lease = payload.get("lease")
             p_name = payload.get("profile_name") or payload.get("profile") or (getattr(lease, "profile_name", "") if lease else "")
             wid = payload.get("worker_id") or payload.get("worker") or (getattr(lease, "worker_id", "") if lease else "")
+            if str(wid) == "coordinator":
+                return None
             return f"[fleet] leased {p_name} for {wid}"
 
         if etype == EventType.PROFILE_RELEASED:
