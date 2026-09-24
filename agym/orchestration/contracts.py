@@ -840,6 +840,8 @@ class CoordinatorAction:
                 raise ValueError("RUN_EXECUTOR action cannot contain auditors")
             if self.workers[0].role != WorkerRole.EXECUTOR:
                 raise ValueError("RUN_EXECUTOR worker must have role EXECUTOR")
+            if self.workers[0].workspace_mode != WorkspaceMode.MUTATING:
+                raise ValueError("RUN_EXECUTOR worker must use MUTATING workspace mode")
 
     def to_dict(self) -> dict[str, Any]:
         return {

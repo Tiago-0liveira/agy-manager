@@ -571,7 +571,10 @@ class OrchestrationEngine:
                 if targets & synthesis_targets and wid not in q.synthesis_critique_worker_ids:
                     q.synthesis_critique_worker_ids.append(wid)
                 if state.mode == RunMode.IMPLEMENT and q.executor_completed:
-                    if wid not in q.implementation_audit_worker_ids:
+                    implementation_targets = {
+                        value for value in [q.last_executor_worker_id, *q.verification_worker_ids] if value
+                    }
+                    if targets & implementation_targets and wid not in q.implementation_audit_worker_ids:
                         q.implementation_audit_worker_ids.append(wid)
 
             q.audits_completed = len(q.audit_worker_ids)
@@ -631,6 +634,8 @@ class OrchestrationEngine:
                 # Executor safety: exactly one mutating worker, role EXECUTOR
                 if len(action.workers) != 1 or action.workers[0].role != WorkerRole.EXECUTOR:
                     return False, "RUN_EXECUTOR action must contain exactly one worker with EXECUTOR role"
+                if action.workers[0].workspace_mode != WorkspaceMode.MUTATING:
+                    return False, "RUN_EXECUTOR worker must use MUTATING workspace mode"
                 readiness = self._check_executor_readiness(state)
                 if readiness:
                     return False, "RUN_EXECUTOR rejected: " + "; ".join(readiness)
