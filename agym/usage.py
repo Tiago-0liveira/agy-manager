@@ -10,9 +10,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Sequence
 
-from .cache import CacheManager, TTL_USAGE_SECONDS, USAGE_CACHE_TTL_SECONDS, format_age, format_freshness_badge
+from .cache import (
+    DEFAULT_USAGE_CACHE_TTL_SECONDS,
+    CacheManager,
+    TTL_USAGE_SECONDS,
+    USAGE_CACHE_TTL_SECONDS,
+    format_age,
+    format_cache_summary,
+    format_freshness_badge,
+)
 from .launcher import build_profile_env, resolve_agy
 from .profiles import Profile, ProfileStore
+from .sessions import get_session_counts
 from .quota_api import fetch_quota_direct_async
 from .subscription import calculate_subscription_health, format_subscription_cells
 from .usage_graphs import (
@@ -383,7 +392,10 @@ def parse_usage_response(
     )
 
 
-def account_usage_to_dict(usage: AccountUsage) -> dict[str, Any]:
+def account_usage_to_dict(
+    usage: AccountUsage,
+    open_sessions: int | None = None,
+) -> dict[str, Any]:
     if usage.subscription_date:
         health = calculate_subscription_health(usage.subscription_date)
         sub_dict: dict[str, Any] = {
@@ -403,7 +415,7 @@ def account_usage_to_dict(usage: AccountUsage) -> dict[str, Any]:
         }
 
     if usage.status != "success":
-        return {
+        res = {
             "account": usage.account,
             "status": "error",
             "cached": usage.cached,
@@ -412,6 +424,9 @@ def account_usage_to_dict(usage: AccountUsage) -> dict[str, Any]:
             "error": usage.error or "unknown error",
             "subscription": sub_dict,
         }
+        if open_sessions is not None:
+            res["open_sessions"] = open_sessions
+        return res
 
     groups_data: list[dict[str, Any]] = []
     for g in usage.groups:
@@ -437,7 +452,7 @@ def account_usage_to_dict(usage: AccountUsage) -> dict[str, Any]:
         }
         groups_data.append(group_dict)
 
-    return {
+    res = {
         "account": usage.account,
         "status": "success",
         "cached": usage.cached,
@@ -446,11 +461,24 @@ def account_usage_to_dict(usage: AccountUsage) -> dict[str, Any]:
         "subscription": sub_dict,
         "groups": groups_data,
     }
+    if open_sessions is not None:
+        res["open_sessions"] = open_sessions
+    return res
 
 
-def usage_payload_to_dict(usages: Sequence[AccountUsage]) -> dict[str, Any]:
+def usage_payload_to_dict(
+    usages: Sequence[AccountUsage],
+    session_counts: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    counts = session_counts if session_counts is not None else {}
     return {
-        "accounts": [account_usage_to_dict(u) for u in usages]
+        "accounts": [
+            account_usage_to_dict(
+                u,
+                open_sessions=counts.get(u.account, 0) if session_counts is not None else None,
+            )
+            for u in usages
+        ]
     }
 
 
@@ -539,6 +567,7 @@ def render_usage_table_lines(
     profiles: Sequence[Profile],
     completed_map: dict[str, AccountUsage],
     *,
+    session_counts: dict[str, int] | None = None,
     show_claude: bool = False,
     spinner_char: str | None = None,
     use_color: bool = True,
@@ -552,6 +581,7 @@ def render_usage_table_lines(
         completed_map,
         extract_quota_bucket,
         format_short_reset_time,
+        session_counts=session_counts,
         show_claude=show_claude,
         use_color=use_color,
         term_width=term_width,
@@ -601,10 +631,12 @@ def render_usage_view_lines(
     profiles: Sequence[Profile],
     completed_map: dict[str, AccountUsage],
     *,
+    session_counts: dict[str, int] | None = None,
     view: str = "table",
     sort_by: str = "usage",
     show_claude: bool = False,
     include_summary: bool = True,
+    include_freshness: bool = True,
     spinner_char: str | None = None,
     use_color: bool = True,
     bar_width: int = 10,
@@ -615,6 +647,13 @@ def render_usage_view_lines(
     telemetry = compute_fleet_telemetry(completed_map, extract_quota_bucket)
 
     lines: list[str] = []
+
+    # One small summary above profile rows
+    if include_freshness and completed_map:
+        summary_line = format_cache_summary(list(completed_map.values()), use_color=use_color)
+        lines.append(summary_line)
+        lines.append("")
+
     # Prepend fleet summary banner for table, grid, matrix if summary is requested
     if include_summary and len(completed_map) > 0 and view != "telemetry":
         banner = render_fleet_summary_banner(telemetry, width=term_width or 80, use_color=use_color)
@@ -628,6 +667,7 @@ def render_usage_view_lines(
                 sorted_profs,
                 completed_map,
                 extract_quota_bucket,
+                session_counts=session_counts,
                 use_color=use_color,
                 term_width=term_width,
             )
@@ -639,6 +679,7 @@ def render_usage_view_lines(
                 completed_map,
                 extract_quota_bucket,
                 format_short_reset_time,
+                session_counts=session_counts,
                 show_claude=show_claude,
                 use_color=use_color,
                 term_width=term_width,
@@ -655,6 +696,7 @@ def render_usage_view_lines(
                 completed_map,
                 extract_quota_bucket,
                 format_short_reset_time,
+                session_counts=session_counts,
                 use_color=use_color,
                 term_width=term_width,
             )
@@ -665,6 +707,7 @@ def render_usage_view_lines(
             render_usage_table_lines(
                 sorted_profs,
                 completed_map,
+                session_counts=session_counts,
                 show_claude=show_claude,
                 spinner_char=spinner_char,
                 use_color=use_color,
@@ -948,6 +991,8 @@ class ProgressiveUsageUI:
         sort_by: str = "usage",
         show_claude: bool = False,
         include_summary: bool | None = None,
+        session_counts: dict[str, int] | None = None,
+        data_root: Path | None = None,
     ) -> None:
         self.profiles = list(profiles)
         self.stdout = sys.stdout if stdout is None else stdout
@@ -959,6 +1004,12 @@ class ProgressiveUsageUI:
             self.include_summary = self.is_tty
         else:
             self.include_summary = include_summary
+        self.data_root = data_root
+        self.session_counts = (
+            session_counts
+            if session_counts is not None
+            else get_session_counts(data_root=self.data_root)
+        )
         self.completed: dict[str, AccountUsage] = {}
         self.spinner_idx = 0
         self.last_lines_count = 0
@@ -995,6 +1046,7 @@ class ProgressiveUsageUI:
         view_lines = render_usage_view_lines(
             self.profiles,
             self.completed,
+            session_counts=self.session_counts,
             view=self.view,
             sort_by=self.sort_by,
             show_claude=self.show_claude,
@@ -1042,6 +1094,7 @@ class ProgressiveUsageUI:
         view_lines = render_usage_view_lines(
             self.profiles,
             completed_map,
+            session_counts=self.session_counts,
             view=self.view,
             sort_by=self.sort_by,
             show_claude=self.show_claude,
@@ -1079,12 +1132,20 @@ async def run_usage(
     show_claude: bool = False,
     include_summary: bool | None = None,
     cache_manager: CacheManager | None = None,
+    cache_ttl: float | None = None,
+    data_root: Path | None = None,
     is_tty: bool | None = None,
     stdout: Any = None,
     runner: Callable[..., Coroutine[Any, Any, tuple[int, str, str]]] | None = None,
 ) -> list[AccountUsage]:
     out = sys.stdout if stdout is None else stdout
-    cm = cache_manager if cache_manager is not None else CacheManager()
+    cm = cache_manager if cache_manager is not None else CacheManager(cache_root=data_root / "cache" if data_root else None)
+    if cache_ttl is None:
+        store = ProfileStore(data_root=data_root)
+        effective_ttl = store.get_usage_cache_ttl()
+    else:
+        effective_ttl = cache_ttl
+
     if not profiles:
         if json_mode:
             out.write(json.dumps({"accounts": []}, indent=2) + "\n")
@@ -1102,9 +1163,11 @@ async def run_usage(
             timeout=timeout,
             force_refresh=refresh,
             cache_manager=cm,
+            max_age=effective_ttl,
             runner=runner,
         )
-        payload = usage_payload_to_dict(usages)
+        session_counts = get_session_counts(data_root=data_root)
+        payload = usage_payload_to_dict(usages, session_counts=session_counts)
         out.write(json.dumps(payload, indent=2) + "\n")
         out.flush()
         return usages
@@ -1113,10 +1176,11 @@ async def run_usage(
     need_live_query = refresh
     if not refresh:
         for p in profiles:
-            if cm.get_usage(p.name, max_age=TTL_USAGE_SECONDS) is None:
+            if cm.get_usage(p.name, max_age=effective_ttl) is None:
                 need_live_query = True
                 break
 
+    session_counts = get_session_counts(data_root=data_root)
     tty_mode = sys.stdout.isatty() if is_tty is None else is_tty
     if need_live_query and tty_mode:
         ui = ProgressiveUsageUI(
@@ -1127,6 +1191,8 @@ async def run_usage(
             sort_by=sort_by,
             show_claude=show_claude,
             include_summary=include_summary,
+            session_counts=session_counts,
+            data_root=data_root,
         )
         spinner_task = asyncio.create_task(ui.spinner_loop())
         usages_result: list[AccountUsage] = []
@@ -1138,6 +1204,7 @@ async def run_usage(
                 timeout=timeout,
                 force_refresh=refresh,
                 cache_manager=cm,
+                max_age=effective_ttl,
                 on_progress=ui.on_progress,
                 runner=runner,
             )
@@ -1154,6 +1221,8 @@ async def run_usage(
         sort_by=sort_by,
         show_claude=show_claude,
         include_summary=include_summary,
+        session_counts=session_counts,
+        data_root=data_root,
     )
     usages_result = await fetch_all_usage(
         agy_path,
@@ -1162,6 +1231,7 @@ async def run_usage(
         timeout=timeout,
         force_refresh=refresh,
         cache_manager=cm,
+        max_age=effective_ttl,
         on_progress=ui.on_progress if not tty_mode else None,
         runner=runner,
     )
@@ -1175,22 +1245,30 @@ async def fetch_and_cache_usage_async(
     *,
     agy_path: Path | None = None,
     cache_manager: CacheManager | None = None,
+    cache_ttl: float | None = None,
+    data_root: Path | None = None,
     concurrency_limit: int = 12,
     timeout: float = 30.0,
     runner: Callable[..., Coroutine[Any, Any, tuple[int, str, str]]] | None = None,
     on_progress: Callable[[AccountUsage], None] | None = None,
 ) -> list[AccountUsage]:
-    """Retrieves usage data for profiles honoring 5-minute cache freshness (USAGE_CACHE_TTL_SECONDS).
+    """Retrieves usage data for profiles honoring shared configurable cache TTL.
 
-    If force is False and valid cache (<300s) exists, cached data is returned without network calls.
+    If force is False and valid cache exists, cached data is returned without network calls.
     Otherwise, invokes the API runner to refresh stale/missing data and updates the cache.
     """
-    cm = cache_manager if cache_manager is not None else CacheManager()
+    cm = cache_manager if cache_manager is not None else CacheManager(cache_root=data_root / "cache" if data_root else None)
     if profiles is None:
-        store = ProfileStore()
+        store = ProfileStore(data_root=data_root)
         profiles = store.list()
     if not profiles:
         return []
+
+    if cache_ttl is None:
+        store = ProfileStore(data_root=data_root)
+        effective_ttl = store.get_usage_cache_ttl()
+    else:
+        effective_ttl = cache_ttl
 
     if agy_path is None:
         agy_path = resolve_agy()
@@ -1202,7 +1280,7 @@ async def fetch_and_cache_usage_async(
         timeout=timeout,
         force_refresh=force,
         cache_manager=cm,
-        max_age=USAGE_CACHE_TTL_SECONDS,
+        max_age=effective_ttl,
         on_progress=on_progress,
         runner=runner,
     )
@@ -1214,6 +1292,8 @@ def fetch_and_cache_usage(
     *,
     agy_path: Path | None = None,
     cache_manager: CacheManager | None = None,
+    cache_ttl: float | None = None,
+    data_root: Path | None = None,
     concurrency_limit: int = 8,
     timeout: float = 30.0,
     runner: Callable[..., Coroutine[Any, Any, tuple[int, str, str]]] | None = None,
@@ -1230,6 +1310,8 @@ def fetch_and_cache_usage(
         force=force,
         agy_path=agy_path,
         cache_manager=cache_manager,
+        cache_ttl=cache_ttl,
+        data_root=data_root,
         concurrency_limit=concurrency_limit,
         timeout=timeout,
         runner=runner,
@@ -1243,3 +1325,4 @@ def fetch_and_cache_usage(
             return executor.submit(asyncio.run, coro).result()
     else:
         return asyncio.run(coro)
+

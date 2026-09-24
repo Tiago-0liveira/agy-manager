@@ -329,3 +329,28 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(data["last_account"], "acc_renamed")
         self.assertEqual(data["history"], ["acc0", "acc_renamed"])
 
+    def test_usage_cache_ttl_persistence_and_defaults(self) -> None:
+        # Default when absent is 300.0s
+        self.assertEqual(self.store.get_usage_cache_ttl(), 300.0)
+
+        # Set to 60s
+        res = self.store.set_usage_cache_ttl(60.0)
+        self.assertEqual(res, 60.0)
+        self.assertEqual(self.store.get_usage_cache_ttl(), 60.0)
+
+        # Verify persisted JSON structure has "settings": {"usage_cache_ttl_seconds": 60}
+        raw = json.loads(self.store.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(raw["settings"]["usage_cache_ttl_seconds"], 60)
+
+        # Reload with new store instance
+        reloaded = ProfileStore(self.store.config_root, self.store.data_root)
+        self.assertEqual(reloaded.get_usage_cache_ttl(), 60.0)
+
+        # Reset to default (None)
+        res_default = self.store.set_usage_cache_ttl(None)
+        self.assertEqual(res_default, 300.0)
+        self.assertEqual(self.store.get_usage_cache_ttl(), 300.0)
+        raw_after = json.loads(self.store.config_path.read_text(encoding="utf-8"))
+        self.assertNotIn("usage_cache_ttl_seconds", raw_after.get("settings", {}))
+
+

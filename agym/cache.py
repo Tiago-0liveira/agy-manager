@@ -9,11 +9,58 @@ from typing import Any
 
 from .profiles import _chmod_private_dir, _default_data_root
 
-# Default TTL policies
-TTL_USAGE_SECONDS = 60.0      # 1 minute for live quota
-USAGE_CACHE_TTL_SECONDS = 300.0  # 5 minutes for interactive picker cache freshness
+# Shared default usage cache TTL (5 minutes)
+DEFAULT_USAGE_CACHE_TTL_SECONDS = 300.0
+USAGE_CACHE_TTL_SECONDS = DEFAULT_USAGE_CACHE_TTL_SECONDS
+TTL_USAGE_SECONDS = 60.0      # legacy constant
 TTL_TOKENS_SECONDS = 600.0    # 10 minutes for token usage tracking
 USAGE_CACHE_VERSION = 2  # v1 may contain quota values from the inaccurate direct API path
+
+
+def parse_duration_seconds(duration_str: str) -> float:
+    """Parses a simple duration string (e.g. '30s', '5m', '1h', '2d', or 'default') into seconds.
+
+    If 'default' is passed, returns DEFAULT_USAGE_CACHE_TTL_SECONDS (300.0).
+    Raises ValueError on invalid formats or non-positive durations.
+    """
+    raw = str(duration_str).strip().lower()
+    if raw == "default":
+        return DEFAULT_USAGE_CACHE_TTL_SECONDS
+
+    import re
+
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*([smhd]?)$", raw)
+    if not m:
+        raise ValueError(
+            f"invalid duration format '{duration_str}'. Expected e.g. 30s, 5m, 1h, or default"
+        )
+    val = float(m.group(1))
+    unit = m.group(2) or "s"
+    if val <= 0:
+        raise ValueError(f"duration must be greater than 0, got '{duration_str}'")
+
+    if unit == "s":
+        return val
+    elif unit == "m":
+        return val * 60.0
+    elif unit == "h":
+        return val * 3600.0
+    elif unit == "d":
+        return val * 86400.0
+    return val
+
+
+def format_duration(seconds: float) -> str:
+    """Formats seconds into concise duration representation (e.g. 30s, 5m, 1h)."""
+    secs = int(seconds) if isinstance(seconds, (int, float)) and float(seconds).is_integer() else seconds
+    if isinstance(secs, int):
+        if secs % 86400 == 0 and secs >= 86400:
+            return f"{secs // 86400}d"
+        if secs % 3600 == 0 and secs >= 3600:
+            return f"{secs // 3600}h"
+        if secs % 60 == 0 and secs >= 60:
+            return f"{secs // 60}m"
+    return f"{secs}s"
 
 
 def should_refresh_cache(
@@ -74,6 +121,71 @@ def format_freshness_badge(
     if use_color:
         return f"\033[90m{text}\033[0m"
     return text
+
+
+def format_cache_summary(
+    usages: Sequence[Any],
+    *,
+    use_color: bool = True,
+) -> str:
+    """Formats a single conservative cache freshness summary for all accounts.
+
+    Examples:
+        - All live: 'Data: Live'
+        - All cached (same age): 'Data: Cached · 2m ago'
+        - Mixed (some live, or differing cache ages): 'Data: Mixed · cached data up to 3m old'
+    """
+    if not usages:
+        if use_color:
+            return "Data: \033[32mLive\033[0m"
+        return "Data: Live"
+
+    cached_entries: list[tuple[bool, float]] = []
+    for u in usages:
+        if hasattr(u, "cached"):
+            is_c = bool(u.cached)
+            age = float(getattr(u, "age_seconds", 0.0))
+        elif isinstance(u, dict):
+            is_c = bool(u.get("cached", False))
+            age = float(u.get("age_seconds", 0.0))
+        else:
+            is_c = False
+            age = 0.0
+        cached_entries.append((is_c, max(0.0, age)))
+
+    cached_only = [entry for entry in cached_entries if entry[0]]
+
+    # Case 1: No cached entries -> All Live
+    if not cached_only:
+        if use_color:
+            return "Data: \033[32mLive\033[0m"
+        return "Data: Live"
+
+    oldest_age = max(age for _, age in cached_only)
+    oldest_age_str = format_age(oldest_age)
+
+    # Case 2: All items cached
+    if len(cached_only) == len(cached_entries):
+        formatted_ages = {format_age(age) for _, age in cached_only}
+        if len(formatted_ages) == 1:
+            text = f"Cached · {oldest_age_str}"
+            if use_color:
+                return f"Data: \033[90m{text}\033[0m"
+            return f"Data: {text}"
+
+    # Case 3: Mixed (some live and some cached, OR differing cache ages)
+    if oldest_age_str.endswith(" ago"):
+        age_part = oldest_age_str[:-4]
+    elif oldest_age_str == "just now":
+        age_part = "<1m"
+    else:
+        age_part = oldest_age_str
+
+    msg = f"Mixed · cached data up to {age_part} old"
+    if use_color:
+        return f"Data: \033[90m{msg}\033[0m"
+    return f"Data: {msg}"
+
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:

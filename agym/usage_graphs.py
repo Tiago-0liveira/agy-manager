@@ -324,6 +324,7 @@ def render_usage_grid_lines(
     extract_bucket_fn: Any,
     format_short_reset_fn: Any,
     *,
+    session_counts: dict[str, int] | None = None,
     show_claude: bool = False,
     use_color: bool = True,
     term_width: int | None = None,
@@ -333,7 +334,9 @@ def render_usage_grid_lines(
         term_width, _ = shutil.get_terminal_size((80, 24))
 
     acc_col_width = max(10, max([len(p.name) for p in profiles], default=10))
+    sess_col_width = 4
     cell_width = 26
+    sess_counts = session_counts or {}
 
     dim = "\033[90m" if use_color else ""
     reset = "\033[0m" if use_color else ""
@@ -343,10 +346,11 @@ def render_usage_grid_lines(
     lines: list[str] = []
 
     if not show_claude:
-        # Default view: 1 line per account (Account, Gemini 5h, Gemini Wk, Sub)
+        # Default view: 1 line per account (Account, Sess, Gemini 5h, Gemini Wk, Sub)
         quota_area = cell_width * 2 + 2
         header = (
             f"{bold}{'Account':<{acc_col_width}}{reset}  "
+            f"{bold}{'Sess':<{sess_col_width}}{reset}  "
             f"{bold}{'Gemini 5h':<{cell_width}}{reset}  "
             f"{bold}{'Gemini Wk':<{cell_width}}{reset}  "
             f"{bold}Sub{reset}"
@@ -358,9 +362,11 @@ def render_usage_grid_lines(
             sub_plain = format_compact_sub(sub_health)
             sub_badge = format_colored_compact_sub(sub_health, use_color=use_color)
             sub_pad = " " * max(0, 3 - len(sub_plain))
+            sess_num = sess_counts.get(p.name, 0)
+            sess_cell = f"{sess_num:<{sess_col_width}}"
 
             if p.name not in completed_map:
-                row = f"{p.name:<{acc_col_width}}  {dim}{'Loading...':<{quota_area}}{reset}  {sub_badge}{sub_pad}"
+                row = f"{p.name:<{acc_col_width}}  {sess_cell}  {dim}{'Loading...':<{quota_area}}{reset}  {sub_badge}{sub_pad}"
                 lines.append(row)
                 continue
 
@@ -371,7 +377,7 @@ def render_usage_grid_lines(
                 if len(failed_text) > quota_area:
                     failed_text = failed_text[: quota_area - 3] + "..."
                 disp_err = f"{red}{failed_text:<{quota_area}}{reset}" if use_color else f"{failed_text:<{quota_area}}"
-                row = f"{p.name:<{acc_col_width}}  {disp_err}  {sub_badge}{sub_pad}"
+                row = f"{p.name:<{acc_col_width}}  {sess_cell}  {disp_err}  {sub_badge}{sub_pad}"
                 lines.append(row)
                 continue
 
@@ -380,7 +386,7 @@ def render_usage_grid_lines(
             g5_cell = format_quota_cell_simple(b_g5, prefix="5h: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
             gw_cell = format_quota_cell_simple(b_gw, prefix="Wk: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
 
-            row = f"{p.name:<{acc_col_width}}  {g5_cell}  {gw_cell}  {sub_badge}{sub_pad}"
+            row = f"{p.name:<{acc_col_width}}  {sess_cell}  {g5_cell}  {gw_cell}  {sub_badge}{sub_pad}"
             lines.append(row)
 
     else:
@@ -390,6 +396,7 @@ def render_usage_grid_lines(
             quota_area = cell_width * 4 + 6
             header = (
                 f"{bold}{'Account':<{acc_col_width}}{reset}  "
+                f"{bold}{'Sess':<{sess_col_width}}{reset}  "
                 f"{bold}{'Gemini 5h':<{cell_width}}{reset}  "
                 f"{bold}{'Gemini Wk':<{cell_width}}{reset}  "
                 f"{bold}{'Claude 5h':<{cell_width}}{reset}  "
@@ -403,9 +410,11 @@ def render_usage_grid_lines(
                 sub_plain = format_compact_sub(sub_health)
                 sub_badge = format_colored_compact_sub(sub_health, use_color=use_color)
                 sub_pad = " " * max(0, 3 - len(sub_plain))
+                sess_num = sess_counts.get(p.name, 0)
+                sess_cell = f"{sess_num:<{sess_col_width}}"
 
                 if p.name not in completed_map:
-                    row = f"{p.name:<{acc_col_width}}  {dim}{'Loading...':<{quota_area}}{reset}  {sub_badge}{sub_pad}"
+                    row = f"{p.name:<{acc_col_width}}  {sess_cell}  {dim}{'Loading...':<{quota_area}}{reset}  {sub_badge}{sub_pad}"
                     lines.append(row)
                     continue
 
@@ -416,7 +425,7 @@ def render_usage_grid_lines(
                     if len(failed_text) > quota_area:
                         failed_text = failed_text[: quota_area - 3] + "..."
                     disp_err = f"{red}{failed_text:<{quota_area}}{reset}" if use_color else f"{failed_text:<{quota_area}}"
-                    row = f"{p.name:<{acc_col_width}}  {disp_err}  {sub_badge}{sub_pad}"
+                    row = f"{p.name:<{acc_col_width}}  {sess_cell}  {disp_err}  {sub_badge}{sub_pad}"
                     lines.append(row)
                     continue
 
@@ -430,13 +439,14 @@ def render_usage_grid_lines(
                 c5_cell = format_quota_cell_simple(b_c5, prefix="5h: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
                 cw_cell = format_quota_cell_simple(b_cw, prefix="Wk: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
 
-                row = f"{p.name:<{acc_col_width}}  {g5_cell}  {gw_cell}  {c5_cell}  {cw_cell}  {sub_badge}{sub_pad}"
+                row = f"{p.name:<{acc_col_width}}  {sess_cell}  {g5_cell}  {gw_cell}  {c5_cell}  {cw_cell}  {sub_badge}{sub_pad}"
                 lines.append(row)
         else:
             # Compact / narrow terminal (< 120 cols): 2 lines per account
             quota_area = cell_width * 2 + 2
             header = (
                 f"{bold}{'Account':<{acc_col_width}}{reset}  "
+                f"{bold}{'Sess':<{sess_col_width}}{reset}  "
                 f"{bold}{'Model':<6}{reset}  "
                 f"{bold}{'5h Quota':<{cell_width}}{reset}  "
                 f"{bold}{'Wk Quota':<{cell_width}}{reset}  "
@@ -449,9 +459,11 @@ def render_usage_grid_lines(
                 sub_plain = format_compact_sub(sub_health)
                 sub_badge = format_colored_compact_sub(sub_health, use_color=use_color)
                 sub_pad = " " * max(0, 3 - len(sub_plain))
+                sess_num = sess_counts.get(p.name, 0)
+                sess_cell = f"{sess_num:<{sess_col_width}}"
 
                 if p.name not in completed_map:
-                    row = f"{p.name:<{acc_col_width}}  {'':<6}  {dim}{'Loading...':<{quota_area}}{reset}  {sub_badge}{sub_pad}"
+                    row = f"{p.name:<{acc_col_width}}  {sess_cell}  {'':<6}  {dim}{'Loading...':<{quota_area}}{reset}  {sub_badge}{sub_pad}"
                     lines.append(row)
                     continue
 
@@ -462,7 +474,7 @@ def render_usage_grid_lines(
                     if len(failed_text) > quota_area:
                         failed_text = failed_text[: quota_area - 3] + "..."
                     disp_err = f"{red}{failed_text:<{quota_area}}{reset}" if use_color else f"{failed_text:<{quota_area}}"
-                    row = f"{p.name:<{acc_col_width}}  {'':<6}  {disp_err}  {sub_badge}{sub_pad}"
+                    row = f"{p.name:<{acc_col_width}}  {sess_cell}  {'':<6}  {disp_err}  {sub_badge}{sub_pad}"
                     lines.append(row)
                     continue
 
@@ -476,8 +488,8 @@ def render_usage_grid_lines(
                 c5_cell = format_quota_cell_simple(b_c5, prefix="5h: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
                 cw_cell = format_quota_cell_simple(b_cw, prefix="Wk: ", use_color=use_color, format_short_reset_fn=format_short_reset_fn)
 
-                row1 = f"{p.name:<{acc_col_width}}  {'Gemini':<6}  {g5_cell}  {gw_cell}  {sub_badge}{sub_pad}"
-                row2 = f"{'':<{acc_col_width}}  {dim}{'Claude':<6}{reset}  {c5_cell}  {cw_cell}"
+                row1 = f"{p.name:<{acc_col_width}}  {sess_cell}  {'Gemini':<6}  {g5_cell}  {gw_cell}  {sub_badge}{sub_pad}"
+                row2 = f"{'':<{acc_col_width}}  {'':<{sess_col_width}}  {dim}{'Claude':<6}{reset}  {c5_cell}  {cw_cell}"
                 lines.append(row1)
                 lines.append(row2)
 
@@ -489,6 +501,7 @@ def render_usage_matrix_lines(
     completed_map: dict[str, Any],
     extract_bucket_fn: Any,
     *,
+    session_counts: dict[str, int] | None = None,
     use_color: bool = True,
     term_width: int | None = None,
 ) -> list[str]:
@@ -501,8 +514,9 @@ def render_usage_matrix_lines(
     bold = "\033[1m" if use_color else ""
 
     # Each matrix cell: " acc_name [G: 64% █▍| C:100% ██] " -> ~30 chars
-    cell_width = 30
+    cell_width = 35
     cols = max(1, min(4, term_width // cell_width))
+    sess_counts = session_counts or {}
 
     cells: list[str] = []
     for p in profiles:
@@ -510,13 +524,14 @@ def render_usage_matrix_lines(
         if len(acc_name) > 10:
             acc_name = acc_name[:9] + "…"
 
+        sess_prefix = f"{acc_name:<10} S:{sess_counts.get(p.name, 0)}"
         if p.name not in completed_map:
-            cells.append(f"{acc_name:<10} [Loading...]")
+            cells.append(f"{sess_prefix} [Loading...]")
             continue
 
         usage = completed_map[p.name]
         if usage.status != "success" and usage.status != "unknown" and not (usage.status == "quiescent" and usage.groups):
-            cells.append(f"{acc_name:<10} \033[91m[Error/Failed]\033[0m" if use_color else f"{acc_name:<10} [Error/Failed]")
+            cells.append(f"{sess_prefix} \033[91m[Error/Failed]\033[0m" if use_color else f"{sess_prefix} [Error/Failed]")
             continue
 
         b_g = extract_bucket_fn(usage, "gemini", "5h")
@@ -538,7 +553,7 @@ def render_usage_matrix_lines(
         else:
             c_str = f"C:{dim}  ?% -{reset}" if use_color else "C:  ?% -"
 
-        cell_str = f"{acc_name:<10} {dim}[{reset}{g_str} {dim}│{reset} {c_str}{dim}]{reset}"
+        cell_str = f"{sess_prefix} {dim}[{reset}{g_str} {dim}│{reset} {c_str}{dim}]{reset}"
         cells.append(cell_str)
 
     # Box wrapping the matrix
@@ -570,6 +585,7 @@ def render_usage_telemetry_lines(
     extract_bucket_fn: Any,
     format_short_reset_fn: Any,
     *,
+    session_counts: dict[str, int] | None = None,
     use_color: bool = True,
     term_width: int | None = None,
 ) -> list[str]:
@@ -584,6 +600,7 @@ def render_usage_telemetry_lines(
     yellow = "\033[38;5;184m" if use_color else ""
     red = "\033[38;5;196m" if use_color else ""
     cyan = "\033[36m" if use_color else ""
+    sess_counts = session_counts or {}
 
     # Group into tiers:
     # 🟢 Ready (>70%)
@@ -621,11 +638,12 @@ def render_usage_telemetry_lines(
 
     def format_account_telemetry_row(p: Profile, usage: Any) -> str:
         acc_name = f"{p.name:<12}"
+        sess_disp = f"{dim}Sess:{reset}{sess_counts.get(p.name, 0)}"
         if not usage:
-            return f"   {acc_name} {dim}Loading...{reset}"
+            return f"   {acc_name} {sess_disp}  {dim}Loading...{reset}"
         if usage.status != "success" and usage.status != "unknown" and not (usage.status == "quiescent" and usage.groups):
             err = usage.error or "failed"
-            return f"   {acc_name} {red}✗ Failed: {err}{reset}"
+            return f"   {acc_name} {sess_disp}  {red}✗ Failed: {err}{reset}"
 
         b_g5 = extract_bucket_fn(usage, "gemini", "5h")
         b_gw = extract_bucket_fn(usage, "gemini", "week")
@@ -669,6 +687,7 @@ def render_usage_telemetry_lines(
 
         return (
             f"   {bold}{acc_name}{reset} "
+            f"{sess_disp}  "
             f"{g5_disp}  "
             f"{c5_disp}  "
             f"{gw_disp}  "

@@ -8,7 +8,13 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
-from .cache import CacheManager, USAGE_CACHE_TTL_SECONDS
+from .cache import (
+    CacheManager,
+    USAGE_CACHE_TTL_SECONDS,
+    format_cache_summary,
+    format_duration,
+    parse_duration_seconds,
+)
 from .diagnostics import doctor_lines
 from .git.auto_pr import AutoPrError, build_auto_pr_parser, handle_auto_pr, parse_auto_pr_args
 from .launcher import (
@@ -30,6 +36,7 @@ from .profiles import (
     validate_profile_name,
 )
 from .rotator import AccountRotator, RotationError
+from .sessions import get_session_counts
 from .subscription import (
     SubscriptionError,
     calculate_subscription_health,
@@ -62,16 +69,17 @@ def build_setup_parser() -> argparse.ArgumentParser:
 
 
 def build_config_parser() -> argparse.ArgumentParser:
-    usage = """config <profile>
+    usage = """config [profile]
   [--model MODEL]
-  [-y | --dsp | --skip-perms | --no-dsp | --no-skip-perms]"""
+  [-y | --dsp | --skip-perms | --no-dsp | --no-skip-perms]
+  [--cache-duration DURATION]"""
     parser = argparse.ArgumentParser(
         prog="agym config",
         usage=usage,
-        description="Configure profile model and permission settings.",
+        description="Configure profile model, permissions, or global cache duration.",
         add_help=True,
     )
-    parser.add_argument("profile", help="Name of the profile to configure")
+    parser.add_argument("profile", nargs="?", default=None, help="Name of the profile to configure (optional when setting global options)")
     parser.add_argument("--model", dest="model", default=None, metavar="MODEL", help="Set default model (or 'default' to clear)")
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
@@ -94,6 +102,13 @@ def build_config_parser() -> argparse.ArgumentParser:
         dest="dangerously_skip_permissions",
         action="store_false",
         help="Disable auto-skipping tool permissions for this profile",
+    )
+    parser.add_argument(
+        "--cache-duration",
+        dest="cache_duration",
+        default=None,
+        metavar="DURATION",
+        help="Set usage cache duration (e.g. 30s, 5m, 1h, or 'default')",
     )
     return parser
 
@@ -539,7 +554,7 @@ def _setup(argv: list[str], store: ProfileStore) -> int:
     print(f"Launching Antigravity to set up profile '{profile.name}'.")
     print(f"Profile home: {profile.home}")
     print("Complete the normal Google sign-in flow, then exit Antigravity.")
-    code = run_agy(agy, profile, replace_process=False, is_setup=True)
+    code = run_agy(agy, profile, replace_process=False, is_setup=True, data_root=store.data_root)
     if code != 0:
         _print_err(f"agy exited with status {code}; profile was kept for inspection/retry")
         return code
@@ -565,8 +580,39 @@ def _setup(argv: list[str], store: ProfileStore) -> int:
 def _config(argv: list[str], store: ProfileStore) -> int:
     parser = build_config_parser()
     ns = parser.parse_args(argv)
-    profile = store.get(ns.profile)
 
+    cache_requested = ns.cache_duration is not None
+    cache_reset = False
+    cache_ttl: float | None = None
+    if cache_requested:
+        try:
+            if ns.cache_duration.strip().lower() == "default":
+                cache_reset = True
+            else:
+                cache_ttl = parse_duration_seconds(ns.cache_duration)
+        except ValueError as exc:
+            raise ProfileError(str(exc)) from exc
+
+    if ns.profile is None:
+        if ns.model is not None or ns.dangerously_skip_permissions is not None:
+            raise ProfileError("a profile name is required to configure model or permissions")
+        if cache_requested:
+            if cache_reset:
+                store.set_usage_cache_ttl(None)
+                print("cache-duration: default (5m)")
+            else:
+                assert cache_ttl is not None
+                store.set_usage_cache_ttl(cache_ttl)
+                human = format_duration(cache_ttl)
+                print(f"cache-duration: {human} ({int(cache_ttl)}s)")
+            return 0
+        ttl = store.get_usage_cache_ttl()
+        human = format_duration(ttl)
+        print(f"cache-duration: {human} ({int(ttl)}s)")
+        return 0
+
+    # Validate all profile-scoped inputs before mutating the global cache setting.
+    profile = store.get(ns.profile)
     changed = False
     new_model = profile.settings.model
     new_danger = profile.settings.dangerously_skip_permissions
@@ -584,12 +630,24 @@ def _config(argv: list[str], store: ProfileStore) -> int:
         new_danger = ns.dangerously_skip_permissions
         changed = True
 
+    if cache_requested:
+        if cache_reset:
+            store.set_usage_cache_ttl(None)
+            print("cache-duration: default (5m)")
+        else:
+            assert cache_ttl is not None
+            store.set_usage_cache_ttl(cache_ttl)
+            human = format_duration(cache_ttl)
+            print(f"cache-duration: {human} ({int(cache_ttl)}s)")
+
     if changed:
-        new_settings = ProfileSettings(
-            model=new_model,
-            dangerously_skip_permissions=new_danger,
+        profile = store.update_settings(
+            profile.name,
+            ProfileSettings(
+                model=new_model,
+                dangerously_skip_permissions=new_danger,
+            ),
         )
-        profile = store.update_settings(profile.name, new_settings)
 
     model_display = profile.settings.model if profile.settings.model else "default"
     danger_display = "true" if profile.settings.dangerously_skip_permissions else "false"
@@ -736,6 +794,8 @@ def _usage(argv: list[str], store: ProfileStore) -> int:
     kwargs: dict[str, Any] = {
         "json_mode": ns.json_mode,
         "timeout": ns.timeout,
+        "cache_ttl": store.get_usage_cache_ttl(),
+        "data_root": store.data_root,
     }
     if ns.refresh:
         kwargs["refresh"] = True
@@ -852,7 +912,7 @@ def _rotate(argv: list[str], store: ProfileStore) -> int:
     except ProfileNotFound:
         from .profiles import Profile
         profile = Profile(name=account_id, home=profile_home, created_at="standalone")
-        return run_agy(agy, profile, passthrough, replace_process=True)
+        return run_agy(agy, profile, passthrough, replace_process=True, data_root=store.data_root)
 
 
 def _statusline(argv: list[str], store: ProfileStore) -> int:
@@ -927,10 +987,11 @@ def _select(
         out.flush()
         return 0
 
-    cm = cache_manager if cache_manager is not None else CacheManager()
+    cache_ttl = store.get_usage_cache_ttl()
+    cm = cache_manager if cache_manager is not None else CacheManager(cache_root=store.data_root / "cache" if store.data_root else None)
 
     needs_live = ns.fresh or any(
-        cm.get_usage(p.name, max_age=USAGE_CACHE_TTL_SECONDS) is None
+        cm.get_usage(p.name, max_age=cache_ttl) is None
         for p in profiles
     )
 
@@ -943,14 +1004,24 @@ def _select(
         force=ns.fresh,
         agy_path=agy_path,
         cache_manager=cm,
+        cache_ttl=cache_ttl,
+        data_root=store.data_root,
         runner=runner,
     )
 
     use_color = hasattr(out, "isatty") and out.isatty()
-    items = prepare_accounts_for_picker(usages, use_color=use_color)
+    session_counts = get_session_counts(data_root=store.data_root)
+    freshness_summary = format_cache_summary(usages, use_color=use_color)
+
+    items = prepare_accounts_for_picker(
+        usages,
+        session_counts=session_counts,
+        use_color=use_color,
+    )
 
     selected = run_picker(
         items,
+        freshness_summary=freshness_summary,
         stdout=out,
         stdin=stdin,
         use_color=use_color,
@@ -1060,12 +1131,12 @@ def _launch(profile_name: str, argv: list[str], store: ProfileStore) -> int:
         other_args = [arg for arg in rest if arg not in ALL_PERMISSIONS_ALIASES]
         if other_args:
             raise ProfileError(f"unexpected arguments with --auto-prompt: {' '.join(other_args)}")
-        kwargs: dict[str, Any] = {"replace_process": True}
+        kwargs: dict[str, Any] = {"replace_process": True, "data_root": store.data_root}
         if perm_args:
             kwargs["extra_args"] = perm_args
         return run_auto_prompt(agy, profile, auto_prompt, **kwargs)
 
-    return run_agy(agy, profile, argv, replace_process=True)
+    return run_agy(agy, profile, argv, replace_process=True, data_root=store.data_root)
 
 
 @dataclass

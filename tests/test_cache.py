@@ -13,7 +13,10 @@ from agym.cache import (
     TTL_TOKENS_SECONDS,
     TTL_USAGE_SECONDS,
     format_age,
+    format_cache_summary,
+    format_duration,
     format_freshness_badge,
+    parse_duration_seconds,
 )
 
 
@@ -35,6 +38,68 @@ class CacheAgeAndBadgeFormattingTests(unittest.TestCase):
         badge_colored = format_freshness_badge(True, 42.0, use_color=True)
         self.assertIn("Cached 42s ago", badge_colored)
         self.assertIn("\033[90m", badge_colored)
+
+    def test_format_cache_summary_all_live(self) -> None:
+        usages = [
+            {"account": "a1", "cached": False, "age_seconds": 0.0},
+            {"account": "a2", "cached": False, "age_seconds": 0.0},
+        ]
+        self.assertEqual(format_cache_summary(usages, use_color=False), "Data: Live")
+        colored = format_cache_summary(usages, use_color=True)
+        self.assertIn("Live", colored)
+        self.assertIn("\033[32m", colored)
+
+    def test_format_cache_summary_all_cached_same_age(self) -> None:
+        usages = [
+            {"account": "a1", "cached": True, "age_seconds": 120.0},
+            {"account": "a2", "cached": True, "age_seconds": 120.0},
+        ]
+        self.assertEqual(format_cache_summary(usages, use_color=False), "Data: Cached · 2m ago")
+        colored = format_cache_summary(usages, use_color=True)
+        self.assertIn("Cached · 2m ago", colored)
+        self.assertIn("\033[90m", colored)
+
+    def test_format_cache_summary_mixed_live_and_cached(self) -> None:
+        usages = [
+            {"account": "a1", "cached": True, "age_seconds": 180.0},
+            {"account": "a2", "cached": False, "age_seconds": 0.0},
+        ]
+        # Conservative: uses oldest cached age (180s -> 3m)
+        self.assertEqual(
+            format_cache_summary(usages, use_color=False),
+            "Data: Mixed · cached data up to 3m old",
+        )
+
+    def test_format_cache_summary_mixed_different_cache_ages(self) -> None:
+        usages = [
+            {"account": "a1", "cached": True, "age_seconds": 45.0},
+            {"account": "a2", "cached": True, "age_seconds": 180.0},
+        ]
+        # All cached, but differing ages -> Mixed with oldest age
+        self.assertEqual(
+            format_cache_summary(usages, use_color=False),
+            "Data: Mixed · cached data up to 3m old",
+        )
+
+    def test_duration_parsing_and_formatting(self) -> None:
+        self.assertEqual(parse_duration_seconds("30s"), 30.0)
+        self.assertEqual(parse_duration_seconds("5m"), 300.0)
+        self.assertEqual(parse_duration_seconds("1h"), 3600.0)
+        self.assertEqual(parse_duration_seconds("2d"), 172800.0)
+        self.assertEqual(parse_duration_seconds("default"), 300.0)
+
+        self.assertEqual(format_duration(30.0), "30s")
+        self.assertEqual(format_duration(300.0), "5m")
+        self.assertEqual(format_duration(3600.0), "1h")
+        self.assertEqual(format_duration(172800.0), "2d")
+
+        with self.assertRaises(ValueError):
+            parse_duration_seconds("0s")
+        with self.assertRaises(ValueError):
+            parse_duration_seconds("-5m")
+        with self.assertRaises(ValueError):
+            parse_duration_seconds("invalid")
+
 
 
 class CacheManagerTests(unittest.TestCase):
