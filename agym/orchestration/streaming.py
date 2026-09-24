@@ -108,8 +108,8 @@ def decode_response(stream: str) -> tuple[str, str | None, dict[str, Any] | None
 def _clean_activity_text(value: Any, *, max_length: int = 120) -> str:
     """Normalize provider text so it is safe and compact in a live terminal."""
     text = str(value or "")
-    text = re.sub(r"\\x1b\\[[0-?]*[ -/]*[@-~]", "", text)
-    text = "".join(ch if ch == "\\t" or ord(ch) >= 32 else " " for ch in text)
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    text = "".join(ch if ch == "\t" or ord(ch) >= 32 else " " for ch in text)
     return " ".join(text.split())[:max_length]
 
 
