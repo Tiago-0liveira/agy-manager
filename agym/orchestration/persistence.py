@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -447,12 +448,20 @@ class FileRunStore:
     """
 
     def __init__(self, base_dir: Path | str | None = None) -> None:
+        self._trace_lock = threading.RLock()
+        self.event_sink: EventSink | None = None
         if base_dir is not None:
             self.base_dir = Path(base_dir).resolve()
         else:
             self.base_dir = get_default_runs_dir()
         self.base_dir.mkdir(parents=True, exist_ok=True)
         _chmod_private_dir(self.base_dir)
+
+    def start_attempt(self, run_id: RunId | str, *, prompt: str, **metadata: Any) -> Any:
+        from agym.orchestration.recording import AttemptCapture
+        if not self.run_dir(run_id).is_dir():
+            raise RunNotFoundError(f"Run '{run_id}' not found")
+        return AttemptCapture(self, str(run_id), prompt, **metadata)
 
     def run_dir(self, run_id: RunId | str) -> Path:
         """Get the directory path for a specific run ID."""
@@ -738,6 +747,15 @@ class FileRunStore:
             except OSError:
                 pass
 
+        from agym.orchestration.recording import append_trace
+        append_trace(self, str(event.run_id), "orchestration", event.to_dict(), event_id=str(event.event_id))
+
+        if self.event_sink is not None:
+            try:
+                self.event_sink.emit(event)
+            except Exception as exc:
+                logger.warning("EventSink failed to emit event: %s", exc)
+
     def get_events(self, run_id: RunId) -> list[OrchestrationEvent]:
         """Retrieve stored events for a run in deterministic append order.
 
@@ -855,6 +873,14 @@ class FileRunStore:
 
         return record
 
+    def record_model_metadata(self, run_id: RunId, invocation_id: InvocationId, result: ModelResult) -> None:
+        """Keep model metadata in the logical invocation snapshot as well as its attempt."""
+        record = self.get_invocation(run_id, invocation_id)
+        record.conversation_id = result.conversation_id or record.conversation_id
+        record.usage = result.usage
+        record.exit_code = result.exit_code
+        atomic_write_json(self.run_dir(run_id) / "invocations" / f"{invocation_id}.json", record.to_dict())
+
     def record_invocation_completed(
         self,
         run_id: RunId | str,
@@ -897,6 +923,14 @@ class FileRunStore:
         if resolved_output is not None:
             self.write_output(rid, iid, resolved_output)
             record.response = resolved_output
+
+        if result is not None:
+            cid = result.get("conversation_id") if isinstance(result, dict) else getattr(result, "conversation_id", None)
+            if cid is not None:
+                record.conversation_id = ConversationId(cid)
+            code = result.get("exit_code") if isinstance(result, dict) else getattr(result, "exit_code", None)
+            if code is not None:
+                record.exit_code = code
 
         # Extract structured data, findings, usage
         if result is not None:

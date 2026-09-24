@@ -59,12 +59,9 @@ _STRATEGY_SETTINGS: dict[ExecutionStrategy, ExecutionSettings] = {
     ),
     ExecutionStrategy.BOOST: ExecutionSettings(
         strategy=ExecutionStrategy.BOOST,
-        is_supported=False,
-        args=(),
-        unsupported_reason=(
-            "Antigravity CLI does not provide a stable CLI option for BOOST execution. "
-            "Model effort options are limited to low, medium, and high."
-        ),
+        is_supported=True,
+        effort="high",
+        args=("--effort", "high"),
     ),
 }
 

@@ -612,10 +612,7 @@ class TerminalEventSink(EventSink):
                     payload.get("rejected")
                     or payload.get("status") == "REJECTED"
                 )
-                is_retrying = (
-                    payload.get("retrying")
-                    or failure == FailureClass.RETRYABLE.value
-                )
+                is_retrying = payload.get("retrying")
                 is_interrupted = (
                     payload.get("interrupted")
                     or payload.get("status") == "INTERRUPTED"
@@ -711,7 +708,7 @@ class TerminalEventSink(EventSink):
             lines.append(colorize(f"Wave {wave_num}", BOLD, use_color))
 
             for w in wave.workers:
-                name_col = w.display_name.ljust(13)
+                name_col = w.display_name.ljust(13) + (" " if len(w.display_name) >= 13 else "")
 
                 if w.status == WorkerStatus.SUCCEEDED:
                     icon = colorize(ICON_SUCCESS, GREEN, use_color)
@@ -761,6 +758,11 @@ class TerminalEventSink(EventSink):
                     line = f"  {name_col}{icon} {p_name}".rstrip()
 
                 lines.append(line)
+                if w.error_message:
+                    for eline in w.error_message.splitlines():
+                        eline = eline.strip()
+                        if eline:
+                            lines.append(f"    Error: {eline}")
 
             lines.append("")
 
@@ -889,7 +891,7 @@ class TerminalEventSink(EventSink):
             failure = payload.get("failure") or (getattr(res, "failure", "") if res else "")
             is_cancelled = payload.get("cancelled") or payload.get("status") == InvocationStatus.CANCELLED.value
             is_rejected = payload.get("rejected") or payload.get("status") == "REJECTED" or failure == "REJECTED"
-            is_retrying = payload.get("retrying") or failure == FailureClass.RETRYABLE.value
+            is_retrying = payload.get("retrying")
             is_interrupted = payload.get("interrupted") or payload.get("status") == "INTERRUPTED"
 
             if is_cancelled:

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Sequence
 
+from agym.orchestration.recording import capture_attempt
 from agym.orchestration.contracts import (
     ActionId,
     ActionKind,
@@ -297,7 +298,18 @@ class CoordinatorClient:
     # Session Management & Creation
     # ------------------------------------------------------------------------
 
-    def _create_session(
+    def _create_session(self, conversation_id: ConversationId | str | None = None) -> ModelSession:
+        with capture_attempt(
+            self.run_store, self.run_id, prompt="", kind="coordinator_session",
+            worker_id="coordinator", profile_name=self.profile_name,
+            round_number=self._round_number, conversation_id=conversation_id,
+        ) as capture:
+            session = self._open_session(conversation_id)
+            if capture is not None:
+                capture.finish(ModelResult(invocation_id="session-start", response="Session opened"))
+            return session
+
+    def _open_session(
         self,
         conversation_id: ConversationId | str | None = None,
     ) -> ModelSession:
@@ -760,7 +772,16 @@ class CoordinatorClient:
 
         for attempt in range(self.max_correction_attempts + 1):
             try:
-                res = session.send(current_prompt, timeout_seconds=self.timeout_seconds)
+                with capture_attempt(
+                    self.run_store, self.run_id, prompt=current_prompt, kind="coordinator",
+                    worker_id="coordinator", profile_name=self.profile_name,
+                    round_number=self._round_number, correction_attempt=attempt,
+                    schema_name=schema_name, conversation_id=self.conversation_id,
+                    timeout_seconds=self.timeout_seconds, strategy=self.strategy.value,
+                ) as capture:
+                    res = session.send(current_prompt, timeout_seconds=self.timeout_seconds)
+                    if capture is not None:
+                        capture.finish(res)
             except Exception as exc:
                 raise CoordinatorCrashError(
                     f"Coordinator model process failed unexpectedly: {exc}",
@@ -804,9 +825,13 @@ class CoordinatorClient:
 
             try:
                 parsed = parser(raw_payload)
+                if capture is not None:
+                    capture.note("protocol_accepted", schema_name=schema_name)
                 return parsed
             except (ProtocolError, ValueError, json.JSONDecodeError) as exc:
                 last_protocol_error = exc
+                if capture is not None:
+                    capture.note("protocol_rejected", schema_name=schema_name, error=str(exc))
                 if attempt < self.max_correction_attempts:
                     logger.warning(
                         "Coordinator output violated %s schema (attempt %d/%d): %s",

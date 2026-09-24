@@ -623,7 +623,7 @@ class TestFailureDistinctions(unittest.TestCase):
                 event_id="f3",
                 run_id=RunId("run-fail-diff"),
                 type=EventType.INVOCATION_FAILED,
-                payload={"worker_id": "alternative", "failure": "RETRYABLE"},
+                payload={"worker_id": "alternative", "failure": "RETRYABLE", "retrying": True},
             )
         )
         # 4. REJECTED
@@ -678,7 +678,7 @@ class TestFailureDistinctions(unittest.TestCase):
                 event_id="f3",
                 run_id=RunId("run-fail-tty"),
                 type=EventType.INVOCATION_FAILED,
-                payload={"worker_id": "alternative", "role": "ALTERNATIVE_DESIGN", "profile_name": "AI2", "failure": "RETRYABLE"},
+                payload={"worker_id": "alternative", "role": "ALTERNATIVE_DESIGN", "profile_name": "AI2", "failure": "RETRYABLE", "retrying": True},
             )
         )
         # Action rejected rejects pending workers

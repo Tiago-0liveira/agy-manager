@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Sequence, TextIO
 
@@ -11,6 +12,7 @@ from agym.orchestration.contracts import (
     AuditResult,
     CoordinatorClient as CoordinatorClientProtocol,
     EventSink,
+    ExecutionStrategy,
     ModelRunner,
     OrchestrationBudget,
     OrchestrationEvent,
@@ -19,6 +21,8 @@ from agym.orchestration.contracts import (
     RunId,
     RunState,
     RunStore,
+    WorkerId,
+    WorkerRequest,
     WorkerResult,
 )
 from agym.orchestration.coordinator import CoordinatorClient
@@ -85,6 +89,9 @@ class BroadcastRunStore:
     def __init__(self, store: RunStore, event_sink: EventSink | None = None) -> None:
         self._store = store
         self._event_sink = event_sink
+        # File-store helpers emit internally; forward those events at their source.
+        if isinstance(store, FileRunStore):
+            store.event_sink = event_sink
 
     @property
     def inner_store(self) -> RunStore:
@@ -123,7 +130,7 @@ class BroadcastRunStore:
                 self._store.emit(event)
             except Exception as exc:
                 logger.warning("Underlying store failed to emit event: %s", exc)
-        if self._event_sink is not None:
+        if self._event_sink is not None and not isinstance(self._store, FileRunStore):
             try:
                 self._event_sink.emit(event)
             except Exception as exc:
@@ -170,6 +177,7 @@ def build_orchestration_dependencies(
     run_store: RunStore | None = None,
     runner: ModelRunner | None = None,
     coordinator: CoordinatorClientProtocol | None = None,
+    coordinator_profile: str | None = None,
     event_sink: EventSink | None = None,
     engine: OrchestrationEngine | None = None,
     budget: OrchestrationBudget | None = None,
@@ -196,7 +204,33 @@ def build_orchestration_dependencies(
     e_sink = event_sink or TerminalEventSink(stream=stream, is_tty=is_tty, use_color=use_color)
     effective_store = BroadcastRunStore(r_store, e_sink)
     mdl_runner = runner or AntigravityRunner(profile_store=p_store)
-    coord = coordinator or CoordinatorClient(runner=mdl_runner, run_store=r_store)
+
+    coord_prof = coordinator_profile
+    if coord_prof is None and coordinator is None:
+        env_prof = os.environ.get("AGYM_PROFILE")
+        if env_prof and p_store.exists(env_prof):
+            coord_prof = env_prof
+        else:
+            try:
+                coord_prof = sched.select_profile(
+                    WorkerRequest(
+                        worker_id=WorkerId("coordinator"),
+                        role="GENERAL",
+                        strategy=ExecutionStrategy.STANDARD,
+                    )
+                )
+            except Exception:
+                pass
+            if coord_prof is None:
+                available = p_store.list()
+                if available:
+                    coord_prof = available[0].name
+
+    coord = coordinator or CoordinatorClient(
+        runner=mdl_runner,
+        run_store=r_store,
+        profile_name=coord_prof,
+    )
     bgt = budget or build_default_budget()
     eng = engine or OrchestrationEngine(
         scheduler=sched,

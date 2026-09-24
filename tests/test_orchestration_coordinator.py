@@ -390,6 +390,19 @@ class TestCoordinatorRecoveryAndErrors(unittest.TestCase):
         correction_sent = session.sent_prompts[2]
         self.assertIn("Your previous response violated the CoordinatorAction schema", correction_sent)
 
+        from agym.orchestration.recording import read_trace
+        root = self.run_store.run_dir(self.run_id)
+        records = [json.loads(p.read_text()) for p in (root / "attempts").glob("*/record.json")]
+        turns = sorted((r for r in records if r["kind"] == "coordinator"), key=lambda r: r["started_at"])
+        self.assertEqual(len(turns), 3)
+        self.assertEqual([r["correction_attempt"] for r in turns], [0, 0, 1])
+        self.assertIn("without JSON", turns[1]["result"]["response"])
+        for turn, prompt in zip(turns, session.sent_prompts):
+            self.assertEqual((root / "attempts" / turn["attempt_id"] / "prompt.txt").read_text(), prompt)
+        events = list(read_trace(root / "trace.jsonl"))
+        self.assertEqual(sum(e["type"] == "protocol_rejected" for e in events), 1)
+        self.assertEqual(sum(e["type"] == "protocol_accepted" for e in events), 2)
+
     def test_malformed_response_repeatedly_halts_without_infinite_loop(self) -> None:
         """Verify that repeated malformed output raises typed error and halts."""
         runner = FakeModelRunner(

@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import inspect
 import logging
 import os
 import sys
@@ -30,6 +31,7 @@ from typing import Any, Collection, Sequence
 
 from agym.orchestration.locking import FileLock, LockTimeoutError
 
+from agym.orchestration.recording import capture_attempt
 from agym.orchestration.contracts import (
     ActionId,
     ActionKind,
@@ -250,17 +252,25 @@ def build_worker_prompt(
                 sections.append(cr.response.strip())
             if cr.structured_data:
                 sections.append(f"```json\n{json.dumps(cr.structured_data, indent=2)}\n```")
+    cwd_path = str(Path.cwd().resolve())
     sections.extend([
+        "",
+        "## Workspace Directory",
+        f"Workspace root: {cwd_path}",
+        "All file inspection operations (e.g. view_file) must use absolute paths anchored at this workspace root.",
         "",
         "## Instructions",
         f"Perform your analysis and execution strictly in accordance with your role ({role.value}).",
         "Deliver clear, high-quality technical output addressing your objective.",
+        "If any tool call fails, errors, or is denied permission, proceed without performing that action.",
+        "Do NOT abort or halt. Adapt your plan, use alternative inspection methods or prior context, and synthesize your complete findings directly in your final response.",
     ])
     if workspace_mode == WorkspaceMode.READ_ONLY:
         sections.extend([
             "",
             "## Workspace Constraint",
             "You are operating in READ-ONLY mode. You must NOT modify any files, create commits, or alter the workspace. Only perform inspection, reading, and analysis.",
+            "Do NOT execute shell commands or use run_command (command execution is disabled in read-only mode). Use read-only inspection tools such as view_file, list_dir, grep_search, and find_by_name to inspect files and directories.",
         ])
     elif workspace_mode == WorkspaceMode.MUTATING:
         sections.extend([
@@ -298,12 +308,19 @@ def build_auditor_prompt(
                 sections.append(tr.response.strip())
             if tr.structured_data:
                 sections.append(f"```json\n{json.dumps(tr.structured_data, indent=2)}\n```")
+    cwd_path = str(Path.cwd().resolve())
     sections.extend([
+        "",
+        "## Workspace Directory",
+        f"Workspace root: {cwd_path}",
+        "All file inspection operations (e.g. view_file) must use absolute paths anchored at this workspace root.",
         "",
         "## Instructions",
         "Critically evaluate the target worker outputs. Highlight potential bugs, security concerns,",
         "regressions, omissions, edge cases, and architectural weaknesses.",
         "List your concrete findings as bullet points.",
+        "If any tool call fails, errors, or is denied permission, proceed without performing that action.",
+        "Do NOT abort or halt. Synthesize your audit findings directly in your final response.",
     ])
     return "\n".join(sections)
 
@@ -418,6 +435,13 @@ class OrchestrationEngine:
     # ========================================================================
     # Action & Budget Validation
     # ========================================================================
+
+    def _check_finalization(self, state: RunState) -> None:
+        """Do not report success when delegated work produced no successful result."""
+        results = [r for r in self.store.get_results(state.run_id) if isinstance(r, WorkerResult)]
+        if results and not any(r.status == InvocationStatus.SUCCEEDED for r in results):
+            details = "; ".join(f"{r.worker_id}: {r.error or r.status.value}" for r in results)
+            raise EngineError(f"No workers succeeded. {details}")
 
     def _validate_action(
         self,
@@ -686,6 +710,57 @@ class OrchestrationEngine:
     # Wave Execution
     # ========================================================================
 
+    def _start_coordinator(self, coord: CoordinatorClient, state: RunState,
+                           fleet_view: FleetView, repository_scope: str = "", *,
+                           persist: bool = True) -> Any:
+        """Pass engine-owned context to coordinators that accept it.
+
+        Keep compatibility with the minimal assess_task protocol and legacy
+        two-argument start methods. Dry-run assessment must not write run artifacts.
+        """
+        context = dict(run_id=state.run_id, run_mode=state.mode,
+                       budget=state.budget, repository_scope=repository_scope)
+        for name in ("start_run", "start", "assess_task"):
+            method = getattr(coord, name, None)
+            if not callable(method):
+                continue
+            parameters = inspect.signature(method).parameters
+            accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+            kwargs = {key: value for key, value in context.items()
+                      if accepts_kwargs or (key in parameters and
+                                            parameters[key].kind != inspect.Parameter.POSITIONAL_ONLY)}
+            # The built-in coordinator persists during session creation, before
+            # assessment returns. Disable its store for this dry-run call only.
+            from agym.orchestration.coordinator import CoordinatorClient as RuntimeCoordinator
+            if not persist and isinstance(coord, RuntimeCoordinator):
+                saved_store = coord.run_store
+                try:
+                    coord.run_store = None
+                    return method(state.task, fleet_view, **kwargs)
+                finally:
+                    coord.run_store = saved_store
+            return method(state.task, fleet_view, **kwargs)
+        return None
+
+    async def _invoke_model(self, invocation: ModelInvocation, profile: str, state: RunState, attempt: int = 1) -> ModelResult:
+        with capture_attempt(
+            self.store, state.run_id, prompt=invocation.prompt, kind="worker",
+            invocation_id=str(invocation.invocation_id), worker_id=str(invocation.worker_id),
+            role=invocation.role.value, profile_name=profile, round_number=state.round_number,
+            attempt_number=attempt, strategy=invocation.strategy.value,
+            workspace_mode=invocation.workspace_mode.value, timeout_seconds=invocation.timeout_seconds,
+            conversation_id=invocation.conversation_id,
+        ) as capture:
+            if hasattr(self.runner, "run_async") and asyncio.iscoroutinefunction(self.runner.run_async):
+                result = await self.runner.run_async(invocation, profile_name=profile)
+            else:
+                result = await asyncio.to_thread(self.runner.run, invocation, profile)
+            if capture is not None:
+                capture.finish(result)
+            if hasattr(self.store, "record_model_metadata"):
+                self.store.record_model_metadata(state.run_id, invocation.invocation_id, result)
+            return result
+
     async def _execute_single_worker(
         self,
         worker_req: WorkerRequest,
@@ -772,10 +847,7 @@ class OrchestrationEngine:
                 started_at = datetime.now(timezone.utc).isoformat()
 
                 try:
-                    if hasattr(self.runner, "run_async") and asyncio.iscoroutinefunction(self.runner.run_async):
-                        model_res = await self.runner.run_async(invocation, profile_name=current_lease.profile_name)
-                    else:
-                        model_res = await asyncio.to_thread(self.runner.run, invocation, current_lease.profile_name)
+                    model_res = await self._invoke_model(invocation, current_lease.profile_name, state, attempt)
                 except (KeyboardInterrupt, asyncio.CancelledError):
                     raise
                 except Exception as exc:
@@ -815,7 +887,8 @@ class OrchestrationEngine:
                             state.run_id,
                             {"invocation_id": str(iid), "worker_id": str(worker_req.worker_id)},
                         )
-                    self.store.save_result(state.run_id, worker_res)
+                    if not hasattr(self.store, "record_invocation_completed"):
+                        self.store.save_result(state.run_id, worker_res)
                     return worker_res
 
                 # Failure classification
@@ -908,7 +981,8 @@ class OrchestrationEngine:
                             "error": model_res.error or "Worker execution failed",
                         },
                     )
-                self.store.save_result(state.run_id, worker_res)
+                if not hasattr(self.store, "record_invocation_failed"):
+                    self.store.save_result(state.run_id, worker_res)
                 return worker_res
         finally:
             # Guarantees release in finally
@@ -993,10 +1067,7 @@ class OrchestrationEngine:
         try:
             started_at = datetime.now(timezone.utc).isoformat()
             try:
-                if hasattr(self.runner, "run_async") and asyncio.iscoroutinefunction(self.runner.run_async):
-                    model_res = await self.runner.run_async(invocation, profile_name=current_lease.profile_name)
-                else:
-                    model_res = await asyncio.to_thread(self.runner.run, invocation, current_lease.profile_name)
+                model_res = await self._invoke_model(invocation, current_lease.profile_name, state)
             except (KeyboardInterrupt, asyncio.CancelledError):
                 raise
             except Exception as exc:
@@ -1043,7 +1114,8 @@ class OrchestrationEngine:
                         state.run_id,
                         {"invocation_id": str(iid), "worker_id": str(audit_req.worker_id)},
                     )
-                self.store.save_result(state.run_id, audit_res)
+                if not hasattr(self.store, "record_invocation_completed"):
+                    self.store.save_result(state.run_id, audit_res)
                 return audit_res
 
             # Failure path
@@ -1074,7 +1146,8 @@ class OrchestrationEngine:
                     state.run_id,
                     {"invocation_id": str(iid), "worker_id": str(audit_req.worker_id)},
                 )
-            self.store.save_result(state.run_id, audit_res)
+            if not hasattr(self.store, "record_invocation_failed"):
+                self.store.save_result(state.run_id, audit_res)
             return audit_res
         finally:
             self.lease_manager.release(current_lease.lease_id, run_id=state.run_id)
@@ -1290,14 +1363,7 @@ class OrchestrationEngine:
             # Support both initial response tuple/InitialCoordinatorResponse and assess_task + decide_action
             action: CoordinatorAction | None = None
 
-            if hasattr(coord, "start_run") and callable(coord.start_run):
-                initial_res = coord.start_run(task, fleet_view)
-            elif hasattr(coord, "start") and callable(coord.start):
-                initial_res = coord.start(task, fleet_view)
-            elif hasattr(coord, "assess_task") and callable(coord.assess_task):
-                initial_res = coord.assess_task(task, fleet_view)
-            else:
-                initial_res = None
+            initial_res = self._start_coordinator(coord, state, fleet_view, repository_scope)
 
             assessment: TaskAssessment | None = None
             if isinstance(initial_res, InitialCoordinatorResponse):
@@ -1438,6 +1504,7 @@ class OrchestrationEngine:
 
                 # Step 12 & Step 17: Check FINALIZE
                 if action.kind == ActionKind.FINALIZE:
+                    self._check_finalization(state)
                     self._emit_event(EventType.ACTION_ACCEPTED, state.run_id, {"action_id": str(action.action_id)})
                     state.status = RunStatus.COMPLETED
                     state.final_result = action.final_response
@@ -1916,6 +1983,7 @@ class OrchestrationEngine:
                 )
 
                 if action.kind == ActionKind.FINALIZE:
+                    self._check_finalization(state)
                     self._emit_event(EventType.ACTION_ACCEPTED, state.run_id, {"action_id": str(action.action_id)})
                     state.status = RunStatus.COMPLETED
                     state.final_result = action.final_response
@@ -2114,14 +2182,7 @@ class OrchestrationEngine:
         assessment: TaskAssessment | None = None
         action: CoordinatorAction | None = None
 
-        if hasattr(coord, "start_run") and callable(coord.start_run):
-            initial_res = coord.start_run(task, fleet_view)
-        elif hasattr(coord, "start") and callable(coord.start):
-            initial_res = coord.start(task, fleet_view)
-        elif hasattr(coord, "assess_task") and callable(coord.assess_task):
-            initial_res = coord.assess_task(task, fleet_view)
-        else:
-            initial_res = None
+        initial_res = self._start_coordinator(coord, state, fleet_view, repository_scope, persist=False)
 
         if isinstance(initial_res, InitialCoordinatorResponse):
             assessment = initial_res.assessment

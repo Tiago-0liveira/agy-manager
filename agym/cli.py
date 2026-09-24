@@ -1074,6 +1074,8 @@ def _format_run_status(state: RunState, results: Sequence[Any] | None = None) ->
             st = getattr(r, "status", "")
             st_val = st.value if hasattr(st, "value") else str(st)
             lines.append(f"  - [{wid}] {r_val}: {st_val}")
+            if getattr(r, "error", None):
+                lines.append(f"    Error: {r.error}")
     if state.final_result:
         lines.append("")
         lines.append("Final Result:")
@@ -1187,6 +1189,7 @@ def _orchestrate(
         type=str.lower,
     )
     parser.add_argument("-n", "--dry-run", dest="dry_run", action="store_true")
+    parser.add_argument("--profile", dest="profile", default=None, help="Profile to use for the coordinator")
 
     try:
         ns = parser.parse_args(args_to_parse)
@@ -1199,7 +1202,7 @@ def _orchestrate(
 
     task = ns.task.strip()
     run_mode = RunMode.IMPLEMENT if ns.mode == "implement" else RunMode.PLAN
-    d = deps or build_orchestration_dependencies(profile_store=store)
+    d = deps or build_orchestration_dependencies(profile_store=store, coordinator_profile=ns.profile)
 
     if ns.dry_run:
         try:

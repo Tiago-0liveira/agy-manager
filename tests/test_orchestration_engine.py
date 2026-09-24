@@ -206,6 +206,102 @@ class BaseEngineTestCase(unittest.TestCase):
 
 class TestOrchestrationEngine(BaseEngineTestCase):
 
+    def test_cli_reports_worker_failures_and_terminal_outcome(self) -> None:
+        import io
+        from types import SimpleNamespace
+        from agym.cli import _orchestrate
+        from agym.orchestration.ui import TerminalEventSink, WorkerStatus
+        from agym.orchestration.wiring import BroadcastRunStore
+
+        for tty in (False, True):
+            for responses, expected in ((["failure", "timeout"], RunStatus.FAILED),
+                                        (["failure", "Recovered result"], RunStatus.COMPLETED)):
+                with self.subTest(tty=tty, responses=responses):
+                    stream = io.StringIO()
+                    sink = TerminalEventSink(stream=stream, is_tty=tty, use_color=False)
+                    self.engine.store = BroadcastRunStore(self.run_store, sink)
+                    actions = [CoordinatorAction(
+                        action_id=ActionId(f"act-{i}"), kind=ActionKind.RUN_WORKERS,
+                        workers=[WorkerRequest(worker_id=WorkerId(f"w-{i}"),
+                                               role=WorkerRole.GENERAL, objective="Test")],
+                    ) for i in range(2)]
+                    self.engine.coordinator = FakeCoordinator(actions=actions)
+                    self.engine.default_budget = OrchestrationBudget(max_retries=0)
+                    for response in responses:
+                        self.runner.add_response(response)
+                    deps = SimpleNamespace(engine=self.engine, run_store=self.run_store)
+                    code = _orchestrate(["Test worker failures"], self.profile_store, deps=deps)
+                    self.assertEqual(code, 1 if expected == RunStatus.FAILED else 0)
+                    run_id = RunId(sink.state.run_id)
+                    self.assertEqual(self.run_store.load_run(run_id).status, expected)
+                    self.assertEqual(sink.state.run_status, expected.value)
+                    self.assertIn("FAILED", stream.getvalue())
+                    self.assertEqual(sink.state.workers["w-0"].status, WorkerStatus.FAILED)
+                    events = self.run_store.get_events(run_id)
+                    terminal = [e for e in events if e.type in (EventType.RUN_FAILED, EventType.RUN_COMPLETED)]
+                    self.assertEqual(len(terminal), 1)
+                    self.assertEqual(sum(e.type == EventType.INVOCATION_FAILED for e in events),
+                                     2 if expected == RunStatus.FAILED else 1)
+                    with patch("sys.stdout", new=io.StringIO()) as status_output:
+                        self.assertEqual(_orchestrate(["status", run_id], self.profile_store, deps=deps), 0)
+                    self.assertIn("Error:", status_output.getvalue())
+
+    def test_cli_wiring_binds_real_coordinator_to_engine_run(self) -> None:
+        import io
+        from agym.cli import _orchestrate
+        from agym.orchestration.runner import FakeModelSession
+        from agym.orchestration.wiring import build_orchestration_dependencies
+        from tests.test_orchestration_coordinator import INITIAL_RESPONSE_DATA
+
+        for mode in ("plan", "implement"):
+            with self.subTest(mode=mode):
+                session = FakeModelSession(responses=[INITIAL_RESPONSE_DATA, {
+                    "action_id": "finish", "kind": "FINALIZE", "final_response": "Reviewed",
+                }])
+                with patch.object(self.runner, "create_session", return_value=session):
+                    deps = build_orchestration_dependencies(
+                        profile_store=self.profile_store, cache_manager=self.cache_manager,
+                        lease_manager=self.lease_manager, scheduler=self.scheduler,
+                        run_store=self.run_store, runner=self.runner,
+                        coordinator_profile=self.profile_names[0],
+                        stream=io.StringIO(), is_tty=False, use_color=False,
+                    )
+                    constructor_id = deps.coordinator.run_id
+                    self.assertEqual(_orchestrate(["--mode", mode, "Review architecture"],
+                                                  self.profile_store, deps=deps), 0)
+                rid = deps.coordinator.run_id
+                self.assertNotEqual(rid, constructor_id)
+                state = self.run_store.load_run(rid)
+                self.assertEqual(state.status, RunStatus.COMPLETED)
+                self.assertEqual(state.mode.value, mode.upper())
+                self.assertIn(f"### Run Mode\n{mode.upper()}", session.sent_prompts[0])
+                self.assertIn("### Budget Summary", session.sent_prompts[0])
+                records = [json.loads(p.read_text()) for p in
+                           (self.run_store.run_dir(rid) / "attempts").glob("*/record.json")]
+                self.assertTrue(any(r["kind"] == "coordinator" for r in records))
+                self.assertTrue(any(r["kind"] == "worker" for r in records))
+                self.assertTrue(all(r["run_id"] == rid for r in records))
+                self.assertFalse(self.run_store.run_dir(constructor_id).exists())
+                self.assertEqual(self.lease_manager.list_leases(), [])
+
+    def test_real_coordinator_dry_run_does_not_persist(self) -> None:
+        from agym.orchestration.coordinator import CoordinatorClient
+        from agym.orchestration.runner import FakeModelSession
+        from tests.test_orchestration_coordinator import INITIAL_RESPONSE_DATA
+
+        session = FakeModelSession(responses=[INITIAL_RESPONSE_DATA])
+        coord = CoordinatorClient(runner=self.runner, run_store=self.run_store, session=session)
+        before = set(self.run_store.base_dir.rglob("*"))
+        try:
+            plan = self.engine.dry_run("Review architecture", coordinator=coord, mode=RunMode.IMPLEMENT)
+            self.assertTrue(plan.is_valid)
+            self.assertIs(coord.run_store, self.run_store)
+            self.assertEqual(set(self.run_store.base_dir.rglob("*")), before)
+            self.assertEqual(self.runner.calls, [])
+            self.assertIn("### Run Mode\nIMPLEMENT", session.sent_prompts[0])
+        finally:
+            coord.close()
+
     def test_01_trivial_one_worker_task(self) -> None:
         """1. Trivial one-worker task: worker executes, then coordinator finalizes."""
         action1 = CoordinatorAction(
@@ -458,7 +554,7 @@ class TestOrchestrationEngine(BaseEngineTestCase):
         budget = OrchestrationBudget(max_retries=0)
         state = self.engine.run(task="Test failure handling", budget=budget, coordinator=coord)
 
-        self.assertEqual(state.status, RunStatus.COMPLETED)
+        self.assertEqual(state.status, RunStatus.FAILED)
         obs = coord.decide_calls[1]
         self.assertEqual(len(obs.failed_results), 1)
         self.assertEqual(obs.failed_results[0].worker_id, "w-fail")
@@ -478,7 +574,7 @@ class TestOrchestrationEngine(BaseEngineTestCase):
         budget = OrchestrationBudget(max_retries=0)
         state = self.engine.run(task="Test timeout", budget=budget, coordinator=coord)
 
-        self.assertEqual(state.status, RunStatus.COMPLETED)
+        self.assertEqual(state.status, RunStatus.FAILED)
         obs = coord.decide_calls[1]
         self.assertEqual(len(obs.failed_results), 1)
         self.assertEqual(obs.failed_results[0].failure, FailureClass.RETRYABLE)
@@ -560,6 +656,15 @@ class TestOrchestrationEngine(BaseEngineTestCase):
         prof1 = calls[0][1]
         prof2 = calls[1][1]
         self.assertNotEqual(prof1, prof2)
+
+        attempts = [json.loads(p.read_text()) for p in
+                    (self.run_store.run_dir(state.run_id) / "attempts").glob("*/record.json")]
+        attempts.sort(key=lambda r: r["attempt_number"])
+        self.assertEqual([r["status"] for r in attempts], ["FAILED", "SUCCEEDED"])
+        self.assertEqual([r["profile_name"] for r in attempts], [prof1, prof2])
+        self.assertEqual(attempts[0]["invocation_id"], attempts[1]["invocation_id"])
+        self.assertNotEqual(attempts[0]["attempt_id"], attempts[1]["attempt_id"])
+        self.assertIn("error", attempts[0]["result"])
 
     def test_13_budget_max_parallel_rejection(self) -> None:
         """13. Action exceeding budget.max_parallel is rejected without crashing run."""
@@ -781,7 +886,7 @@ class TestOrchestrationEngine(BaseEngineTestCase):
         self.assertIn("w-p2", display_str)
 
     def test_22_resume_after_interrupted_worker(self) -> None:
-        """22. Resume an interrupted run with in-progress worker; classifies failure and completes."""
+        """22. Resume with only an interrupted worker; finalization must report failure."""
         # 1. Create and interrupt a run with an active invocation
         run_id = RunId("run-resume-int-1")
         state = self.run_store.create_run(run_id=run_id, task="Resume interrupted task")
@@ -806,8 +911,8 @@ class TestOrchestrationEngine(BaseEngineTestCase):
 
         resumed_state = self.engine.resume(run_id, coordinator=coord)
 
-        self.assertEqual(resumed_state.status, RunStatus.COMPLETED)
-        self.assertEqual(resumed_state.final_result, "Successfully recovered after interruption")
+        self.assertEqual(resumed_state.status, RunStatus.FAILED)
+        self.assertIn("No workers succeeded", resumed_state.final_result)
 
         # Unfinished worker was classified as failed
         results = self.run_store.get_results(run_id)
@@ -1530,7 +1635,7 @@ class TestOrchestrationEngine(BaseEngineTestCase):
         self.runner.run = failing_run  # type: ignore[assignment]
 
         state = self.engine.run("Test preserving stdout on failure", coordinator=coord)
-        self.assertEqual(state.status, RunStatus.COMPLETED)
+        self.assertEqual(state.status, RunStatus.FAILED)
 
         # 1. Check observation sent to coordinator contains both
         self.assertGreaterEqual(len(coord.decide_calls), 2)

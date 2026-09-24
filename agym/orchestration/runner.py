@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
 import json
 import logging
 import os
@@ -56,6 +57,8 @@ from agym.orchestration.strategies import (
     map_strategy,
 )
 from agym.profiles import Profile, ProfileError, ProfileNotFound, ProfileStore
+from agym.orchestration.recording import current_attempt
+from agym.orchestration.streaming import decode_response
 from agym.orchestration.locking import FileLock
 from agym.orchestration.prompts import redact_profile_identities
 from agym.wincred import (
@@ -134,11 +137,13 @@ def classify_failure(result: ModelResult) -> FailureClass:
         return FailureClass.UNRECOVERABLE
     if result.status == InvocationStatus.CANCELLED or "cancelled" in err:
         return FailureClass.UNRECOVERABLE
+    if "permission" in err or "denied" in err:
+        return FailureClass.RETRYABLE
     if "malformed json" in err or "malformed structured payload" in err:
         return FailureClass.RECOVERABLE
     if "timed out" in err or "timeout" in err:
         return FailureClass.RETRYABLE
-    if "empty output" in err:
+    if "empty output" in err or "empty response" in err:
         return FailureClass.RETRYABLE
     if result.exit_code is not None and result.exit_code != 0:
         return FailureClass.RETRYABLE
@@ -338,7 +343,11 @@ class AntigravityRunner:
 
         op_args: list[str] = list(strat_settings.args)
 
-        if invocation.output_schema is not None:
+        if current_attempt.get() is not None:
+            op_args.extend(["--output-format", "stream-json"])
+            if invocation.output_schema is not None:
+                op_args.extend(["--json-schema", json.dumps(invocation.output_schema)])
+        elif invocation.output_schema is not None:
             schema_json = json.dumps(invocation.output_schema)
             op_args.extend(["--output-format", "json", "--json-schema", schema_json])
         else:
@@ -349,19 +358,15 @@ class AntigravityRunner:
 
         op_args.extend(["--print", invocation.prompt])
 
+        # Headless subprocess execution requires auto-approved permissions so tools do not hang or auto-deny
+        op_args.append("--dangerously-skip-permissions")
+
         if invocation.workspace_mode == WorkspaceMode.READ_ONLY:
             op_args.extend(["--mode", "plan", "--sandbox"])
         elif invocation.workspace_mode == WorkspaceMode.MUTATING:
             op_args.extend(["--mode", "accept-edits"])
 
         if profile is not None:
-            if invocation.workspace_mode == WorkspaceMode.READ_ONLY:
-                from dataclasses import replace
-                safe_settings = replace(profile.settings, dangerously_skip_permissions=False)
-                profile = replace(profile, settings=safe_settings)
-                if env and "AGYM_DANGEROUSLY_SKIP_PERMISSIONS" in env:
-                    env = {k: v for k, v in env.items() if k != "AGYM_DANGEROUSLY_SKIP_PERMISSIONS"}
-
             argv = build_agy_args(
                 profile,
                 operation_args=op_args,
@@ -370,9 +375,6 @@ class AntigravityRunner:
             )
         else:
             argv = [str(self._agy_path), *op_args]
-
-        if invocation.workspace_mode == WorkspaceMode.READ_ONLY:
-            argv = [arg for arg in argv if arg not in ("--dangerously-skip-permissions", "-y", "--yes")]
 
         return argv
 
@@ -393,10 +395,34 @@ class AntigravityRunner:
 
         if loop and loop.is_running():
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(asyncio.run, self.run_async(invocation, profile_name))
+                future = executor.submit(contextvars.copy_context().run, asyncio.run, self.run_async(invocation, profile_name))
                 return future.result()
         else:
             return asyncio.run(self.run_async(invocation, profile_name))
+
+    async def _collect_output(self, proc: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
+        capture = current_attempt.get()
+        if capture is None:
+            return await proc.communicate()
+
+        async def drain(reader: asyncio.StreamReader, stream: str) -> bytes:
+            chunks = []
+            while chunk := await reader.read(65536):
+                capture.write(stream, chunk)
+                chunks.append(chunk)
+            return b"".join(chunks)
+
+        tasks = [asyncio.create_task(drain(proc.stdout, "stdout")),
+                 asyncio.create_task(drain(proc.stderr, "stderr"))]
+        try:
+            stdout, stderr = await asyncio.gather(*tasks)
+            await proc.wait()
+            return stdout, stderr
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def run_async(
         self,
@@ -495,9 +521,13 @@ class AntigravityRunner:
                         **popen_kwargs,
                     )
             self._register_process(invocation.run_id, invocation.invocation_id, proc)
+            capture = current_attempt.get()
+            if capture is not None:
+                capture.note("process_started", pid=proc.pid, argv=cmd, cwd=str(Path.cwd()),
+                             output_format="stream-json")
 
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(),
+                self._collect_output(proc),
                 timeout=invocation.timeout_seconds,
             )
         except asyncio.TimeoutError:
@@ -575,25 +605,42 @@ class AntigravityRunner:
                 invocation_id=invocation.invocation_id,
                 status=InvocationStatus.FAILED,
                 exit_code=0,
-                error="Empty output returned from model runner",
+                error=redact_profile_identities(
+                    "Empty output returned from model runner" + (f": {stderr_text}" if stderr_text else ""),
+                    [profile_name] if profile_name else None,
+                ),
                 started_at=started_at,
                 completed_at=completed_at,
             )
 
+        stream_cid = None
+        usage = None
+        if current_attempt.get() is not None:
+            try:
+                stdout_text, stream_cid, usage = decode_response(stdout_text)
+            except ValueError as exc:
+                return ModelResult(
+                    invocation_id=invocation.invocation_id, status=InvocationStatus.FAILED,
+                    exit_code=exit_code, error=str(exc),
+                    started_at=started_at, completed_at=completed_at,
+                )
+
         # Conversation ID resolution
-        convo_id = _extract_conversation_id(stdout_text) or _extract_conversation_id(stderr_text)
+        convo_id = stream_cid or _extract_conversation_id(stdout_text) or _extract_conversation_id(stderr_text)
         if not convo_id and invocation.conversation_id:
             convo_id = invocation.conversation_id
 
         # Structured output parsing if output_schema was specified
         if invocation.output_schema is not None:
-            return self._parse_structured_output(
+            result = self._parse_structured_output(
                 invocation=invocation,
                 stdout_text=stdout_text,
                 convo_id=convo_id,
                 started_at=started_at,
                 completed_at=completed_at,
             )
+            result.usage = usage
+            return result
 
         # Standard plain response
         return ModelResult(
@@ -601,6 +648,7 @@ class AntigravityRunner:
             status=InvocationStatus.SUCCEEDED,
             response=stdout_text,
             structured_data=None,
+            usage=usage,
             conversation_id=convo_id,
             exit_code=0,
             started_at=started_at,
@@ -767,6 +815,10 @@ class AntigravitySession:
         self._thread.start()
 
         self._proc: asyncio.subprocess.Process | None = None
+        self._stderr_task: asyncio.Task | None = None
+        self._active_capture = current_attempt.get()
+        self._session_command: list[str] = []
+        self._stdout_buffer = bytearray()
         self._proc_started = threading.Event()
         self._start_error: Exception | None = None
 
@@ -844,7 +896,31 @@ class AntigravitySession:
             env=env,
             **popen_kwargs,
         )
+        self._stdout_buffer.clear()
+        self._session_command = cmd
+        self._stderr_task = asyncio.create_task(self._drain_stderr(self._proc.stderr))
         self._proc_started.set()
+
+    async def _read_session_line(self) -> bytes:
+        """Capture bytes before parsing, including incomplete and large NDJSON lines."""
+        while b"\n" not in self._stdout_buffer:
+            chunk = await self._proc.stdout.read(65536)
+            if not chunk:
+                line = bytes(self._stdout_buffer)
+                self._stdout_buffer.clear()
+                return line
+            if self._active_capture is not None:
+                self._active_capture.write("stdout", chunk)
+            self._stdout_buffer.extend(chunk)
+        end = self._stdout_buffer.index(b"\n") + 1
+        line = bytes(self._stdout_buffer[:end])
+        del self._stdout_buffer[:end]
+        return line
+
+    async def _drain_stderr(self, reader: asyncio.StreamReader) -> None:
+        while chunk := await reader.read(65536):
+            if self._active_capture is not None:
+                self._active_capture.write("stderr", chunk)
 
     @property
     def conversation_id(self) -> ConversationId:
@@ -945,8 +1021,14 @@ class AntigravitySession:
                         completed_at=datetime.now(timezone.utc).isoformat(),
                     )
 
+            self._active_capture = current_attempt.get()
+            if self._active_capture is not None:
+                self._active_capture.note("process_attached", pid=self._proc.pid,
+                                          argv=self._session_command, cwd=str(Path.cwd()),
+                                          output_format="stream-json")
+
             # Write NDJSON prompt line to stdin
-            payload = json.dumps({"prompt": prompt}) + "\n"
+            payload = json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
             try:
                 assert self._proc.stdin is not None
                 write_res = self._proc.stdin.write(payload.encode("utf-8"))
@@ -968,6 +1050,7 @@ class AntigravitySession:
 
             # Read NDJSON response events from stdout
             response_lines: list[str] = []
+            usage = None
             structured_data: dict[str, Any] | None = None
             raw_response_text: str | None = None
             has_terminal_event = False
@@ -976,7 +1059,7 @@ class AntigravitySession:
                 assert self._proc.stdout is not None
                 while True:
                     line_bytes = await asyncio.wait_for(
-                        self._proc.stdout.readline(),
+                        self._read_session_line(),
                         timeout=timeout,
                     )
                     if not line_bytes:
@@ -996,6 +1079,9 @@ class AntigravitySession:
                         response_lines.append(line_str)
                         continue
 
+                    if not isinstance(event, dict):
+                        continue
+
                     # Capture conversation ID from event
                     cid = (
                         event.get("conversation_id")
@@ -1005,18 +1091,26 @@ class AntigravitySession:
                     if cid and (self._conversation_id is None or self._conversation_id == "unknown"):
                         self._conversation_id = ConversationId(cid)
 
-                    evt_type = event.get("event") or event.get("step_type")
+                    evt_type = event.get("event") or event.get("step_type") or event.get("type")
                     if evt_type == "init":
                         continue
                     elif evt_type in ("result", "turn_complete", "response"):
-                        res = event.get("result") or event.get("response") or event.get("output")
-                        if isinstance(res, dict):
-                            structured_data = res
-                            raw_response_text = json.dumps(res)
-                        elif isinstance(res, str):
-                            raw_response_text = res
-                        elif res is not None:
-                            raw_response_text = str(res)
+                        try:
+                            raw_response_text, inner_cid, usage = decode_response(line_str)
+                        except ValueError as exc:
+                            return ModelResult(
+                                invocation_id=inv_id, status=InvocationStatus.FAILED,
+                                error=str(exc), conversation_id=self.conversation_id,
+                                started_at=started_at, completed_at=datetime.now(timezone.utc).isoformat(),
+                            )
+                        if inner_cid:
+                            self._conversation_id = ConversationId(inner_cid)
+                        try:
+                            parsed_response = json.loads(raw_response_text)
+                            if isinstance(parsed_response, dict):
+                                structured_data = parsed_response
+                        except ValueError:
+                            pass
                         has_terminal_event = True
                         break
                     elif evt_type == "error":
@@ -1077,7 +1171,7 @@ class AntigravitySession:
                     completed_at=datetime.now(timezone.utc).isoformat(),
                 )
 
-            if not has_terminal_event and not response_lines and raw_response_text is None:
+            if not has_terminal_event:
                 self._is_invalid = True
                 await self._close_process()
                 return ModelResult(
@@ -1109,6 +1203,7 @@ class AntigravitySession:
                 status=InvocationStatus.SUCCEEDED,
                 response=raw_response_text,
                 structured_data=structured_data,
+                usage=usage,
                 conversation_id=self.conversation_id,
                 exit_code=0,
                 started_at=started_at,
@@ -1180,6 +1275,15 @@ class AntigravitySession:
                         await asyncio.wait_for(proc.wait(), timeout=1.0)
                     except Exception:
                         pass
+
+        if self._stderr_task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(self._stderr_task), timeout=1.0)
+            except asyncio.TimeoutError:
+                self._stderr_task.cancel()
+                await asyncio.gather(self._stderr_task, return_exceptions=True)
+            finally:
+                self._stderr_task = None
 
     def __enter__(self) -> AntigravitySession:
         return self

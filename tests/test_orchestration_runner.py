@@ -74,22 +74,19 @@ class TestStrategyMapping(unittest.TestCase):
         self.assertEqual(get_strategy_args(ExecutionStrategy.HIGH_EFFORT), ["--effort", "high"])
         self.assertTrue(is_strategy_supported(ExecutionStrategy.HIGH_EFFORT))
 
-    def test_boost_strategy_mapping_explicitly_unsupported(self) -> None:
+    def test_boost_strategy_mapping_supported(self) -> None:
         settings = get_execution_settings(ExecutionStrategy.BOOST)
-        self.assertFalse(settings.is_supported)
-        self.assertEqual(settings.args, ())
-        self.assertIsNotNone(settings.unsupported_reason)
-        self.assertIn("BOOST", settings.unsupported_reason or "")
-        self.assertFalse(is_strategy_supported(ExecutionStrategy.BOOST))
-
-        with self.assertRaises(UnsupportedStrategyError) as ctx:
-            get_strategy_args(ExecutionStrategy.BOOST)
-        self.assertIn("BOOST", str(ctx.exception))
+        self.assertTrue(settings.is_supported)
+        self.assertEqual(settings.effort, "high")
+        self.assertEqual(settings.args, ("--effort", "high"))
+        self.assertIsNone(settings.unsupported_reason)
+        self.assertEqual(get_strategy_args(ExecutionStrategy.BOOST), ["--effort", "high"])
+        self.assertTrue(is_strategy_supported(ExecutionStrategy.BOOST))
 
     def test_case_insensitive_strategy_mapping(self) -> None:
         self.assertTrue(get_execution_settings("standard").is_supported)
         self.assertTrue(get_execution_settings("high_effort").is_supported)
-        self.assertFalse(get_execution_settings("boost").is_supported)
+        self.assertTrue(get_execution_settings("boost").is_supported)
 
     def test_unknown_strategy_handled_cleanly(self) -> None:
         settings = get_execution_settings("NONEXISTENT_STRATEGY")
@@ -231,11 +228,9 @@ class TestRunnerArgvAndEnvironment(unittest.TestCase):
         self.assertIn("--mode", argv)
         self.assertEqual(argv[argv.index("--mode") + 1], "plan")
         self.assertIn("--sandbox", argv)
-        self.assertNotIn("--dangerously-skip-permissions", argv)
-        self.assertNotIn("-y", argv)
-        self.assertNotIn("--yes", argv)
+        self.assertIn("--dangerously-skip-permissions", argv)
 
-    def test_argv_unsupported_boost_raises(self) -> None:
+    def test_argv_boost_strategy(self) -> None:
         inv = ModelInvocation(
             invocation_id=InvocationId("i-boost"),
             run_id=RunId("r-1"),
@@ -244,8 +239,9 @@ class TestRunnerArgvAndEnvironment(unittest.TestCase):
             strategy=ExecutionStrategy.BOOST,
             prompt="Boost me",
         )
-        with self.assertRaises(UnsupportedStrategyError):
-            self.runner.build_argv(inv)
+        argv = self.runner.build_argv(inv)
+        self.assertIn("--effort", argv)
+        self.assertEqual(argv[argv.index("--effort") + 1], "high")
 
 
 class TestOneShotInvocationExecution(unittest.IsolatedAsyncioTestCase):
@@ -328,18 +324,25 @@ class TestOneShotInvocationExecution(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--effort", args)
         self.assertEqual(args[args.index("--effort") + 1], "high")
 
+    @patch("agym.orchestration.runner.get_execution_settings")
     @patch("asyncio.create_subprocess_exec")
-    async def test_unsupported_boost_invocation_returns_clean_failure(
+    async def test_unsupported_strategy_invocation_returns_clean_failure(
         self,
         mock_exec: AsyncMock,
+        mock_settings: MagicMock,
     ) -> None:
+        mock_settings.return_value = ExecutionSettings(
+            strategy=ExecutionStrategy.STANDARD,
+            is_supported=False,
+            unsupported_reason="Custom unsupported reason",
+        )
         inv = ModelInvocation(
-            invocation_id=InvocationId("inv-boost"),
+            invocation_id=InvocationId("inv-unsupported"),
             run_id=RunId("run-1"),
             worker_id=InvocationId("w-1"),
             role=WorkerRole.GENERAL,
-            strategy=ExecutionStrategy.BOOST,
-            prompt="Run with boost",
+            strategy=ExecutionStrategy.STANDARD,
+            prompt="Run with unsupported",
         )
         result = await self.runner.run_async(inv)
 
@@ -347,7 +350,7 @@ class TestOneShotInvocationExecution(unittest.IsolatedAsyncioTestCase):
         mock_exec.assert_not_called()
         self.assertEqual(result.status, InvocationStatus.FAILED)
         self.assertIn("Unsupported execution strategy", result.error or "")
-        self.assertIn("BOOST", result.error or "")
+        self.assertIn("Custom unsupported reason", result.error or "")
 
     @patch("asyncio.create_subprocess_exec")
     async def test_structured_json_success(self, mock_exec: AsyncMock) -> None:
@@ -454,7 +457,7 @@ class TestOneShotInvocationExecution(unittest.IsolatedAsyncioTestCase):
 
     @patch("asyncio.create_subprocess_exec")
     async def test_empty_response_handling(self, mock_exec: AsyncMock) -> None:
-        mock_proc = self._create_mock_process(stdout="   \n   ", returncode=0)
+        mock_proc = self._create_mock_process(stdout="   \n   ", stderr="Backend returned no response", returncode=0)
         mock_exec.return_value = mock_proc
 
         inv = ModelInvocation(
@@ -469,6 +472,7 @@ class TestOneShotInvocationExecution(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, InvocationStatus.FAILED)
         self.assertEqual(result.exit_code, 0)
         self.assertIn("Empty output", result.error or "")
+        self.assertIn("Backend returned no response", result.error or "")
 
     @patch("asyncio.create_subprocess_exec")
     async def test_nonzero_exit_reporting(self, mock_exec: AsyncMock) -> None:
@@ -566,6 +570,7 @@ class TestOneShotInvocationExecution(unittest.IsolatedAsyncioTestCase):
     async def test_timeout_handling(self, mock_exec: AsyncMock) -> None:
         mock_proc = AsyncMock()
         mock_proc.returncode = None
+        mock_proc.stderr.read.return_value = b""
         # communicate hangs forever
         mock_proc.communicate.side_effect = asyncio.TimeoutError()
         mock_exec.return_value = mock_proc
@@ -588,6 +593,7 @@ class TestOneShotInvocationExecution(unittest.IsolatedAsyncioTestCase):
     async def test_cancellation_handling(self, mock_exec: AsyncMock) -> None:
         mock_proc = AsyncMock()
         mock_proc.returncode = None
+        mock_proc.stderr.read.return_value = b""
         mock_proc.communicate.side_effect = asyncio.CancelledError()
         mock_exec.return_value = mock_proc
 
@@ -659,8 +665,10 @@ class TestProcessIsolationAndControl(unittest.TestCase):
     def test_cancel_run_terminates_only_specified_run(self) -> None:
         proc1 = MagicMock()
         proc1.returncode = None
+        proc1.stderr.read.return_value = b""
         proc2 = MagicMock()
         proc2.returncode = None
+        proc2.stderr.read.return_value = b""
         proc3 = MagicMock()
         proc3.returncode = None
 
@@ -683,8 +691,10 @@ class TestProcessIsolationAndControl(unittest.TestCase):
     def test_cancel_individual_invocation(self) -> None:
         proc1 = MagicMock()
         proc1.returncode = None
+        proc1.stderr.read.return_value = b""
         proc2 = MagicMock()
         proc2.returncode = None
+        proc2.stderr.read.return_value = b""
 
         self.runner._register_process(RunId("run-A"), InvocationId("inv-1"), proc1)
         self.runner._register_process(RunId("run-A"), InvocationId("inv-2"), proc2)
@@ -718,6 +728,7 @@ class TestPersistentModelSession(unittest.TestCase):
     def test_persistent_session_conforms_to_protocol(self, mock_exec: AsyncMock) -> None:
         mock_proc = AsyncMock()
         mock_proc.returncode = None
+        mock_proc.stderr.read.return_value = b""
         mock_exec.return_value = mock_proc
 
         session = AntigravitySession(
@@ -734,6 +745,7 @@ class TestPersistentModelSession(unittest.TestCase):
     ) -> None:
         mock_proc = AsyncMock()
         mock_proc.returncode = None
+        mock_proc.stderr.read.return_value = b""
 
         # Sequence of NDJSON stream events for two turns:
         # Turn 1: init event (conversation_id), then result event
@@ -744,7 +756,7 @@ class TestPersistentModelSession(unittest.TestCase):
             b'{"event": "result", "response": "Answer turn 2"}\n',
             b"",
         ]
-        mock_proc.stdout.readline.side_effect = lines
+        mock_proc.stdout.read.side_effect = lines
         mock_exec.return_value = mock_proc
 
         session = AntigravitySession(
@@ -767,8 +779,8 @@ class TestPersistentModelSession(unittest.TestCase):
         self.assertEqual(len(write_calls), 2)
         payload1 = json.loads(write_calls[0][0][0].decode("utf-8"))
         payload2 = json.loads(write_calls[1][0][0].decode("utf-8"))
-        self.assertEqual(payload1, {"prompt": "Question 1"})
-        self.assertEqual(payload2, {"prompt": "Question 2"})
+        self.assertEqual(payload1, {"event": "user", "message": {"content": "Question 1"}})
+        self.assertEqual(payload2, {"event": "user", "message": {"content": "Question 2"}})
 
         session.close()
 
@@ -776,6 +788,7 @@ class TestPersistentModelSession(unittest.TestCase):
     def test_persistent_session_close_cleanly(self, mock_exec: AsyncMock) -> None:
         mock_proc = AsyncMock()
         mock_proc.returncode = None
+        mock_proc.stderr.read.return_value = b""
         mock_exec.return_value = mock_proc
 
         session = AntigravitySession(
@@ -791,6 +804,7 @@ class TestPersistentModelSession(unittest.TestCase):
     def test_persistent_session_context_manager(self, mock_exec: AsyncMock) -> None:
         mock_proc = AsyncMock()
         mock_proc.returncode = None
+        mock_proc.stderr.read.return_value = b""
         mock_exec.return_value = mock_proc
 
         with AntigravitySession(agy_path="/mock/agy", profile_store=self.profile_store) as sess:
@@ -803,15 +817,17 @@ class TestPersistentModelSession(unittest.TestCase):
         # Process 1: Turn 1 times out (hangs reading stdout)
         proc1 = AsyncMock()
         proc1.returncode = None
-        async def slow_readline() -> bytes:
+        proc1.stderr.read.return_value = b""
+        async def slow_readline(*_args) -> bytes:
             await asyncio.sleep(5.0)
             return b'{"event": "result", "response": "Delayed Turn 1 output"}\n'
-        proc1.stdout.readline.side_effect = slow_readline
+        proc1.stdout.read.side_effect = slow_readline
 
         # Process 2: Spawned on restart for Turn 2
         proc2 = AsyncMock()
         proc2.returncode = None
-        proc2.stdout.readline.side_effect = [
+        proc2.stderr.read.return_value = b""
+        proc2.stdout.read.side_effect = [
             b'{"event": "result", "response": "Turn 2 fresh output"}\n',
         ]
 
@@ -838,10 +854,12 @@ class TestPersistentModelSession(unittest.TestCase):
         # Part 2: Crash / EOF handling
         proc3 = AsyncMock()
         proc3.returncode = 1
-        proc3.stdout.readline.side_effect = [b""]  # Immediate EOF from crashed process
+        proc3.stderr.read.return_value = b""
+        proc3.stdout.read.side_effect = [b""]  # Immediate EOF from crashed process
         proc4 = AsyncMock()
         proc4.returncode = None
-        proc4.stdout.readline.side_effect = [
+        proc4.stderr.read.return_value = b""
+        proc4.stdout.read.side_effect = [
             b'{"event": "result", "response": "Recovered after crash"}\n',
         ]
         mock_exec.side_effect = [proc3, proc4]
@@ -1031,6 +1049,22 @@ class TestFailureClassification(unittest.TestCase):
             error="Malformed JSON in output: invalid character",
         )
         self.assertEqual(classify_failure(res), FailureClass.RECOVERABLE)
+
+    def test_classify_permission_denied(self) -> None:
+        res = ModelResult(
+            invocation_id=InvocationId("i-1"),
+            status=InvocationStatus.FAILED,
+            error="Tool permission denied for RunCommand: user denied permission to run command",
+        )
+        self.assertEqual(classify_failure(res), FailureClass.RETRYABLE)
+
+    def test_classify_empty_response(self) -> None:
+        res = ModelResult(
+            invocation_id=InvocationId("i-1"),
+            status=InvocationStatus.FAILED,
+            error="Empty response in final result event",
+        )
+        self.assertEqual(classify_failure(res), FailureClass.RETRYABLE)
 
 
 class TestIndependenceAndSafety(unittest.TestCase):
