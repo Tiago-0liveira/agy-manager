@@ -25,6 +25,7 @@ from agym.orchestration.contracts import (
     BudgetUsage,
     ComplexityLevel,
     CoordinatorAction,
+    CoordinatorQualityUpdate,
     ExecutionStrategy,
     FailureClass,
     InvocationStatus,
@@ -127,6 +128,8 @@ COORDINATOR_ACTION_ALLOWED_FIELDS: frozenset[str] = frozenset({
     "workers",
     "auditors",
     "reason_summary",
+    "reason",
+    "quality_update",
     "final_response",
 })
 
@@ -349,8 +352,27 @@ COORDINATOR_ACTION_SCHEMA: dict[str, Any] = {
         },
         "reason_summary": {
             "type": "string",
+            "maxLength": 500,
             "default": "",
-            "description": "Rationale for this decision.",
+            "description": "Legacy alias for the short action rationale.",
+        },
+        "reason": {
+            "type": "string",
+            "maxLength": 500,
+            "default": "",
+            "description": "Short rationale explaining why the orchestration action is useful.",
+        },
+        "quality_update": {
+            "type": ["object", "null"],
+            "properties": {
+                "open_questions": {"type": ["array", "null"], "items": {"type": "string"}},
+                "disagreements": {"type": ["array", "null"], "items": {"type": "string"}},
+                "open_critical_findings": {"type": ["array", "null"], "items": {"type": "string"}},
+                "confidence": {"type": ["number", "null"], "minimum": 0.0, "maximum": 1.0}
+            },
+            "additionalProperties": False,
+            "default": None,
+            "description": "Coordinator-reported reasoning state. Mechanical quality evidence is engine-derived.",
         },
         "final_response": {
             "type": ["string", "null"],
