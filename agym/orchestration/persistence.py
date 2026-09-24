@@ -560,6 +560,23 @@ class FileRunStore:
             if stage_dir.exists():
                 shutil.rmtree(stage_dir, ignore_errors=True)
 
+        # create_run writes RUN_CREATED directly so the run directory is atomic.
+        # Broadcast that already-persisted event after the rename; otherwise the
+        # live TUI does not learn the task/run start until a later lifecycle event.
+        from agym.orchestration.recording import append_trace
+        append_trace(
+            self,
+            str(rid),
+            "orchestration",
+            initial_event.to_dict(),
+            event_id=str(initial_event.event_id),
+        )
+        if self.event_sink is not None:
+            try:
+                self.event_sink.emit(initial_event)
+            except Exception as exc:
+                logger.warning("EventSink failed to emit initial run event: %s", exc)
+
         return state
 
     # ------------------------------------------------------------------------
