@@ -40,6 +40,7 @@ RESERVED_NAMES = {
     "auto-pr",
     "all",
     "smartrename",
+    "update",
 }
 
 
@@ -523,6 +524,7 @@ class ProfileStore:
     def profile_dir(self, name: str) -> Path:
         validate_profile_name(name)
         return self.profiles_root / name
+
 
     def smart_rename(self, mode: str) -> list[tuple[str, str]]:
         normalized_mode = mode.strip().lower()
