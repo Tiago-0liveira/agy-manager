@@ -1904,7 +1904,11 @@ class OrchestrationEngine:
                 self._emit_event(
                     EventType.ROUND_COMPLETED,
                     state.run_id,
-                    {"round_number": state.round_number - 1},
+                    {
+                        "round_number": state.round_number - 1,
+                        "budget": state.budget.to_dict(),
+                        "budget_usage": state.budget_usage.to_dict(),
+                    },
                 )
 
                 # Persist coordinator tracking info
@@ -2414,7 +2418,11 @@ class OrchestrationEngine:
                 self._emit_event(
                     EventType.ROUND_COMPLETED,
                     state.run_id,
-                    {"round_number": state.round_number - 1},
+                    {
+                        "round_number": state.round_number - 1,
+                        "budget": state.budget.to_dict(),
+                        "budget_usage": state.budget_usage.to_dict(),
+                    },
                 )
 
                 observation = self._build_observation(state, completed=c_wave, failed=f_wave, rejected=r_wave)

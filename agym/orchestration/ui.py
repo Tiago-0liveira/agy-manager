@@ -562,6 +562,21 @@ class TerminalEventSink(EventSink):
                         self.state.waves[wn].status = "COMPLETED"
                 except (ValueError, TypeError):
                     pass
+            usage = payload.get("budget_usage")
+            if isinstance(usage, dict):
+                self.state.budget_invocations = int(
+                    usage.get("invocations", self.state.budget_invocations) or 0
+                )
+                self.state.budget_rounds = int(
+                    usage.get("rounds", self.state.budget_rounds) or 0
+                )
+                self.state.runtime_seconds = float(
+                    usage.get("runtime_seconds", self.state.runtime_seconds) or 0.0
+                )
+            budget = payload.get("budget")
+            if isinstance(budget, dict):
+                self.state.budget_max_invocations = int(budget.get("max_invocations", 0) or 0)
+                self.state.budget_max_rounds = int(budget.get("max_rounds", 0) or 0)
 
         elif etype in (EventType.ACTION_REQUESTED, EventType.ACTION_ACCEPTED):
             act = payload.get("action")
@@ -867,6 +882,19 @@ class TerminalEventSink(EventSink):
                         if eline:
                             lines.append(f"    Error: {eline}")
 
+            lines.append("")
+
+        if self.state.run_status not in {
+            RunStatus.COMPLETED.value,
+            RunStatus.FAILED.value,
+            RunStatus.INTERRUPTED.value,
+        }:
+            started = _parse_timestamp(self.state.started_at)
+            elapsed = self.state.runtime_seconds
+            if started is not None:
+                now = datetime.now(started.tzinfo) if started.tzinfo else datetime.now()
+                elapsed = max(elapsed, (now - started).total_seconds())
+            lines.append(f"Elapsed {format_duration(elapsed)}")
             lines.append("")
 
         # Trailing run status if finished
