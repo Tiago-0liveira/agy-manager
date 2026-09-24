@@ -447,6 +447,8 @@ class OrchestrationEngine:
         worker_id: str,
         activity: str,
     ) -> None:
+        if worker_id == "coordinator":
+            return
         self._emit_event(
             EventType.INVOCATION_ACTIVITY,
             run_id,
@@ -497,8 +499,6 @@ class OrchestrationEngine:
                 missing.append("at least 2 independent worker perspectives are required")
             if q.synthesis_completed < 1:
                 missing.append("a synthesis is required")
-            if state.assessment and state.assessment.value_of_auditing >= 0.5 and q.audits_completed < 1:
-                missing.append("an independent audit is required because value_of_auditing >= 0.5")
         else:
             if q.independent_perspectives < 3:
                 missing.append("at least 3 independent worker perspectives are required")

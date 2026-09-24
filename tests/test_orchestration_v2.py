@@ -115,6 +115,14 @@ class TestQualityGates(OrchestratorV2Base):
         missing = self.engine._check_finalization(state)
         self.assertTrue(any("synthesis" in item.lower() for item in missing))
 
+    def test_medium_audit_is_advisory_not_a_hard_gate(self) -> None:
+        state = self.make_state(ComplexityLevel.MEDIUM, value_of_auditing=0.9)
+        state.quality_state.independent_perspectives = 2
+        state.quality_state.independent_worker_ids = ["w1", "w2"]
+        state.quality_state.synthesis_completed = 1
+        state.quality_state.synthesis_worker_ids = ["s1"]
+        self.assertEqual(self.engine._check_finalization(state), [])
+
     def test_critical_findings_block_and_resolution_allows_finalization(self) -> None:
         state = self.make_state(ComplexityLevel.LARGE)
         self._ready_high(state)
@@ -355,11 +363,16 @@ class TestImplementModeGates(OrchestratorV2Base):
         self.assertEqual(self.engine._check_finalization(state), [])
 
     def test_only_executor_can_mutate(self) -> None:
+        mutating_analysis = WorkerRequest(
+            worker_id=WorkerId("analysis"),
+            role=WorkerRole.TESTING,
+            workspace_mode=WorkspaceMode.MUTATING,
+        )
         with self.assertRaises(ValueError):
-            WorkerRequest(
-                worker_id=WorkerId("analysis"),
-                role=WorkerRole.TESTING,
-                workspace_mode=WorkspaceMode.MUTATING,
+            CoordinatorAction(
+                action_id=ActionId("bad-mutation"),
+                kind=ActionKind.RUN_WORKERS,
+                workers=[mutating_analysis],
             )
         with self.assertRaises(ValueError):
             parse_coordinator_action({
@@ -421,7 +434,7 @@ class TestV2Presentation(unittest.TestCase):
     def test_completion_does_not_dump_full_final_response(self) -> None:
         sink = TerminalEventSink(stream=io.StringIO(), is_tty=False, use_color=False, run_id="ui-final")
         giant = "SECRET-FINAL-" + ("x" * 5000)
-        sink.emit(type_event("1", EventType.RUN_COMPLETED, {
+        sink.emit(type_event("final", EventType.RUN_COMPLETED, {
             "summary": giant,
             "final_result": giant,
             "final_artifact_path": "/tmp/run/deliverables/final.md",

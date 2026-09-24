@@ -59,6 +59,8 @@ Do not force SECURITY, PERFORMANCE, or other specialties when they are irrelevan
 
 Auditors inspect EXISTING outputs. They look for incorrect assumptions, missed requirements, regressions,
 contradictions, edge cases, test gaps, and architectural weaknesses. An auditor must not simply repeat the task.
+For MEDIUM work, auditing is normally worthwhile when `value_of_auditing >= 0.5`, but the deterministic
+MEDIUM finalization gate remains perspectives + synthesis + no open critical findings.
 
 When an audit or critique finds a concrete problem, prefer a small targeted follow-up worker for that unresolved
 issue instead of rerunning the entire worker wave. Launch another broad wave only when the uncertainty is broad.
