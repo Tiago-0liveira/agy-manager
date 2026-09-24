@@ -10,22 +10,28 @@ from .backends import BackendError, TerminalPaneBackend
 from .detector import detect_backend, get_unsupported_message
 from .layout import calculate_layout
 
+DEFAULT_PROFILE_COUNT = 4
+
+
 HELP_TEXT = """Usage:
-  agym all [options] [--] [agy args...]
+  agym all [count] [options] [--] [agy args...]
 
 Description:
-  Launch every configured Antigravity profile simultaneously, with one
-  profile per terminal pane arranged as evenly as practical within the
-  current terminal window.
+  Launch up to COUNT configured Antigravity profiles simultaneously, with
+  one profile per terminal pane arranged as evenly as practical within the
+  current terminal window. COUNT defaults to 4.
 
 Supported backends:
   - Windows: Windows Terminal (native wt.exe split-pane in current tab/window)
   - Linux:   tmux (active session or automatic managed session fallback), WezTerm
   - macOS:   tmux (active session or automatic managed session fallback), WezTerm
 
+Arguments:
+  count                               Number of profiles to launch (default: 4)
+
 Options:
   -h, --help                          Show this help message and exit
-  -n, --count <N>                     Limit number of profiles to launch (e.g. -n 4 for 2x2 grid)
+  -n, --count <N>                     Compatibility alias for the positional count
   --profiles <p1,p2,...>              Launch specific profile subset by name
   -C, --cwd, --dir <path>             Working directory to open panes in (default: current dir)
   -- [agy args...]                    Pass trailing arguments directly to each profile
@@ -36,19 +42,27 @@ def build_all_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agym all",
         description=(
-            "Launch every configured Antigravity profile simultaneously, "
-            "with one profile per terminal pane."
+            "Launch a bounded number of configured Antigravity profiles "
+            "simultaneously, with one profile per terminal pane."
         ),
         add_help=True,
+    )
+    parser.add_argument(
+        "profile_count",
+        nargs="?",
+        type=int,
+        default=DEFAULT_PROFILE_COUNT,
+        metavar="COUNT",
+        help=f"Number of profiles to launch (default: {DEFAULT_PROFILE_COUNT})",
     )
     parser.add_argument(
         "-n",
         "--count",
         "--limit",
-        dest="count",
+        dest="count_override",
         type=int,
         metavar="N",
-        help="Limit number of profiles to launch",
+        help="Compatibility alias for the positional count",
     )
     parser.add_argument(
         "--profiles",
@@ -98,6 +112,7 @@ def run_all(
 
     cwd_arg: str | None = None
     count_arg: int | None = None
+    count_explicit = False
     profiles_arg: str | None = None
     rest_args: list[str] = []
 
@@ -119,6 +134,10 @@ def run_all(
                 err.write(f"agym all: option '{arg}' requires an integer count\n")
                 err.flush()
                 return 2
+            if count_explicit:
+                err.write("agym all: profile count specified more than once\n")
+                err.flush()
+                return 2
             val = all_argv[i + 1]
             try:
                 count_arg = int(val)
@@ -128,8 +147,13 @@ def run_all(
                 err.write(f"agym all: invalid count '{val}': must be a positive integer\n")
                 err.flush()
                 return 2
+            count_explicit = True
             i += 2
         elif arg.startswith(("-n=", "--count=", "--limit=")):
+            if count_explicit:
+                err.write("agym all: profile count specified more than once\n")
+                err.flush()
+                return 2
             val = arg.split("=", 1)[1]
             try:
                 count_arg = int(val)
@@ -139,6 +163,7 @@ def run_all(
                 err.write(f"agym all: invalid count '{val}': must be a positive integer\n")
                 err.flush()
                 return 2
+            count_explicit = True
             i += 1
         elif arg in ("--profiles",):
             if i + 1 >= len(all_argv):
@@ -150,9 +175,27 @@ def run_all(
         elif arg.startswith("--profiles="):
             profiles_arg = arg.split("=", 1)[1]
             i += 1
+        elif (
+            not count_explicit
+            and not rest_args
+            and arg.lstrip("+-").isdigit()
+        ):
+            try:
+                count_arg = int(arg)
+                if count_arg <= 0:
+                    raise ValueError
+            except ValueError:
+                err.write(f"agym all: invalid count '{arg}': must be a positive integer\n")
+                err.flush()
+                return 2
+            count_explicit = True
+            i += 1
         else:
             rest_args.append(arg)
             i += 1
+
+    if count_arg is None:
+        count_arg = DEFAULT_PROFILE_COUNT
 
     passthrough = rest_args + passthrough
 
@@ -187,8 +230,7 @@ def run_all(
     else:
         profiles = list(all_profiles)
 
-    if count_arg is not None:
-        profiles = profiles[:count_arg]
+    profiles = profiles[:count_arg]
 
     if not profiles:
         err.write("agym all: no profiles selected to launch\n")

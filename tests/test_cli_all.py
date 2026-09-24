@@ -63,7 +63,7 @@ class CliAllCommandTests(unittest.TestCase):
         with mock.patch("sys.stdout", out):
             code = cli.main(["all", "--help"])
         self.assertEqual(code, 0)
-        self.assertIn("Launch every configured Antigravity profile simultaneously", out.getvalue())
+        self.assertIn("Launch a bounded number of configured Antigravity profiles", out.getvalue())
 
     @mock.patch("agym.cli.ProfileStore")
     def test_zero_profiles_prints_setup_message(self, Store: mock.Mock) -> None:
@@ -163,6 +163,41 @@ class CliAllCommandTests(unittest.TestCase):
         run_mock.assert_called_once_with(
             Path("/mock/agy"), p1, ["--dsp"], replace_process=True
         )
+
+
+    @mock.patch("agym.cli.ProfileStore")
+    @mock.patch("agym.panes.runner.detect_backend")
+    def test_all_defaults_to_four_profiles(
+        self, detect_mock: mock.Mock, Store: mock.Mock
+    ) -> None:
+        for name in ("p1", "p2", "p3", "p4", "p5", "p6"):
+            self.store.create(name)
+        Store.return_value = self.store
+
+        mock_backend = MockBackend(exit_code=0)
+        detect_mock.return_value = mock_backend
+
+        code = cli.main(["all"])
+        self.assertEqual(code, 0)
+        self.assertEqual(mock_backend.called_with["profiles"], ["p1", "p2", "p3", "p4"])
+        self.assertEqual(mock_backend.called_with["plan"].total_panes, 4)
+
+    @mock.patch("agym.cli.ProfileStore")
+    @mock.patch("agym.panes.runner.detect_backend")
+    def test_all_positional_count_limits_profiles(
+        self, detect_mock: mock.Mock, Store: mock.Mock
+    ) -> None:
+        for name in ("p1", "p2", "p3", "p4"):
+            self.store.create(name)
+        Store.return_value = self.store
+
+        mock_backend = MockBackend(exit_code=0)
+        detect_mock.return_value = mock_backend
+
+        code = cli.main(["all", "2"])
+        self.assertEqual(code, 0)
+        self.assertEqual(mock_backend.called_with["profiles"], ["p1", "p2"])
+        self.assertEqual(mock_backend.called_with["plan"].total_panes, 2)
 
 
     @mock.patch("agym.cli.ProfileStore")

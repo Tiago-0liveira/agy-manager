@@ -86,7 +86,7 @@ agym personal -- -p "explain this repository"
 agym personal -p "explain this repository"
 
 # Multi-pane fleet launch:
-agym all                                  # Launch all profiles in evenly arranged terminal panes
+agym all                                  # Launch up to 4 profiles in a 2x2 layout by default
 agym all -- -p "fleet review"             # Pass arguments to all launched profiles
 
 agym list
@@ -119,16 +119,19 @@ agym remove work --yes
 
 ### Multi-Pane Fleet Launch (`agym all`)
 
-`agym all` launches every configured Antigravity profile simultaneously, with one profile per terminal pane arranged as evenly as practical within the current terminal window.
+`agym all` launches a bounded number of configured Antigravity profiles simultaneously, with one profile per terminal pane arranged as evenly as practical. The positional count defaults to 4.
 
 ```bash
-# Launch all accounts in evenly subdivided panes
+# Launch the default 4 profiles in a 2x2 grid
 agym all
 
-# Auto-approve permissions for all instances with --dsp (or -y)
-agym all --dsp
+# Launch the first 6 profiles
+agym all 6
 
-# Limit how many profiles to launch (e.g. first 4 profiles in a 2x2 grid)
+# Auto-approve permissions for all launched instances
+agym all 4 --dsp
+
+# -n / --count remains available as a compatibility alias
 agym all -n 4
 
 # Open all panes in a specific project directory (-C / --cwd)
@@ -138,11 +141,11 @@ agym all -C /path/to/my-repo
 agym all --profiles personal,work
 
 # Combine options and forward custom Antigravity flags
-agym all -n 4 -C /path/to/project --dsp -- -p "fleet review"
+agym all 4 -C /path/to/project --dsp -- -p "fleet review"
 ```
 
 #### Core Behavior & Profile Isolation
-- **Discovery**: Retrieves all configured profiles from `ProfileStore` (matching `agym list`).
+- **Discovery**: Retrieves configured profiles from `ProfileStore` (matching `agym list`) and launches the requested count, defaulting to the first 4.
 - **Full Isolation**: Each pane executes through the standard `agym <profile>` launch path, preserving isolated home directories (`HOME`, `USERPROFILE`, `LOCALAPPDATA`, `APPDATA`), credentials, statuslines, default models, permission flags, and current working directory.
 - **Shortcut Handling**: If no profiles exist, displays setup guidance (`agym setup <profile>`). If exactly 1 profile exists, launches it directly without initializing multi-pane backends.
 
