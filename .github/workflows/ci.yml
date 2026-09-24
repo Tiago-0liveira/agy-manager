@@ -35,7 +35,7 @@ jobs:
           python -m unittest
           tests.test_auto_pr tests.test_cache tests.test_cli tests.test_diagnostics
           tests.test_host_safety tests.test_launcher tests.test_picker tests.test_profiles
-          tests.test_quota_api tests.test_rotator tests.test_statusline tests.test_subscription
+          tests.test_quota_api tests.test_rotator tests.test_sessions tests.test_statusline tests.test_subscription
           tests.test_tokens tests.test_usage tests.test_updater tests.test_wincred
           tests.council.test_packaging tests.test_release_version
 

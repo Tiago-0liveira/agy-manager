@@ -1151,6 +1151,29 @@ class UsageGraphsTests(unittest.TestCase):
         main_line = next(l for l in lines if "main" in l)
         self.assertIn("0", main_line)
 
+    def test_matrix_and_telemetry_render_session_counts(self) -> None:
+        from agym.usage import render_usage_view_lines
+
+        p = Profile(name="ttb", home=Path("/h1"), created_at="")
+        usage = parse_usage_response(SAMPLE_REAL_RESPONSE, "ttb")
+        completed = {"ttb": usage}
+
+        matrix = "\n".join(
+            render_usage_view_lines(
+                [p], completed, session_counts={"ttb": 2}, view="matrix",
+                use_color=False, include_summary=False,
+            )
+        )
+        telemetry = "\n".join(
+            render_usage_view_lines(
+                [p], completed, session_counts={"ttb": 2}, view="telemetry",
+                use_color=False, include_summary=False,
+            )
+        )
+
+        self.assertIn("S:2", matrix)
+        self.assertIn("Sess:2", telemetry)
+
     def test_usage_json_includes_open_sessions(self) -> None:
         u1 = parse_usage_response(SAMPLE_REAL_RESPONSE, "ttb")
         u2 = parse_usage_response(SAMPLE_REAL_RESPONSE, "main")

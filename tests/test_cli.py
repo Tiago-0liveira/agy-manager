@@ -26,7 +26,9 @@ class CliTests(unittest.TestCase):
             run.return_value = 0
             self.assertEqual(cli.main(["personal", "-p", "hello"]), 0)
             resolve.assert_called_once_with()
-            run.assert_called_once_with(Path("/real/agy"), profile, ["-p", "hello"], replace_process=True)
+            run.assert_called_once_with(
+                Path("/real/agy"), profile, ["-p", "hello"], replace_process=True, data_root=store.data_root
+            )
 
     @mock.patch("agym.cli.ProfileStore")
     def test_config_display_and_mutation(self, Store: mock.Mock) -> None:
@@ -136,6 +138,27 @@ class CliTests(unittest.TestCase):
 
 
     @mock.patch("agym.cli.ProfileStore")
+    def test_config_validation_does_not_mutate_cache_ttl(self, Store: mock.Mock) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(Path(tmp) / "config", Path(tmp) / "data")
+            store.create("personal")
+            Store.return_value = store
+            self.assertEqual(store.get_usage_cache_ttl(), 300.0)
+
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                code = cli.main(["config", "missing", "--cache-duration", "30s"])
+            self.assertEqual(code, 2)
+            self.assertEqual(store.get_usage_cache_ttl(), 300.0)
+
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                code = cli.main(["config", "personal", "--cache-duration", "30s", "--model", ""])
+            self.assertEqual(code, 2)
+            self.assertEqual(store.get_usage_cache_ttl(), 300.0)
+
+
+    @mock.patch("agym.cli.ProfileStore")
     @mock.patch("agym.cli.resolve_agy")
     @mock.patch("agym.cli.run_auto_prompt")
     @mock.patch("agym.cli.run_agy")
@@ -158,7 +181,7 @@ class CliTests(unittest.TestCase):
             code = cli.main(["personal", "--auto-prompt", "make a plan"])
             self.assertEqual(code, 0)
             mock_run_auto_prompt.assert_called_once_with(
-                Path("/usr/bin/agy"), profile, "make a plan", replace_process=True
+                Path("/usr/bin/agy"), profile, "make a plan", replace_process=True, data_root=store.data_root
             )
             mock_run_agy.assert_not_called()
 
@@ -180,7 +203,7 @@ class CliTests(unittest.TestCase):
             code = cli.main(["personal", "-p", "review"])
             self.assertEqual(code, 0)
             mock_run_agy.assert_called_once_with(
-                Path("/usr/bin/agy"), profile, ["-p", "review"], replace_process=True
+                Path("/usr/bin/agy"), profile, ["-p", "review"], replace_process=True, data_root=store.data_root
             )
             mock_run_auto_prompt.assert_not_called()
 
@@ -191,7 +214,7 @@ class CliTests(unittest.TestCase):
             code = cli.main(["personal", "--", "--auto-prompt", "something"])
             self.assertEqual(code, 0)
             mock_run_agy.assert_called_once_with(
-                Path("/usr/bin/agy"), profile, ["--", "--auto-prompt", "something"], replace_process=True
+                Path("/usr/bin/agy"), profile, ["--", "--auto-prompt", "something"], replace_process=True, data_root=store.data_root
             )
             mock_run_auto_prompt.assert_not_called()
 
@@ -201,7 +224,7 @@ class CliTests(unittest.TestCase):
             code = cli.main(["personal", "--auto-prompt", "make a plan", "-y"])
             self.assertEqual(code, 0)
             mock_run_auto_prompt.assert_called_once_with(
-                Path("/usr/bin/agy"), profile, "make a plan", replace_process=True, extra_args=["-y"]
+                Path("/usr/bin/agy"), profile, "make a plan", replace_process=True, data_root=store.data_root, extra_args=["-y"]
             )
             mock_run_agy.assert_not_called()
 
@@ -283,7 +306,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             p = store.get("my-prof")
             self.assertEqual(p.subscription_date, "2027-03-14")
-            run.assert_called_with(Path("/real/agy"), p, replace_process=False, is_setup=True)
+            run.assert_called_with(Path("/real/agy"), p, replace_process=False, is_setup=True, data_root=store.data_root)
 
             # Setting up an existing profile raises error
             err = io.StringIO()
@@ -428,7 +451,7 @@ class CliTests(unittest.TestCase):
                 code1 = cli.main(["rotate", "-p", "step 1"])
             self.assertEqual(code1, 0)
             self.assertIn("Active Account: p1", out1.getvalue())
-            run.assert_called_with(Path("/real/agy"), p1, ["-p", "step 1"], replace_process=True)
+            run.assert_called_with(Path("/real/agy"), p1, ["-p", "step 1"], replace_process=True, data_root=store.data_root)
 
             # 2nd rotate -> launches p2
             out2 = io.StringIO()
@@ -436,7 +459,7 @@ class CliTests(unittest.TestCase):
                 code2 = cli.main(["rotate", "-p", "step 2"])
             self.assertEqual(code2, 0)
             self.assertIn("Active Account: p2", out2.getvalue())
-            run.assert_called_with(Path("/real/agy"), p2, ["-p", "step 2"], replace_process=True)
+            run.assert_called_with(Path("/real/agy"), p2, ["-p", "step 2"], replace_process=True, data_root=store.data_root)
 
     @mock.patch("agym.cli.ProfileStore")
     def test_rename_command(self, Store: mock.Mock) -> None:

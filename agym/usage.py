@@ -667,6 +667,7 @@ def render_usage_view_lines(
                 sorted_profs,
                 completed_map,
                 extract_quota_bucket,
+                session_counts=session_counts,
                 use_color=use_color,
                 term_width=term_width,
             )
@@ -695,6 +696,7 @@ def render_usage_view_lines(
                 completed_map,
                 extract_quota_bucket,
                 format_short_reset_time,
+                session_counts=session_counts,
                 use_color=use_color,
                 term_width=term_width,
             )

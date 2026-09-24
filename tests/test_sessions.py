@@ -125,6 +125,48 @@ class TestSessions(unittest.TestCase):
             self.assertEqual(active[0].session_id, sid1)
             self.assertFalse(corrupt_file.exists())
 
+    def test_pid_reuse_prunes_stale_session(self) -> None:
+        with mock.patch("agym.sessions.is_pid_alive", return_value=True), mock.patch(
+            "agym.sessions.get_process_start_id", side_effect=["start-a", "start-b"]
+        ):
+            sid = register_session("profile-a", pid=321, data_root=self.data_root)
+            session_file = self.data_root / "sessions" / f"{sid}.json"
+            self.assertTrue(session_file.exists())
+            active = list_active_sessions(data_root=self.data_root)
+            self.assertEqual(active, [])
+            self.assertFalse(session_file.exists())
+
+    def test_legacy_record_without_process_start_id_uses_pid_fallback(self) -> None:
+        sessions_dir = self.data_root / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        legacy_file = sessions_dir / "sess-legacy.json"
+        legacy_file.write_text(
+            json.dumps(
+                {
+                    "session_id": "sess-legacy",
+                    "profile": "legacy",
+                    "pid": 444,
+                    "started_at": "2026-09-24T00:00:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch("agym.sessions.is_pid_alive", return_value=True), mock.patch(
+            "agym.sessions.get_process_start_id", return_value="different-process"
+        ):
+            active = list_active_sessions(data_root=self.data_root)
+        self.assertEqual(len(active), 1)
+        self.assertIsNone(active[0].process_start_id)
+        self.assertTrue(legacy_file.exists())
+
+    def test_windows_pid_check_never_falls_back_to_os_kill(self) -> None:
+        with mock.patch("agym.sessions.sys.platform", "win32"), mock.patch(
+            "agym.sessions._is_windows_pid_alive", return_value=True
+        ) as win_alive, mock.patch("agym.sessions.os.kill") as kill:
+            self.assertTrue(is_pid_alive(1234))
+        win_alive.assert_called_once_with(1234)
+        kill.assert_not_called()
+
     def test_is_pid_alive_current_process(self) -> None:
         # Current process PID must be alive
         self.assertTrue(is_pid_alive(os.getpid()))
