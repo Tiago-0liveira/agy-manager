@@ -45,13 +45,16 @@ class TokenUsage:
     cache_read_tokens: int = 0
     total_tokens: int = 0
 
+    def __post_init__(self) -> None:
+        if self.total_tokens == 0 and (self.input_tokens > 0 or self.output_tokens > 0):
+            object.__setattr__(self, "total_tokens", self.input_tokens + self.output_tokens)
+
     @property
     def cache_efficiency(self) -> float:
-        """Returns cache read efficiency percentage: cache_read / (input + cache_read)."""
-        prompt_total = self.input_tokens + self.cache_read_tokens
-        if prompt_total <= 0:
+        """Returns cache read efficiency percentage: cache_read / input_tokens."""
+        if self.input_tokens <= 0:
             return 0.0
-        return (self.cache_read_tokens / prompt_total) * 100.0
+        return (self.cache_read_tokens / self.input_tokens) * 100.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -71,7 +74,13 @@ class TokenUsage:
         out = int(data.get("output_tokens", 0) or 0)
         thk = int(data.get("thinking_tokens", 0) or 0)
         crd = int(data.get("cache_read_tokens", 0) or 0)
-        tot = int(data.get("total_tokens", inp + out + thk + crd) or (inp + out + thk + crd))
+        tot_raw = data.get("total_tokens")
+        if tot_raw is not None and int(tot_raw) > 0:
+            tot = int(tot_raw)
+            if (thk > 0 or crd > 0) and tot == (inp + out + thk + crd):
+                tot = inp + out
+        else:
+            tot = inp + out
         return cls(
             input_tokens=inp,
             output_tokens=out,
@@ -208,7 +217,7 @@ def scan_profile_conversations(
                 try:
                     conn = sqlite3.connect(f"file:{db_path.resolve()}?mode=ro", uri=True)
                     cursor = conn.cursor()
-                    cursor.execute("SELECT idx, metadata FROM steps WHERE step_type = 15 ORDER BY idx ASC;")
+                    cursor.execute("SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx ASC;")
                     for _, meta in cursor.fetchall():
                         if not meta or not isinstance(meta, bytes):
                             continue
@@ -218,11 +227,16 @@ def scan_profile_conversations(
                             if not isinstance(raw_stat, bytes):
                                 continue
                             stat_fields = _parse_protobuf_fields(raw_stat)
+                            if not any(k in stat_fields for k in (2, 3, 5, 9, 10)):
+                                continue
                             inp = int(stat_fields.get(2, [0])[0]) if 2 in stat_fields else 0
                             thk = int(stat_fields.get(9, [0])[0]) if 9 in stat_fields else 0
-                            out = int(stat_fields.get(10, [0])[0]) if 10 in stat_fields else max(0, int(stat_fields.get(3, [0])[0]) - thk)
+                            out = int(stat_fields.get(3, [0])[0]) if 3 in stat_fields else 0
+                            vis = int(stat_fields.get(10, [0])[0]) if 10 in stat_fields else 0
+                            if out == 0 and (vis > 0 or thk > 0):
+                                out = vis + thk
                             crd = int(stat_fields.get(5, [0])[0]) if 5 in stat_fields else 0
-                            tot = inp + out + thk + crd
+                            tot = inp + out
 
                             total_in += inp
                             total_out += out
@@ -265,7 +279,7 @@ def scan_profile_conversations(
                                     out_val = int(u.get("output_tokens", 0) or 0)
                                     thk_val = int(u.get("thinking_tokens", 0) or 0)
                                     crd_val = int(u.get("cache_read_tokens", 0) or 0)
-                                    tot_val = int(u.get("total_tokens", inp_val + out_val + thk_val + crd_val) or (inp_val + out_val + thk_val + crd_val))
+                                    tot_val = inp_val + out_val
                                     total_in += inp_val
                                     total_out += out_val
                                     total_thk += thk_val
@@ -284,8 +298,8 @@ def scan_profile_conversations(
             except OSError:
                 pass
 
-    if total_tot == 0 and (total_in + total_out + total_thk + total_crd) > 0:
-        total_tot = total_in + total_out + total_thk + total_crd
+    if total_tot == 0 and (total_in + total_out) > 0:
+        total_tot = total_in + total_out
 
     cumulative = TokenUsage(
         input_tokens=total_in,
@@ -518,11 +532,20 @@ def render_stacked_bar(
         end = f"{COLOR_DIM}]{COLOR_RESET}" if use_color else "]"
         return f"{border}{char * width}{end}"
 
-    # Calculate proportional segments
-    raw_in = (usage.input_tokens / total) * width
-    raw_out = (usage.output_tokens / total) * width
-    raw_thk = (usage.thinking_tokens / total) * width
-    raw_crd = (usage.cache_read_tokens / total) * width
+    # Exclusive categories internally:
+    # uncached input = input_tokens - cache_read_tokens
+    # cached input = cache_read_tokens
+    # visible output = output_tokens - thinking_tokens
+    # thinking = thinking_tokens
+    uncached_in = max(0, usage.input_tokens - usage.cache_read_tokens)
+    cached_in = usage.cache_read_tokens
+    visible_out = max(0, usage.output_tokens - usage.thinking_tokens)
+    thinking_out = usage.thinking_tokens
+
+    raw_in = (uncached_in / total) * width
+    raw_out = (visible_out / total) * width
+    raw_thk = (thinking_out / total) * width
+    raw_crd = (cached_in / total) * width
 
     # Allocate integer characters preserving min 1 if non-zero
     counts = [int(raw_in), int(raw_out), int(raw_thk), int(raw_crd)]
@@ -605,7 +628,7 @@ def render_summary_card(
     top_account = max(successful, key=lambda a: a.usage.total_tokens, default=None)
     avg_tokens = (total_tokens / len(successful)) if successful else 0.0
 
-    prompt_total = total_in + total_crd
+    prompt_total = total_in
     cache_eff = ((total_crd / prompt_total) * 100.0) if prompt_total > 0 else 0.0
 
     cached_count = sum(1 for a in accounts if a.cached)
@@ -775,7 +798,7 @@ def render_composition_breakdown_table(
         fl_out = sum(a.usage.output_tokens for a in successful)
         fl_thk = sum(a.usage.thinking_tokens for a in successful)
         fl_crd = sum(a.usage.cache_read_tokens for a in successful)
-        p_tot = fl_inp + fl_crd
+        p_tot = fl_inp
         fl_hit = f"{(fl_crd / p_tot * 100.0):.1f}%" if p_tot > 0 else "0.0%"
 
         fl_lbl = "Fleet Total"
@@ -881,7 +904,7 @@ def render_tokens_table_view(
     total_crd = sum(a.usage.cache_read_tokens for a in successful)
     max_tokens = max((a.usage.total_tokens for a in successful), default=1)
 
-    p_tot = total_in + total_crd
+    p_tot = total_in
     cache_hit_pct = (total_crd / p_tot * 100.0) if p_tot > 0 else 0.0
 
     top_account = max(successful, key=lambda a: a.usage.total_tokens, default=None)
@@ -964,7 +987,7 @@ def render_tokens_table_view(
         share_pct = (a.usage.total_tokens / total_tokens * 100.0) if total_tokens > 0 else 0.0
         share_s = f"{share_pct:5.1f}%"
 
-        v_frac = (a.usage.total_tokens / max_tokens) if max_tokens > 0 else 0.0
+        v_frac = (a.usage.total_tokens / total_tokens) if total_tokens > 0 else 0.0
         v_pct = round(v_frac * 100)
         v_bar = format_smooth_bar(v_frac, width=bar_w, use_color=use_color)
         v_col_display = f"{v_bar} {v_pct:3d}%"
@@ -1091,7 +1114,7 @@ def render_tokens_telemetry_view(
     total_crd = sum(a.usage.cache_read_tokens for a in successful)
     max_tokens = max((a.usage.total_tokens for a in successful), default=1)
 
-    p_tot = total_in + total_crd
+    p_tot = total_in
     cache_hit_pct = (total_crd / p_tot * 100.0) if p_tot > 0 else 0.0
 
     dim = COLOR_DIM if use_color else ""
@@ -1274,7 +1297,7 @@ async def run_tokens(
         tot_thk = sum(u.usage.thinking_tokens for u in successful)
         tot_crd = sum(u.usage.cache_read_tokens for u in successful)
         top_u = max(successful, key=lambda u: u.usage.total_tokens, default=None)
-        p_tot = tot_in + tot_crd
+        p_tot = tot_in
 
         payload = {
             "summary": {

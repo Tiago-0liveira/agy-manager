@@ -283,8 +283,8 @@ class QuotaApiUnitTests(unittest.TestCase):
                 "data": {"groups": [{
                     "name": "Gemini Models",
                     "buckets": [{
-                        "id": "gemini-weekly", "name": "Weekly Limit Remaining",
-                        "window": "weekly", "remaining_fraction": 0.4224,
+                        "id": "gemini-5h", "name": "Five Hour Limit Remaining",
+                        "window": "5h", "remaining_fraction": 0.4224,
                     }],
                 }]},
             },
@@ -318,8 +318,21 @@ class QuotaApiUnitTests(unittest.TestCase):
             await asyncio.Event().wait()
 
         mock_direct.side_effect = stalled_api
+        valid_cli_response = {
+            "status": "SUCCESS",
+            "command": {
+                "name": "usage",
+                "data": {"groups": [{
+                    "name": "Gemini Models",
+                    "buckets": [{
+                        "id": "gemini-5h", "name": "Five Hour Limit Remaining",
+                        "window": "5h", "remaining_fraction": 0.5,
+                    }],
+                }]},
+            },
+        }
         mock_runner.return_value = (
-            0, json.dumps({"status": "SUCCESS", "command": {"name": "usage", "data": {"groups": []}}}), "",
+            0, json.dumps(valid_cli_response), "",
         )
 
         async def _run() -> None:
@@ -334,8 +347,22 @@ class QuotaApiUnitTests(unittest.TestCase):
     def test_fetch_account_usage_async_uses_injected_runner(self) -> None:
         self._setup_token_file()
 
+        valid_cli_response = {
+            "status": "SUCCESS",
+            "command": {
+                "name": "usage",
+                "data": {"groups": [{
+                    "name": "Gemini Models",
+                    "buckets": [{
+                        "id": "gemini-5h", "name": "Five Hour Limit Remaining",
+                        "window": "5h", "remaining_fraction": 0.5,
+                    }],
+                }]},
+            },
+        }
+
         async def mock_runner(argv: list[str], env: dict[str, str], timeout: float) -> tuple[int, str, str]:
-            return 0, json.dumps({"status": "SUCCESS", "command": {"name": "usage", "data": {"groups": []}}}), ""
+            return 0, json.dumps(valid_cli_response), ""
 
         async def _run() -> None:
             sem = asyncio.Semaphore(1)

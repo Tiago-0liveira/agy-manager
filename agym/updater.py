@@ -56,6 +56,30 @@ def is_newer_version(candidate: str, current: str) -> bool:
         return False
 
 
+def is_running_in_repo() -> bool:
+    """Returns True if agym is running from within its source repository or worktree."""
+    try:
+        # Check 1: Is the loaded agym package directly inside its git repository?
+        # (e.g. python3 -m agym.cli, or running from local source tree)
+        pkg_dir = Path(__file__).resolve().parent
+        repo_root = pkg_dir.parent
+        if (repo_root / ".git").exists() and (repo_root / "agym" / "cli.py").is_file():
+            return True
+    except Exception:
+        pass
+
+    try:
+        # Check 2: Is the current working directory inside the agym source repository?
+        cwd = Path.cwd().resolve()
+        for p in (cwd, *cwd.parents):
+            if (p / ".git").exists() and (p / "agym" / "cli.py").is_file():
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
 def get_update_cache_file() -> Path:
     return _default_data_root() / "cache" / "updater.json"
 
@@ -505,9 +529,13 @@ def do_update(release_info: dict[str, Any] | None = None) -> int:
 def maybe_prompt_startup_update(argv: list[str]) -> None:
     """Hook invoked at startup of agym CLI.
 
-    Bypasses non-interactive sessions, fast statusline calls, and 24h dismissed updates.
+    Bypasses non-interactive sessions, repository checkouts, fast statusline calls, and 24h dismissed updates.
     """
     if os.environ.get("AGYM_NO_UPDATE_CHECK") == "1":
+        return
+
+    # Skip when running inside the source repository (e.g. python3 -m agym.cli)
+    if is_running_in_repo():
         return
 
     # Skip if non-interactive
@@ -550,11 +578,15 @@ def maybe_prompt_startup_update(argv: list[str]) -> None:
         pass
 
 
-def run_update_cli(argv: list[str]) -> int:
-    """Entry point for 'agym update' command."""
+def build_update_parser() -> argparse.ArgumentParser:
+    usage = """update
+  [--check]
+  [-f | --force]"""
     parser = argparse.ArgumentParser(
         prog="agym update",
+        usage=usage,
         description="Check for and install updates to agym.",
+        add_help=True,
     )
     parser.add_argument(
         "--check",
@@ -566,6 +598,12 @@ def run_update_cli(argv: list[str]) -> int:
         action="store_true",
         help="Force reinstall / update even if already on latest version",
     )
+    return parser
+
+
+def run_update_cli(argv: list[str]) -> int:
+    """Entry point for 'agym update' command."""
+    parser = build_update_parser()
     ns = parser.parse_args(argv)
 
     print("Checking for updates on GitHub...")

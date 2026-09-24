@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import dataclass
 import json
 import sys
 from pathlib import Path
+from typing import Any, Callable, Sequence
 
 from .cache import CacheManager, USAGE_CACHE_TTL_SECONDS
 from .diagnostics import doctor_lines
-from .git.auto_pr import AutoPrError, handle_auto_pr, parse_auto_pr_args
+from .git.auto_pr import AutoPrError, build_auto_pr_parser, handle_auto_pr, parse_auto_pr_args
 from .launcher import (
     ALL_PERMISSIONS_ALIASES,
     AgyNotFound,
@@ -37,7 +39,7 @@ from .subscription import (
 )
 from .statusline import get_statusline_status, render_statusline, sync_all_profiles
 from .tokens import run_tokens
-from .updater import maybe_prompt_startup_update, run_update_cli
+from .updater import build_update_parser, maybe_prompt_startup_update, run_update_cli
 from .usage import fetch_and_cache_usage, run_usage
 from .wincred import get_profile_email
 from .orchestration.contracts import RunId, RunMode, RunState, RunStatus
@@ -47,161 +49,11 @@ from .orchestration.wiring import (
     build_orchestration_dependencies,
 )
 
-USAGE = """agym — Explicit isolated-profile manager for Google Antigravity CLI
 
-Usage:
-  agym <command> [arguments...]
-  agym <profile> [--] [agy args...]
-  agym <profile> --auto-prompt "<prompt>"
-  agym <profile> --auto-pr [-b <branch>] [--title <title>] [--body <body>] [--draft] [--no-push]
-  agym orchestrate "<task>" [--mode plan|implement] [--dry-run]
-  agym orchestrate status <run-id>
-  agym orchestrate resume <run-id>
-  agym select [-f|--fresh] [-- [agy args...]]
-  agym rotate [--file <file>] [--status] [--reset] [--simulate [N]] [-- [agy args...]]
-  agym config <profile> [--model <model>|default] [-y|--dsp|--skip-perms|--[no-]dangerously-skip-permissions]
-  agym update [--check] [-f|--force]
-
-Commands:
-  setup <profile>                     Create a new profile and complete Google sign-in
-  orchestrate <task>                  Orchestrate multi-agent reasoning or implementation
-  config <profile>                    Configure profile model and permission settings
-  edit <profile>                      Edit profile settings (e.g. subscription renewal date, rename)
-  rename <profile> <new-name>         Rename a profile and its isolated directory (alias: mv)
-  list                                List all configured profiles and subscription status
-  select                              Interactively select account by quota health and launch (alias: pick)
-  rotate                              Rotate through accounts/profiles sequentially and launch
-  usage [profiles...]                 Show live model quota usage and subscription health
-  tokens [profiles...]                Show token consumption graphs and fleet summary (aliases: token, token-usage)
-  statusline                          Manage and preview statusline across all registered profiles
-  remove <profile>                    Delete a profile and its isolated data
-  doctor [profile]                    Check environment, executable, permissions, and state
-  auto-pr [profile]                   Create a pull request from current branch into base branch
-  update                              Check for and install updates to agym
-
-Launching Antigravity:
-  agym <profile>                      Launch Antigravity under the specified profile.
-                                      Replaces the current process on POSIX, preserving native
-                                      terminal, TTY, working directory, and signal handling.
-
-  agym rotate [agy args...]           Rotate to next account/profile and launch Antigravity.
-                                      Ensures non-repeating execution, atomic state updates,
-                                      and cross-platform Chromium lock cleanup on Windows.
-
-  agym <profile> [agy args...]        Pass arguments directly to Antigravity.
-                                      Example: agym personal -p "explain this codebase"
-
-  agym <profile> -- [agy args...]     Use '--' separator before arguments if needed to
-                                      prevent agym from parsing flags intended for agy.
-
-  agym <profile> --auto-prompt "<prompt>"
-                                      Two-stage prompt workflow: run non-interactively to generate
-                                      a plan, then continue interactively in the same profile session.
-
-  agym <profile> --auto-pr            Automated pull request creation: inspects commits and diff,
-                                      pushes current branch, and opens a PR via GitHub CLI.
-
-General Options:
-  -h, --help                          Show this help message and exit
-
-Command Options:
-  agym setup <profile> [-s, --subscription-date DATE]
-      -s, --subscription-date DATE    Renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)
-
-  agym config <profile> [--model MODEL] [-y|--dsp|--skip-perms|--[no-]dangerously-skip-permissions]
-      --model MODEL                   Set default model (or 'default' to clear)
-      -y, --dsp, --skip-perms         Enable auto-skipping tool permissions
-      --no-dsp, --no-skip-perms       Disable auto-skipping tool permissions
-
-  agym rename <old-profile> <new-name>
-      Rename a profile, its isolated data directory, and associated caches (alias: mv)
-
-  agym edit <profile> [--name NEW_NAME] [-s, --subscription-date DATE | --clear-subscription-date]
-      --name, --rename NEW_NAME       Rename the profile to a new name
-      -s, --subscription-date DATE    Set renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)
-      --clear-subscription-date       Remove stored subscription date
-  agym usage [--json] [-c, --claude] [-f, --refresh] [-v, --view {table,grid,matrix,telemetry}] [--sort {usage,quota,reset,name,sub,default}] [--timeout SECONDS] [profiles...]
-      --json                          Output quota and subscription data in JSON format
-      -c, --claude                    Include Claude & GPT quotas in the usage view
-      -f, --refresh                   Bypass cache and force live query
-      -v, --view VIEW                 Visual graph layout: table (default), grid, matrix, or telemetry
-      -g, --grid                      Shortcut for --view grid (borderless account view)
-      -m, --matrix                    Shortcut for --view matrix (ultra-dense heatmap for dozens of accounts)
-      -t, --telemetry                 Shortcut for --view telemetry (executive tiered view & recommendation)
-      --sort CRITERION                Sort accounts by: usage (default), quota, reset, name, or sub
-      --no-summary                    Hide top fleet capacity summary banner
-      --timeout SECONDS               Per-profile query timeout in seconds (default: 30)
-
-  agym tokens [--json] [-b, --breakdown] [-f, --refresh] [-v, --view {table,matrix,telemetry,classic}] [--sort {default,volume,cache,name}] [profiles...]
-      --json                          Output token metrics and summary in JSON format
-      -b, --breakdown                 Show detailed token composition breakdown table
-      -f, --refresh                   Bypass cache and re-scan conversation databases
-      -v, --view VIEW                 Visual layout: table (default), matrix, telemetry, classic
-      -m, --matrix                    Shortcut for --view matrix (ultra-dense heatmap for dozens of accounts)
-      -t, --telemetry                 Shortcut for --view telemetry (executive tiered view & analytics)
-      --sort CRITERION                Sort accounts by: default, volume, cache, or name
-
-  agym statusline [--preview [profile] | --sync | --status | --enable | --disable]
-      --preview, -p [PROFILE]         Preview rendered statusline for active or specified profile
-      --sync, -s                      Install and configure statusline across all profiles
-      --status                        Show statusline configuration status across all profiles
-      --enable                        Enable statusline for all profiles
-      --disable                       Disable statusline for all profiles
-
-  agym select [-f, --fresh] [-- [agy args...]]
-      -f, --fresh                     Force fetch fresh usage data, ignoring 5-minute cache (alias: pick)
-
-  agym remove <profile> [-y, --yes]
-      -y, --yes                       Delete without interactive confirmation prompt
-
-  agym <profile> --auto-pr [-b, --base BRANCH] [--title TITLE] [--body BODY] [--draft] [--no-push] [-n]
-      -b, --base BRANCH               Target base branch for PR (default: main)
-      --title TITLE                   Custom PR title (auto-generated from commits if omitted)
-      --body BODY                     Custom PR description (auto-generated from diff if omitted)
-      --draft                         Create pull request as a draft
-      --no-push                       Skip pushing current branch to origin before PR creation
-      -n, --dry-run                   Preview PR creation without pushing or creating a PR
-
-  agym orchestrate "<task>" [--mode {plan,implement}] [-n, --dry-run]
-      --mode {plan,implement}         Operating mode: plan (default) or implement
-      -n, --dry-run                   Preview execution plan without worker execution
-  agym orchestrate status <run-id>    Show status and progress of an orchestration run
-  agym orchestrate resume <run-id>    Resume an interrupted or failed orchestration run
-
-Examples:
-  agym setup personal                 Create profile and authenticate with Google
-  agym setup work -s 14/03/2027       Create profile with known subscription renewal date
-  agym orchestrate "Refactor auth"    Plan orchestration for a task
-  agym orchestrate status run-123     Check status of a run
-  agym select                         Interactively pick an account based on quota health
-  agym select -f                      Force live refresh of quotas before selection
-  agym personal                       Open an interactive Antigravity session
-  agym personal -p "write tests"      Run non-interactive Antigravity command
-  agym personal --auto-pr             Create PR from current branch into main
-  agym work --auto-pr -b develop      Create PR targeting develop branch
-  agym work --auto-pr --draft         Create draft PR from current branch
-  agym rename personal main           Rename profile 'personal' to 'main'
-  agym rename jmcar AI1               Rename profile 'jmcar' to 'AI1'
-  agym list                           Check status and renewal timeline of all profiles
-  agym usage                          View live quota table and subscription health
-  agym tokens                         View token consumption and fleet statistics
-  agym tokens --breakdown             Show detailed token composition breakdown table
-  agym tokens --json                  Export token consumption metrics as JSON
-  agym statusline                     Show statusline status and preview across profiles
-  agym statusline --sync              Ensure statusline is configured for all accounts
-  agym statusline --preview personal  Preview statusline rendering for profile 'personal'
-  agym edit personal -s 01/06/2027    Update subscription date for an existing profile
-  agym remove old-account --yes       Remove profile without prompting
-"""
-
-
-def _print_err(message: str) -> None:
-    print(f"agym: {message}", file=sys.stderr)
-
-
-def _setup(argv: list[str], store: ProfileStore) -> int:
+def build_setup_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agym setup",
+        usage="setup <profile> [-s DATE]",
         description="Create a new isolated Antigravity profile and complete Google sign-in.",
         add_help=True,
     )
@@ -212,6 +64,498 @@ def _setup(argv: list[str], store: ProfileStore) -> int:
         metavar="DATE",
         help="Subscription renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)",
     )
+    return parser
+
+
+def build_config_parser() -> argparse.ArgumentParser:
+    usage = """config <profile>
+  [--model MODEL]
+  [-y | --dsp | --skip-perms | --no-dsp | --no-skip-perms]"""
+    parser = argparse.ArgumentParser(
+        prog="agym config",
+        usage=usage,
+        description="Configure profile model and permission settings.",
+        add_help=True,
+    )
+    parser.add_argument("profile", help="Name of the profile to configure")
+    parser.add_argument("--model", dest="model", default=None, metavar="MODEL", help="Set default model (or 'default' to clear)")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "-y",
+        "--yes",
+        "--dsp",
+        "--skip-perms",
+        "--dangerously-skip-permissions",
+        "--dangerously-skip-permission",
+        dest="dangerously_skip_permissions",
+        action="store_true",
+        default=None,
+        help="Enable auto-skipping tool permissions for this profile",
+    )
+    group.add_argument(
+        "--no-dangerously-skip-permissions",
+        "--no-dangerously-skip-permission",
+        "--no-dsp",
+        "--no-skip-perms",
+        dest="dangerously_skip_permissions",
+        action="store_false",
+        help="Disable auto-skipping tool permissions for this profile",
+    )
+    return parser
+
+
+def build_edit_parser() -> argparse.ArgumentParser:
+    usage = """edit <profile>
+  [--name NEW_NAME]
+  [-s DATE | --clear-subscription-date]"""
+    parser = argparse.ArgumentParser(
+        prog="agym edit",
+        usage=usage,
+        description="Update profile configuration or subscription renewal date.",
+        add_help=True,
+    )
+    parser.add_argument("profile", help="Name of the profile to edit")
+    parser.add_argument(
+        "--name",
+        "--rename",
+        dest="new_name",
+        metavar="NEW_NAME",
+        help="Rename the profile to a new name",
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--subscription-date",
+        "-s",
+        metavar="DATE",
+        help="Subscription renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)",
+    )
+    group.add_argument(
+        "--clear-subscription-date",
+        action="store_true",
+        help="Clear the stored subscription date",
+    )
+    return parser
+
+
+def build_rename_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="agym rename",
+        usage="rename <profile> <new-name>",
+        description="Rename a profile, its isolated data directory, and associated caches.",
+        add_help=True,
+    )
+    parser.add_argument("old_profile", metavar="<profile>", help="Current name of the profile")
+    parser.add_argument("new_name", metavar="<new-name>", help="New name for the profile")
+    return parser
+
+
+def build_list_parser() -> argparse.ArgumentParser:
+    return argparse.ArgumentParser(
+        prog="agym list",
+        usage="list",
+        description="List all configured profiles, state, and subscription renewal status.",
+        add_help=True,
+    )
+
+
+def build_select_parser() -> argparse.ArgumentParser:
+    usage = """select
+  [-f | --fresh]
+  [-- <agy args...>]"""
+    parser = argparse.ArgumentParser(
+        prog="agym select",
+        usage=usage,
+        description="Interactively select an account based on cached 5h quota and launch Antigravity.",
+        add_help=True,
+    )
+    parser.add_argument(
+        "-f",
+        "--fresh",
+        action="store_true",
+        help="Force fetch fresh usage data, ignoring 5-minute cache",
+    )
+    return parser
+
+
+def build_rotate_parser() -> argparse.ArgumentParser:
+    usage = """rotate
+  [--file FILE]
+  [--status]
+  [--reset]
+  [--simulate [N]]
+  [-- <agy args...>]"""
+    parser = argparse.ArgumentParser(
+        prog="agym rotate",
+        usage=usage,
+        description="Rotate through configured profiles or an account file sequentially and launch Antigravity.",
+        add_help=True,
+    )
+    parser.add_argument(
+        "--file",
+        "-f",
+        metavar="FILE",
+        help="Custom account file (txt or json) to rotate through instead of configured profiles",
+    )
+    parser.add_argument("--status", action="store_true", help="Show current rotation status and history")
+    parser.add_argument("--reset", action="store_true", help="Reset rotation state back to the first account")
+    parser.add_argument(
+        "--simulate",
+        nargs="?",
+        const=3,
+        type=int,
+        metavar="N",
+        help="Simulate N rotation steps without launching agy (default: 3)",
+    )
+    return parser
+
+
+def build_usage_parser() -> argparse.ArgumentParser:
+    usage = """usage [profiles...]
+  [--json]
+  [-c | --claude]
+  [-f | --refresh]
+  [-v | --view VIEW]
+  [-g | --grid]
+  [-m | --matrix]
+  [-t | --telemetry]
+  [--sort CRITERION]
+  [--no-summary]
+  [--timeout SECONDS]"""
+    parser = argparse.ArgumentParser(
+        prog="agym usage",
+        usage=usage,
+        description="Show quota limits, remaining capacity, reset times, and subscription health.",
+        add_help=True,
+    )
+    parser.add_argument("profiles", nargs="*", help="Optional specific profiles to query")
+    parser.add_argument("--json", action="store_true", dest="json_mode", help="Output in JSON format")
+    parser.add_argument(
+        "--claude",
+        "-c",
+        action="store_true",
+        dest="show_claude",
+        help="Include Claude & GPT quotas in the usage view",
+    )
+    parser.add_argument(
+        "--refresh",
+        "-f",
+        "--no-cache",
+        action="store_true",
+        dest="refresh",
+        help="Bypass cache and force live query",
+    )
+    parser.add_argument(
+        "--view",
+        "-v",
+        choices=["table", "grid", "matrix", "telemetry"],
+        default="table",
+        metavar="VIEW",
+        help="Visual graph layout style: table (default), grid, matrix, or telemetry",
+    )
+    parser.add_argument(
+        "--grid",
+        "-g",
+        action="store_const",
+        dest="view",
+        const="grid",
+        help="Shortcut for --view grid (multi-column card dashboard)",
+    )
+    parser.add_argument(
+        "--matrix",
+        "-m",
+        action="store_const",
+        dest="view",
+        const="matrix",
+        help="Shortcut for --view matrix (ultra-dense heatmap for dozens of accounts)",
+    )
+    parser.add_argument(
+        "--telemetry",
+        "-t",
+        action="store_const",
+        dest="view",
+        const="telemetry",
+        help="Shortcut for --view telemetry (executive tiered view & recommendations)",
+    )
+    parser.add_argument(
+        "--sort",
+        choices=["usage", "quota", "reset", "name", "sub", "default"],
+        default="usage",
+        metavar="CRITERION",
+        help="Sort order for profiles (default: usage; options: usage, quota, reset, name, sub, default)",
+    )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        dest="include_summary",
+        default=None,
+        help="Show top fleet capacity summary banner",
+    )
+    parser.add_argument(
+        "--no-summary",
+        action="store_false",
+        dest="include_summary",
+        help="Hide top fleet capacity summary banner",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="Per-profile timeout in seconds (default: 30)",
+    )
+    return parser
+
+
+def build_tokens_parser() -> argparse.ArgumentParser:
+    usage = """tokens [profiles...]
+  [--json]
+  [-b | --breakdown]
+  [-f | --refresh]
+  [-v | --view VIEW]
+  [-m | --matrix]
+  [-t | --telemetry]
+  [--sort CRITERION]"""
+    parser = argparse.ArgumentParser(
+        prog="agym tokens",
+        usage=usage,
+        description="Show token usage breakdowns, comparison charts, and fleet statistics.",
+        add_help=True,
+    )
+    parser.add_argument("profiles", nargs="*", help="Optional specific profiles to query")
+    parser.add_argument("--json", action="store_true", dest="json_mode", help="Output in JSON format")
+    parser.add_argument(
+        "--breakdown",
+        "-b",
+        action="store_true",
+        dest="breakdown",
+        help="Show detailed token composition breakdown table per profile",
+    )
+    parser.add_argument(
+        "--refresh",
+        "-f",
+        "--no-cache",
+        action="store_true",
+        dest="refresh",
+        help="Bypass cache and re-scan conversation databases",
+    )
+    parser.add_argument(
+        "--view",
+        "-v",
+        choices=["table", "matrix", "telemetry", "classic"],
+        default="table",
+        metavar="VIEW",
+        help="Visual layout style: table (default), matrix, telemetry, classic",
+    )
+    parser.add_argument(
+        "--matrix",
+        "-m",
+        action="store_const",
+        dest="view",
+        const="matrix",
+        help="Shortcut for --view matrix (ultra-dense heatmap for dozens of accounts)",
+    )
+    parser.add_argument(
+        "--telemetry",
+        "-t",
+        action="store_const",
+        dest="view",
+        const="telemetry",
+        help="Shortcut for --view telemetry (executive tiered view & analytics)",
+    )
+    parser.add_argument(
+        "--sort",
+        choices=["default", "volume", "cache", "name"],
+        default="default",
+        metavar="CRITERION",
+        help="Sort order for profiles (default, volume, cache, name)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="Per-profile timeout in seconds (default: 30)",
+    )
+    return parser
+
+
+def build_statusline_parser() -> argparse.ArgumentParser:
+    usage = """statusline
+  [--preview [PROFILE]]
+  [--sync]
+  [--status]
+  [--enable]
+  [--disable]"""
+    parser = argparse.ArgumentParser(
+        prog="agym statusline",
+        usage=usage,
+        description="Manage and preview the Antigravity statusline across all registered profiles.",
+        add_help=True,
+    )
+    parser.add_argument(
+        "--preview",
+        "-p",
+        nargs="?",
+        const="",
+        metavar="PROFILE",
+        default=None,
+        help="Preview rendered statusline for the active or specified profile",
+    )
+    parser.add_argument(
+        "--sync",
+        "-s",
+        action="store_true",
+        help="Ensure statusline runner is installed and configured across all registered profiles",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Check statusline configuration status across all profiles",
+    )
+    parser.add_argument(
+        "--enable",
+        action="store_true",
+        help="Enable statusline across all profiles",
+    )
+    parser.add_argument(
+        "--disable",
+        action="store_true",
+        help="Disable statusline across all profiles",
+    )
+    return parser
+
+
+def build_remove_parser() -> argparse.ArgumentParser:
+    usage = """remove <profile>
+  [-y | --yes]"""
+    parser = argparse.ArgumentParser(
+        prog="agym remove",
+        usage=usage,
+        description="Delete a profile and its isolated data directory.",
+        add_help=True,
+    )
+    parser.add_argument("profile", metavar="<profile>", help="Name of the profile to remove")
+    parser.add_argument("--yes", "-y", action="store_true", help="Delete without interactive confirmation prompt")
+    return parser
+
+
+def build_doctor_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="agym doctor",
+        usage="doctor [profile]",
+        description="Inspect Antigravity executable, paths, permissions, and profile health.",
+        add_help=True,
+    )
+    parser.add_argument("profile", nargs="?", metavar="[profile]", help="Optional specific profile to diagnose")
+    return parser
+
+
+ORCHESTRATE_USAGE = """agym orchestrate — Multi-agent orchestration for Google Antigravity CLI
+
+Usage:
+  agym orchestrate "<task>" [--mode plan|implement] [--dry-run]
+  agym orchestrate status <run-id>
+  agym orchestrate resume <run-id>
+
+Options:
+  --mode {plan,implement}   Operating mode: plan (default) or implement
+  -n, --dry-run             Preview execution plan without worker execution
+  -h, --help                Show this help message and exit
+
+Commands:
+  status <run-id>           Display status of a run from persisted state
+  resume <run-id>           Resume an interrupted or failed run
+"""
+
+
+def build_orchestrate_parser() -> argparse.ArgumentParser:
+    class _OrchestrateHelpParser(argparse.ArgumentParser):
+        def format_help(self) -> str:
+            return ORCHESTRATE_USAGE.rstrip() + "\n"
+
+        def print_help(self, file: Any = None) -> None:
+            print(ORCHESTRATE_USAGE.rstrip(), file=file)
+
+    return _OrchestrateHelpParser(
+        prog="agym orchestrate",
+        add_help=False,
+    )
+
+
+def format_main_help() -> str:
+    lines = [
+        "Accounts",
+        "  setup       Create a profile",
+        "  list        List profiles",
+        "  edit        Edit profile settings",
+        "  config      Configure profile defaults",
+        "  rename      Rename a profile",
+        "  remove      Delete a profile",
+        "",
+        "Usage & Monitoring",
+        "  usage       Show quota usage",
+        "  tokens      Show token usage",
+        "  statusline  Manage statusline",
+        "",
+        "Launching",
+        "  select      Pick an account",
+        "  rotate      Rotate accounts",
+        "  <profile>   Launch Antigravity",
+        "",
+        "Tools",
+        "  doctor",
+        "  auto-pr",
+        "  update",
+        "  integration",
+        "  orchestrate",
+        "",
+        "Run `agym help <command>` for details.",
+    ]
+    return "\n".join(lines)
+
+
+def format_launch_help() -> str:
+    lines = [
+        "Launching Antigravity:",
+        "  agym <profile>                      Launch Antigravity under the specified profile.",
+        "                                      Replaces the current process on POSIX, preserving native",
+        "                                      terminal, TTY, working directory, and signal handling.",
+        "",
+        "  agym rotate [agy args...]           Rotate to next account/profile and launch Antigravity.",
+        "                                      Ensures non-repeating execution, atomic state updates,",
+        "                                      and cross-platform Chromium lock cleanup on Windows.",
+        "",
+        "  agym <profile> [agy args...]        Pass arguments directly to Antigravity.",
+        "                                      Example: agym personal -p \"explain this codebase\"",
+        "",
+        "  agym <profile> -- [agy args...]     Use '--' separator before arguments if needed to",
+        "                                      prevent agym from parsing flags intended for agy.",
+        "",
+        "  agym <profile> --auto-prompt \"<prompt>\"",
+        "                                      Two-stage prompt workflow: run non-interactively to generate",
+        "                                      a plan, then continue interactively in the same profile session.",
+        "",
+        "  agym <profile> --auto-pr            Automated pull request creation: inspects commits and diff,",
+        "                                      pushes current branch, and opens a PR via GitHub CLI.",
+    ]
+    return "\n".join(lines)
+
+
+def _has_help_flag(argv: list[str]) -> bool:
+    for arg in argv:
+        if arg == "--":
+            return False
+        if arg in {"-h", "--help", "help"}:
+            return True
+    return False
+
+
+def _print_err(message: str) -> None:
+    print(f"agym: {message}", file=sys.stderr)
+
+
+def _setup(argv: list[str], store: ProfileStore) -> int:
+    parser = build_setup_parser()
     ns = parser.parse_args(argv)
     validate_profile_name(ns.profile)
     if store.exists(ns.profile):
@@ -258,31 +602,7 @@ def _setup(argv: list[str], store: ProfileStore) -> int:
 
 
 def _config(argv: list[str], store: ProfileStore) -> int:
-    parser = argparse.ArgumentParser(prog="agym config", add_help=True)
-    parser.add_argument("profile")
-    parser.add_argument("--model", dest="model", default=None)
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "-y",
-        "--yes",
-        "--dsp",
-        "--skip-perms",
-        "--dangerously-skip-permissions",
-        "--dangerously-skip-permission",
-        dest="dangerously_skip_permissions",
-        action="store_true",
-        default=None,
-        help="Enable auto-skipping tool permissions for this profile",
-    )
-    group.add_argument(
-        "--no-dangerously-skip-permissions",
-        "--no-dangerously-skip-permission",
-        "--no-dsp",
-        "--no-skip-perms",
-        dest="dangerously_skip_permissions",
-        action="store_false",
-        help="Disable auto-skipping tool permissions for this profile",
-    )
+    parser = build_config_parser()
     ns = parser.parse_args(argv)
     profile = store.get(ns.profile)
 
@@ -324,13 +644,7 @@ def _config(argv: list[str], store: ProfileStore) -> int:
 
 
 def _rename(argv: list[str], store: ProfileStore) -> int:
-    parser = argparse.ArgumentParser(
-        prog="agym rename",
-        description="Rename a profile, its isolated data directory, and associated caches.",
-        add_help=True,
-    )
-    parser.add_argument("old_profile", help="Current name of the profile")
-    parser.add_argument("new_name", help="New name for the profile")
+    parser = build_rename_parser()
     ns = parser.parse_args(argv)
     validate_profile_name(ns.old_profile)
     validate_profile_name(ns.new_name)
@@ -341,31 +655,7 @@ def _rename(argv: list[str], store: ProfileStore) -> int:
 
 
 def _edit(argv: list[str], store: ProfileStore) -> int:
-    parser = argparse.ArgumentParser(
-        prog="agym edit",
-        description="Update profile configuration or subscription renewal date.",
-        add_help=True,
-    )
-    parser.add_argument("profile", help="Name of the profile to edit")
-    parser.add_argument(
-        "--name",
-        "--rename",
-        dest="new_name",
-        metavar="NEW_NAME",
-        help="Rename the profile to a new name",
-    )
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "--subscription-date",
-        "-s",
-        metavar="DATE",
-        help="Subscription renewal/expiration date (DD/MM/YYYY or YYYY-MM-DD)",
-    )
-    group.add_argument(
-        "--clear-subscription-date",
-        action="store_true",
-        help="Clear the stored subscription date",
-    )
+    parser = build_edit_parser()
     ns = parser.parse_args(argv)
     validate_profile_name(ns.profile)
     profile = store.get(ns.profile)
@@ -414,12 +704,7 @@ def _edit(argv: list[str], store: ProfileStore) -> int:
 
 
 def _list(argv: list[str], store: ProfileStore) -> int:
-    parser = argparse.ArgumentParser(
-        prog="agym list",
-        description="List all configured profiles, state, and subscription renewal status.",
-        add_help=True,
-    )
-    parser.parse_args(argv)
+    build_list_parser().parse_args(argv)
     profiles = store.list()
     if not profiles:
         print("No profiles.")
@@ -444,13 +729,7 @@ def _list(argv: list[str], store: ProfileStore) -> int:
 
 
 def _remove(argv: list[str], store: ProfileStore) -> int:
-    parser = argparse.ArgumentParser(
-        prog="agym remove",
-        description="Delete a profile and its isolated data directory.",
-        add_help=True,
-    )
-    parser.add_argument("profile", help="Name of the profile to remove")
-    parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
+    parser = build_remove_parser()
     ns = parser.parse_args(argv)
     profile = store.get(ns.profile)
     target = store.profile_dir(profile.name).resolve()
@@ -466,12 +745,7 @@ def _remove(argv: list[str], store: ProfileStore) -> int:
 
 
 def _doctor(argv: list[str], store: ProfileStore) -> int:
-    parser = argparse.ArgumentParser(
-        prog="agym doctor",
-        description="Inspect Antigravity executable, paths, permissions, and profile health.",
-        add_help=True,
-    )
-    parser.add_argument("profile", nargs="?", help="Optional specific profile to diagnose")
+    parser = build_doctor_parser()
     ns = parser.parse_args(argv)
     for line in doctor_lines(store, ns.profile):
         print(line)
@@ -479,85 +753,7 @@ def _doctor(argv: list[str], store: ProfileStore) -> int:
 
 
 def _usage(argv: list[str], store: ProfileStore) -> int:
-    parser = argparse.ArgumentParser(
-        prog="agym usage",
-        description="Show quota limits, remaining capacity, reset times, and subscription health.",
-        add_help=True,
-    )
-    parser.add_argument("--json", action="store_true", dest="json_mode", help="Output in JSON format")
-    parser.add_argument(
-        "--refresh",
-        "-f",
-        "--no-cache",
-        action="store_true",
-        dest="refresh",
-        help="Bypass cache and force live query",
-    )
-    parser.add_argument(
-        "--view",
-        "-v",
-        choices=["table", "grid", "matrix", "telemetry"],
-        default="table",
-        help="Visual graph layout style: table (default), grid, matrix, or telemetry",
-    )
-    parser.add_argument(
-        "--grid",
-        "-g",
-        action="store_const",
-        dest="view",
-        const="grid",
-        help="Shortcut for --view grid (multi-column card dashboard)",
-    )
-    parser.add_argument(
-        "--matrix",
-        "-m",
-        action="store_const",
-        dest="view",
-        const="matrix",
-        help="Shortcut for --view matrix (ultra-dense heatmap for dozens of accounts)",
-    )
-    parser.add_argument(
-        "--telemetry",
-        "-t",
-        action="store_const",
-        dest="view",
-        const="telemetry",
-        help="Shortcut for --view telemetry (executive tiered view & recommendations)",
-    )
-    parser.add_argument(
-        "--sort",
-        choices=["usage", "quota", "reset", "name", "sub", "default"],
-        default="usage",
-        help="Sort order for profiles (default: usage; options: usage, quota, reset, name, sub, default)",
-    )
-    parser.add_argument(
-        "--claude",
-        "-c",
-        action="store_true",
-        dest="show_claude",
-        help="Include Claude & GPT quotas in the usage view",
-    )
-    parser.add_argument(
-        "--summary",
-        action="store_true",
-        dest="include_summary",
-        default=None,
-        help="Show top fleet capacity summary banner",
-    )
-    parser.add_argument(
-        "--no-summary",
-        action="store_false",
-        dest="include_summary",
-        help="Hide top fleet capacity summary banner",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=30.0,
-        metavar="SECONDS",
-        help="Per-profile timeout in seconds (default: 30)",
-    )
-    parser.add_argument("profiles", nargs="*", help="Optional specific profiles to query")
+    parser = build_usage_parser()
     ns = parser.parse_args(argv)
 
     if ns.profiles:
@@ -599,64 +795,7 @@ def _usage(argv: list[str], store: ProfileStore) -> int:
 
 
 def _tokens(argv: list[str], store: ProfileStore) -> int:
-    parser = argparse.ArgumentParser(
-        prog="agym tokens",
-        description="Show token usage breakdowns, comparison charts, and fleet statistics.",
-        add_help=True,
-    )
-    parser.add_argument("--json", action="store_true", dest="json_mode", help="Output in JSON format")
-    parser.add_argument(
-        "--breakdown",
-        "-b",
-        action="store_true",
-        dest="breakdown",
-        help="Show detailed token composition breakdown table per profile",
-    )
-    parser.add_argument(
-        "--refresh",
-        "-f",
-        "--no-cache",
-        action="store_true",
-        dest="refresh",
-        help="Bypass cache and re-scan conversation databases",
-    )
-    parser.add_argument(
-        "--view",
-        "-v",
-        choices=["table", "matrix", "telemetry", "classic"],
-        default="table",
-        help="Visual layout style: table (default), matrix, telemetry, classic",
-    )
-    parser.add_argument(
-        "--matrix",
-        "-m",
-        action="store_const",
-        dest="view",
-        const="matrix",
-        help="Shortcut for --view matrix (ultra-dense heatmap for dozens of accounts)",
-    )
-    parser.add_argument(
-        "--telemetry",
-        "-t",
-        action="store_const",
-        dest="view",
-        const="telemetry",
-        help="Shortcut for --view telemetry (executive tiered view & analytics)",
-    )
-    parser.add_argument(
-        "--sort",
-        choices=["default", "volume", "cache", "name"],
-        default="default",
-        help="Sort order for profiles (default, volume, cache, name)",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=30.0,
-        metavar="SECONDS",
-        help="Per-profile timeout in seconds (default: 30)",
-    )
-    parser.add_argument("profiles", nargs="*", help="Optional specific profiles to query")
+    parser = build_tokens_parser()
     ns = parser.parse_args(argv)
 
     if ns.profiles:
@@ -699,27 +838,7 @@ def _tokens(argv: list[str], store: ProfileStore) -> int:
 
 
 def _rotate(argv: list[str], store: ProfileStore) -> int:
-    parser = argparse.ArgumentParser(
-        prog="agym rotate",
-        description="Rotate through configured profiles or an account file sequentially and launch Antigravity.",
-        add_help=True,
-    )
-    parser.add_argument("--status", action="store_true", help="Show current rotation status and history")
-    parser.add_argument("--reset", action="store_true", help="Reset rotation state back to the first account")
-    parser.add_argument(
-        "--simulate",
-        nargs="?",
-        const=3,
-        type=int,
-        metavar="COUNT",
-        help="Simulate COUNT rotation steps without launching agy (default: 3)",
-    )
-    parser.add_argument(
-        "--file",
-        "-f",
-        metavar="FILE",
-        help="Custom account file (txt or json) to rotate through instead of configured profiles",
-    )
+    parser = build_rotate_parser()
     ns, passthrough = parser.parse_known_args(argv)
     if passthrough and passthrough[0] == "--":
         passthrough = passthrough[1:]
@@ -776,41 +895,7 @@ def _rotate(argv: list[str], store: ProfileStore) -> int:
 
 
 def _statusline(argv: list[str], store: ProfileStore) -> int:
-    parser = argparse.ArgumentParser(
-        prog="agym statusline",
-        description="Manage and preview the Antigravity statusline across all registered profiles.",
-        add_help=True,
-    )
-    parser.add_argument(
-        "--preview",
-        "-p",
-        nargs="?",
-        const="",
-        metavar="PROFILE",
-        default=None,
-        help="Preview rendered statusline for the active or specified profile",
-    )
-    parser.add_argument(
-        "--sync",
-        "-s",
-        action="store_true",
-        help="Ensure statusline runner is installed and configured across all registered profiles",
-    )
-    parser.add_argument(
-        "--status",
-        action="store_true",
-        help="Check statusline configuration status across all profiles",
-    )
-    parser.add_argument(
-        "--enable",
-        action="store_true",
-        help="Enable statusline across all profiles",
-    )
-    parser.add_argument(
-        "--disable",
-        action="store_true",
-        help="Disable statusline across all profiles",
-    )
+    parser = build_statusline_parser()
     ns = parser.parse_args(argv)
 
     if ns.enable:
@@ -869,17 +954,7 @@ def _select(
     stdout: Any = None,
     stdin: Any = None,
 ) -> int:
-    parser = argparse.ArgumentParser(
-        prog="agym select",
-        description="Interactively select an account based on cached 5h quota and launch Antigravity.",
-        add_help=True,
-    )
-    parser.add_argument(
-        "-f",
-        "--fresh",
-        action="store_true",
-        help="Force fetch fresh usage data, ignoring 5-minute cache",
-    )
+    parser = build_select_parser()
     ns, passthrough = parser.parse_known_args(argv)
     if passthrough and passthrough[0] == "--":
         passthrough = passthrough[1:]
@@ -961,8 +1036,9 @@ def _is_auto_pr(args: list[str]) -> bool:
 
 
 def _auto_pr(argv: list[str], store: ProfileStore) -> int:
+    parser = build_auto_pr_parser()
     if any(arg in {"-h", "--help"} for arg in argv):
-        parse_auto_pr_args(["--help"])
+        parser.print_help()
         return 0
 
     profile_name = None
@@ -984,7 +1060,7 @@ def _auto_pr(argv: list[str], store: ProfileStore) -> int:
     profile = store.get(profile_name)
     if not any(arg == "--auto-pr" or arg.startswith("--auto-pr=") for arg in remaining_argv):
         remaining_argv = ["--auto-pr"] + remaining_argv
-    ns = parse_auto_pr_args(remaining_argv)
+    ns = parser.parse_args(remaining_argv)
     return handle_auto_pr(
         profile=profile,
         base_branch=ns.base,
@@ -1029,24 +1105,6 @@ def _launch(profile_name: str, argv: list[str], store: ProfileStore) -> int:
         return run_auto_prompt(agy, profile, auto_prompt, **kwargs)
 
     return run_agy(agy, profile, argv, replace_process=True)
-
-
-ORCHESTRATE_USAGE = """agym orchestrate — Multi-agent orchestration for Google Antigravity CLI
-
-Usage:
-  agym orchestrate "<task>" [--mode plan|implement] [--dry-run]
-  agym orchestrate status <run-id>
-  agym orchestrate resume <run-id>
-
-Options:
-  --mode {plan,implement}   Operating mode: plan (default) or implement
-  -n, --dry-run             Preview execution plan without worker execution
-  -h, --help                Show this help message and exit
-
-Commands:
-  status <run-id>           Display status of a run from persisted state
-  resume <run-id>           Resume an interrupted or failed run
-"""
 
 
 def _format_run_status(state: RunState, results: Sequence[Any] | None = None) -> str:
@@ -1232,6 +1290,137 @@ def _orchestrate(
         return 1
 
 
+@dataclass
+class CommandSpec:
+    name: str
+    aliases: tuple[str, ...] = ()
+    group: str = ""
+    description: str = ""
+    parser_builder: Callable[[], argparse.ArgumentParser] | None = None
+    handler: Callable[..., int] | None = None
+
+
+COMMAND_REGISTRY: list[CommandSpec] = [
+    # Accounts
+    CommandSpec(name="setup", group="Accounts", description="Create a profile", parser_builder=build_setup_parser, handler=_setup),
+    CommandSpec(name="list", group="Accounts", description="List profiles", parser_builder=build_list_parser, handler=_list),
+    CommandSpec(name="edit", group="Accounts", description="Edit profile settings", parser_builder=build_edit_parser, handler=_edit),
+    CommandSpec(name="config", group="Accounts", description="Configure profile defaults", parser_builder=build_config_parser, handler=_config),
+    CommandSpec(name="rename", aliases=("mv",), group="Accounts", description="Rename a profile", parser_builder=build_rename_parser, handler=_rename),
+    CommandSpec(name="remove", group="Accounts", description="Delete a profile", parser_builder=build_remove_parser, handler=_remove),
+    # Usage & Monitoring
+    CommandSpec(name="usage", group="Usage & Monitoring", description="Show quota usage", parser_builder=build_usage_parser, handler=_usage),
+    CommandSpec(name="tokens", aliases=("token", "token-usage"), group="Usage & Monitoring", description="Show token usage", parser_builder=build_tokens_parser, handler=_tokens),
+    CommandSpec(name="statusline", group="Usage & Monitoring", description="Manage statusline", parser_builder=build_statusline_parser, handler=_statusline),
+    # Launching
+    CommandSpec(name="select", aliases=("pick",), group="Launching", description="Pick an account", parser_builder=build_select_parser, handler=_select),
+    CommandSpec(name="rotate", group="Launching", description="Rotate accounts", parser_builder=build_rotate_parser, handler=_rotate),
+    # Tools
+    CommandSpec(name="doctor", group="Tools", description="", parser_builder=build_doctor_parser, handler=_doctor),
+    CommandSpec(name="auto-pr", aliases=("--auto-pr",), group="Tools", description="", parser_builder=build_auto_pr_parser, handler=_auto_pr),
+    CommandSpec(name="update", group="Tools", description="", parser_builder=build_update_parser, handler=lambda argv, store: run_update_cli(argv)),
+    CommandSpec(
+        name="integration",
+        group="Tools",
+        description="",
+        parser_builder=lambda: __import__("agym.integration.cli", fromlist=["build_integration_parser"]).build_integration_parser(),
+        handler=lambda argv, store: __import__("agym.integration.cli", fromlist=["main"]).main(argv),
+    ),
+    CommandSpec(
+        name="orchestrate",
+        group="Tools",
+        description="",
+        parser_builder=build_orchestrate_parser,
+        handler=_orchestrate,
+    ),
+]
+
+COMMANDS_BY_NAME: dict[str, CommandSpec] = {}
+ALIAS_MAP: dict[str, str] = {}
+for cmd in COMMAND_REGISTRY:
+    COMMANDS_BY_NAME[cmd.name] = cmd
+    for alias in cmd.aliases:
+        ALIAS_MAP[alias] = cmd.name
+
+
+def resolve_command(name: str) -> CommandSpec | None:
+    canonical = ALIAS_MAP.get(name, name)
+    return COMMANDS_BY_NAME.get(canonical)
+
+
+def _handle_help_command(rest: list[str]) -> int:
+    clean_rest = [arg for arg in rest if arg not in {"-h", "--help"}]
+    if not clean_rest:
+        print(format_main_help())
+        return 0
+
+    topic = clean_rest[0]
+    if topic in {"launch", "<profile>"}:
+        print(format_launch_help())
+        return 0
+
+    if topic == "integration":
+        from .integration import cli as integration_cli
+        sub_path = clean_rest[1:]
+        help_text = integration_cli.format_integration_help(sub_path)
+        if help_text is not None:
+            print(help_text)
+            return 0
+        else:
+            cmd_name = " ".join(sub_path)
+            _print_err(f"unknown integration command '{cmd_name}'. Run 'agym help integration' for available commands.")
+            return 2
+
+    cmd_spec = resolve_command(topic)
+    if cmd_spec is not None:
+        if cmd_spec.name == "integration":
+            from .integration import cli as integration_cli
+            sub_path = clean_rest[1:]
+            help_text = integration_cli.format_integration_help(sub_path)
+            if help_text is not None:
+                print(help_text)
+                return 0
+            else:
+                cmd_name = " ".join(sub_path)
+                _print_err(f"unknown integration command '{cmd_name}'. Run 'agym help integration' for available commands.")
+                return 2
+
+        if cmd_spec.name == "orchestrate":
+            print(ORCHESTRATE_USAGE.rstrip())
+            return 0
+
+        if cmd_spec.parser_builder is not None:
+            cmd_spec.parser_builder().print_help()
+            return 0
+
+    _print_err(f"unknown command '{topic}'. Run 'agym help' for available commands.")
+    return 2
+
+
+def _handle_command_help(cmd_spec: CommandSpec, rest: list[str]) -> int:
+    if cmd_spec.name == "integration":
+        from .integration import cli as integration_cli
+        sub_path = [a for a in rest if a not in {"-h", "--help", "help"}]
+        help_text = integration_cli.format_integration_help(sub_path)
+        if help_text is not None:
+            print(help_text)
+            return 0
+        else:
+            cmd_name = " ".join(sub_path)
+            _print_err(f"unknown integration command '{cmd_name}'. Run 'agym help integration' for available commands.")
+            return 2
+
+    if cmd_spec.name == "orchestrate":
+        print(ORCHESTRATE_USAGE.rstrip())
+        return 0
+
+    if cmd_spec.parser_builder is not None:
+        cmd_spec.parser_builder().print_help()
+        return 0
+
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     if sys.platform == "win32":
         for stream in (sys.stdout, sys.stderr):
@@ -1252,9 +1441,29 @@ def main(argv: list[str] | None = None) -> int:
     if args == ["--statusline-render"]:
         from .statusline import main as render_statusline_main
         return render_statusline_main()
-    if not args or args[0] in {"-h", "--help", "help"}:
-        print(USAGE.rstrip())
-        return 0 if args else 2
+
+    # 1. Main compact help
+    if not args:
+        print(format_main_help())
+        return 2
+
+    if args[0] in {"-h", "--help"} or args == ["help"]:
+        print(format_main_help())
+        return 0
+
+    # 2. 'agym help ...'
+    if args[0] == "help":
+        return _handle_help_command(args[1:])
+
+    # 3. Help for launch
+    if args[0] == "launch" and _has_help_flag(args[1:]):
+        print(format_launch_help())
+        return 0
+
+    # 4. '<command> --help'
+    cmd_spec = resolve_command(args[0])
+    if cmd_spec is not None and _has_help_flag(args[1:]):
+        return _handle_command_help(cmd_spec, args[1:])
 
     store = ProfileStore()
     command, rest = args[0], args[1:]
@@ -1263,36 +1472,8 @@ def main(argv: list[str] | None = None) -> int:
     maybe_prompt_startup_update(args)
 
     try:
-        if command == "update":
-            return run_update_cli(rest)
-        if command == "setup":
-            return _setup(rest, store)
-        if command == "config":
-            return _config(rest, store)
-        if command == "edit":
-            return _edit(rest, store)
-        if command in {"rename", "mv"}:
-            return _rename(rest, store)
-        if command == "list":
-            return _list(rest, store)
-        if command in {"select", "pick"}:
-            return _select(rest, store)
-        if command == "rotate":
-            return _rotate(rest, store)
-        if command == "usage":
-            return _usage(rest, store)
-        if command in {"token", "tokens", "token-usage"}:
-            return _tokens(rest, store)
-        if command == "statusline":
-            return _statusline(rest, store)
-        if command == "remove":
-            return _remove(rest, store)
-        if command == "doctor":
-            return _doctor(rest, store)
-        if command in {"auto-pr", "--auto-pr"}:
-            return _auto_pr(rest, store)
-        if command == "orchestrate":
-            return _orchestrate(rest, store)
+        if cmd_spec is not None and cmd_spec.handler is not None:
+            return cmd_spec.handler(rest, store)
         return _launch(command, rest, store)
     except (InvalidProfileName, ProfileExists, ProfileNotFound, ProfileError, AgyNotFound, SubscriptionError, AutoPrError) as exc:
         _print_err(str(exc))

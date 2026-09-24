@@ -18,6 +18,95 @@ from .usage import list_usage
 CAPABILITIES = ["profiles.read", "usage.read", "runs.headless", "runs.durable",
                 "runs.stop", "runs.events", "runs.events.follow", "profiles.auto", "leases.read"]
 
+INTEGRATION_TREE = """integration
+├── info
+├── profiles
+├── usage
+├── run
+│   ├── start
+│   ├── get
+│   ├── list
+│   ├── stop
+│   └── events
+└── lease
+    └── get"""
+
+INTEGRATION_RUN_TREE = """run
+├── start
+├── get
+├── list
+├── stop
+└── events"""
+
+INTEGRATION_LEASE_TREE = """lease
+└── get"""
+
+INTEGRATION_ARG_REFS = {
+    "info": """integration info
+  [--protocol N]
+  [--json]""",
+    "profiles": """integration profiles
+  [--protocol N]
+  [--json]""",
+    "usage": """integration usage
+  [--profile PROFILE]
+  [--refresh]
+  [--protocol N]
+  [--json]""",
+    "run start": """integration run start
+  --request-json -
+  [--protocol N]
+  [--json]""",
+    "run get": """integration run get
+  --id RUN_ID
+  [--protocol N]
+  [--json]""",
+    "run list": """integration run list
+  [--client CLIENT]
+  [--client-id ID]
+  [--request-id ID]
+  [--workspace-key KEY]
+  [--protocol N]
+  [--json]""",
+    "run stop": """integration run stop
+  --id RUN_ID
+  [--protocol N]
+  [--json]""",
+    "run events": """integration run events
+  --id RUN_ID
+  [--after N]
+  [--limit N]
+  [--follow]
+  [--protocol N]
+  [--json | --ndjson]""",
+    "lease get": """integration lease get
+  --id LEASE_ID
+  [--protocol N]
+  [--json]""",
+}
+
+
+def format_integration_help(subcommand_path: list[str] | None = None) -> str | None:
+    path = [p for p in (subcommand_path or []) if p not in {"-h", "--help", "help"}]
+    if not path:
+        return INTEGRATION_TREE + "\n\n" + "\n\n".join(INTEGRATION_ARG_REFS.values())
+    if path == ["run"]:
+        run_refs = [
+            INTEGRATION_ARG_REFS["run start"],
+            INTEGRATION_ARG_REFS["run get"],
+            INTEGRATION_ARG_REFS["run list"],
+            INTEGRATION_ARG_REFS["run stop"],
+            INTEGRATION_ARG_REFS["run events"],
+        ]
+        return INTEGRATION_RUN_TREE + "\n\n" + "\n\n".join(run_refs)
+    if path == ["lease"]:
+        return INTEGRATION_LEASE_TREE + "\n\n" + INTEGRATION_ARG_REFS["lease get"]
+
+    key = " ".join(path)
+    if key in INTEGRATION_ARG_REFS:
+        return INTEGRATION_ARG_REFS[key]
+    return None
+
 
 class Parser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
@@ -78,9 +167,26 @@ def _follow(store: Store, run_id: str, after: int, limit: int) -> None:
         time.sleep(0.15)
 
 
+def build_integration_parser() -> Parser:
+    return _parser()
+
+
 def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    is_help = any(arg in {"-h", "--help"} for arg in args) or (bool(args) and args[0] == "help")
+    if is_help:
+        sub_path = [a for a in args if a not in {"-h", "--help", "help"}]
+        help_text = format_integration_help(sub_path)
+        if help_text is not None:
+            print(help_text)
+            return 0
+        else:
+            cmd_name = " ".join(sub_path)
+            print(f"agym: unknown integration command '{cmd_name}'. Run 'agym help integration' for available commands.", file=sys.stderr)
+            return 2
+
     try:
-        ns = _parser().parse_args(argv)
+        ns = _parser().parse_args(args)
         validate_protocol(ns.protocol)
         store = Store()
         if ns.command == "info":

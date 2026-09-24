@@ -78,9 +78,11 @@ def _format_relative_duration(dt: datetime | None, now: datetime | None = None) 
 
 
 def _get_color_for_fraction(fraction: float, status: str = "success") -> str:
-    """Returns ANSI color code based on quota availability (>50% green, 15-50% yellow, <15% red)."""
-    if status != "success":
+    """Returns ANSI color code based on quota availability (>50% green, 15-50% yellow, <15% red, dim for unknown)."""
+    if status == "error":
         return "\033[31m"  # Red for errors
+    if status == "unknown" or fraction < 0.0:
+        return "\033[90m"  # Dim grey for unknown
     pct = fraction * 100.0
     if pct > 50.0:
         return "\033[32m"  # Green
@@ -170,31 +172,33 @@ def prepare_accounts_for_picker(
         else:
             continue
 
-        if status == "success":
-            if bucket is not None:
-                fraction = max(0.0, min(1.0, float(bucket.remaining_fraction)))
-                pct = round(fraction * 100)
-                raw_quota_sort_key = fraction
-                reset_dt = bucket.reset_time
-                if fraction >= 1.0 or reset_dt is None:
-                    reset_time_str = "Ready"
-                    raw_reset_timestamp = None
-                else:
-                    raw_reset_timestamp = reset_dt.timestamp()
-                    reset_time_str = _format_relative_duration(reset_dt, now=now)
-            else:
-                fraction = 1.0
-                pct = 100
-                raw_quota_sort_key = 1.0
-                raw_reset_timestamp = None
+        if status == "success" and bucket is not None:
+            fraction = max(0.0, min(1.0, float(bucket.remaining_fraction)))
+            pct = round(fraction * 100)
+            raw_quota_sort_key = fraction
+            reset_dt = bucket.reset_time
+            if fraction >= 1.0 or reset_dt is None:
                 reset_time_str = "Ready"
+                raw_reset_timestamp = None
+            else:
+                raw_reset_timestamp = reset_dt.timestamp()
+                reset_time_str = _format_relative_duration(reset_dt, now=now)
 
             limit_5h_text = f"{pct:3d}%"
             limit_5h_colored = f"{format_colored_bar(fraction, width=5, use_color=True)} {limit_5h_text}"
             limit_5h_plain = f"{format_colored_bar(fraction, width=5, use_color=False)} {limit_5h_text}"
-        else:
+        elif status == "unknown" or (status == "success" and bucket is None):
+            status = "unknown"
             fraction = -1.0
             raw_quota_sort_key = -1.0
+            raw_reset_timestamp = float("inf")
+            reset_time_str = "-"
+            limit_5h_text = "Unknown"
+            limit_5h_colored = f"\033[90m{'Unknown':<12}\033[0m"
+            limit_5h_plain = f"{'Unknown':<12}"
+        else:
+            fraction = -2.0
+            raw_quota_sort_key = -2.0
             raw_reset_timestamp = float("inf")
             reset_time_str = "-"
             limit_5h_text = "Error"

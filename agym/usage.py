@@ -571,8 +571,8 @@ def sort_profiles(
                 return (-1.0, -1.0)
             b_5h = extract_quota_bucket(u, "gemini", "5h")
             b_wk = extract_quota_bucket(u, "gemini", "week")
-            score_5h = b_5h.remaining_fraction if b_5h else 1.0
-            score_wk = b_wk.remaining_fraction if b_wk else 1.0
+            score_5h = b_5h.remaining_fraction if b_5h else -1.0
+            score_wk = b_wk.remaining_fraction if b_wk else -1.0
             return (score_5h, score_wk)
         return sorted(profiles, key=get_score, reverse=True)
     if sort_by == "name":
@@ -771,7 +771,20 @@ async def fetch_account_usage_async(
                 cached_at=cached_at,
             )
             if cached_usage.status == "success":
-                return cached_usage
+                b_5h = extract_quota_bucket(cached_usage, "gemini", "5h")
+                now = datetime.now(timezone.utc)
+                is_stale = False
+                if b_5h is None:
+                    is_stale = True
+                elif b_5h.reset_time is not None:
+                    reset_dt = b_5h.reset_time
+                    if reset_dt.tzinfo is None:
+                        reset_dt = reset_dt.replace(tzinfo=timezone.utc)
+                    if reset_dt <= now:
+                        is_stale = True
+
+                if not is_stale:
+                    return cached_usage
 
     if not profile.home.exists():
         return AccountUsage(
@@ -794,9 +807,11 @@ async def fetch_account_usage_async(
                 if direct_res is not None:
                     usage, raw_out = direct_res
                     if usage.status == "success":
-                        if cache_manager is not None:
-                            cache_manager.set_usage(profile.name, account_usage_to_dict(usage), raw_out)
-                        return usage
+                        b_5h = extract_quota_bucket(usage, "gemini", "5h")
+                        if b_5h is not None:
+                            if cache_manager is not None:
+                                cache_manager.set_usage(profile.name, account_usage_to_dict(usage), raw_out)
+                            return usage
             except asyncio.TimeoutError:
                 logger.debug("Direct quota API timed out for profile '%s'; using agy /usage", profile.name)
             except Exception as exc:
@@ -861,8 +876,22 @@ async def fetch_account_usage_async(
             cached=False,
             age_seconds=0.0,
         )
-        if usage.status == "success" and cache_manager is not None:
-            cache_manager.set_usage(profile.name, account_usage_to_dict(usage), out)
+        if usage.status == "success":
+            b_5h = extract_quota_bucket(usage, "gemini", "5h")
+            if b_5h is not None:
+                if cache_manager is not None:
+                    cache_manager.set_usage(profile.name, account_usage_to_dict(usage), out)
+                return usage
+            else:
+                return AccountUsage(
+                    account=profile.name,
+                    status="unknown",
+                    groups=usage.groups,
+                    error="missing 5h quota bucket",
+                    subscription_date=profile.subscription_date,
+                    cached=False,
+                    age_seconds=0.0,
+                )
         return usage
 
 
