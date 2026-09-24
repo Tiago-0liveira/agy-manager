@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 os.environ["AGYM_DISABLE_WINCRED"] = "1"
+os.environ["AGYM_NO_UPDATE_CHECK"] = "1"
 import tempfile
 import unittest
 from pathlib import Path
@@ -174,8 +175,9 @@ class CliTests(unittest.TestCase):
             )
             mock_run_agy.assert_not_called()
 
+    @mock.patch("agym.cli.resolve_agy", return_value=Path("/usr/bin/agy"))
     @mock.patch("agym.cli.ProfileStore")
-    def test_auto_prompt_errors(self, Store: mock.Mock) -> None:
+    def test_auto_prompt_errors(self, Store: mock.Mock, _resolve: mock.Mock) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = ProfileStore(Path(tmp) / "config", Path(tmp) / "data")
             store.create("personal")
@@ -323,17 +325,21 @@ class CliTests(unittest.TestCase):
                 code = cli.main([arg])
                 self.assertEqual(code, 0)
                 out = mock_out.getvalue()
-                self.assertIn("agym — Explicit isolated-profile manager", out)
-                self.assertIn("Commands:", out)
-                self.assertIn("Launching Antigravity:", out)
-                self.assertIn("Command Options:", out)
-                self.assertIn("Examples:", out)
+                self.assertIn("Accounts", out)
+                self.assertIn("Usage & Monitoring", out)
+                self.assertIn("Launching", out)
+                self.assertIn("Tools", out)
+                self.assertIn("Run `agym help <command>` for details.", out)
 
         with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
             code = cli.main([])
             self.assertEqual(code, 2)
             out = mock_out.getvalue()
-            self.assertIn("agym — Explicit isolated-profile manager", out)
+            self.assertIn("Accounts", out)
+            self.assertIn("Usage & Monitoring", out)
+            self.assertIn("Launching", out)
+            self.assertIn("Tools", out)
+            self.assertIn("Run `agym help <command>` for details.", out)
 
     @mock.patch("agym.cli.ProfileStore")
     def test_rotate_simulate(self, Store: mock.Mock) -> None:

@@ -92,6 +92,17 @@ class CacheManagerTests(unittest.TestCase):
         # Lookup nonexistent profile: miss
         self.assertIsNone(self.cm.get_usage("nonexistent", now=t0))
 
+    def test_old_direct_api_usage_cache_is_invalidated(self) -> None:
+        now = datetime(2026, 9, 21, 2, 0, 0, tzinfo=timezone.utc)
+        self.cm.set_usage("personal", {"status": "success"}, "{}", now=now)
+        path = self.cm.usage_dir / "personal.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["version"] = 1
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        self.assertIsNone(self.cm.get_usage("personal", now=now))
+        self.assertEqual(self.cm.get_cached_usage_with_meta("personal"), (None, None))
+
     def test_tokens_cache_hit_and_expiry(self) -> None:
         t0 = datetime(2026, 9, 21, 2, 0, 0, tzinfo=timezone.utc)
         snapshot = {

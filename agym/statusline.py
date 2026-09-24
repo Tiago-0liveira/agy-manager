@@ -306,6 +306,7 @@ def resolve_context_window(payload: dict[str, Any] | None = None) -> ContextWind
 class VCSInfo:
     branch: str | None = None
     worktree: str | None = None
+    directory: str | None = None
 
 
 def parse_git_head(head_content: str | None) -> str | None:
@@ -343,6 +344,7 @@ def resolve_git_vcs(
 
     branch: str | None = None
     worktree: str | None = None
+    directory: str | None = None
 
     # Check if payload explicitly provides VCS metadata without an explicit cwd
     has_explicit_cwd = (
@@ -355,12 +357,9 @@ def resolve_git_vcs(
     payload_git = payload.get("git") if isinstance(payload.get("git"), dict) else {}
     payload_branch = payload_vcs.get("branch") or payload_git.get("branch") or payload.get("branch")
     payload_worktree = payload_vcs.get("worktree") or payload_git.get("worktree") or payload.get("worktree")
-
-    if not has_explicit_cwd and payload_branch:
-        return VCSInfo(
-            branch=str(payload_branch).strip(),
-            worktree=str(payload_worktree).strip() if payload_worktree else None,
-        )
+    payload_dir = payload_vcs.get("directory") or payload_git.get("directory") or payload.get("directory")
+    if payload_dir:
+        directory = str(payload_dir).strip()
 
     # Determine directory to inspect
     target_dir: Path | None = None
@@ -394,6 +393,16 @@ def resolve_git_vcs(
             target_dir = Path.cwd().resolve()
         except Exception:
             target_dir = None
+
+    if directory is None and target_dir is not None and target_dir.name:
+        directory = target_dir.name
+
+    if not has_explicit_cwd and payload_branch:
+        return VCSInfo(
+            branch=str(payload_branch).strip(),
+            worktree=str(payload_worktree).strip() if payload_worktree else None,
+            directory=directory,
+        )
 
     # Inspect disk
     if target_dir is not None:
@@ -438,13 +447,15 @@ def resolve_git_vcs(
     if worktree is None and payload_worktree:
         worktree = str(payload_worktree).strip()
 
-    return VCSInfo(branch=branch, worktree=worktree)
+    return VCSInfo(branch=branch, worktree=worktree, directory=directory)
 
 
 def format_vcs_tag(
     vcs: VCSInfo | None,
     include_worktree: bool = True,
+    include_directory: bool = True,
     max_branch_len: int | None = None,
+    max_dir_len: int | None = None,
     no_color: bool = False,
 ) -> str | None:
     if not vcs or not vcs.branch:
@@ -455,13 +466,27 @@ def format_vcs_tag(
         branch = branch[: max_branch_len - 1] + "…"
 
     blue = BLUE if not no_color else ""
-    dark_gray = DARK_GRAY if not no_color else ""
+    gray = GRAY if not no_color else ""
     reset = RESET if not no_color else ""
 
-    if include_worktree and vcs.worktree:
+    # Inside worktree: show compact worktree icon before the branch
+    if vcs.worktree:
+        if include_worktree:
+            if no_color:
+                return f"🌳 🌿 {branch}"
+            return f"{blue}🌳 🌿 {branch}{reset}"
         if no_color:
-            return f"🌿 {branch} [{vcs.worktree}]"
-        return f"{blue}🌿 {branch} {dark_gray}[{vcs.worktree}]{reset}"
+            return f"🌿 {branch}"
+        return f"{blue}🌿 {branch}{reset}"
+
+    # Normal repository: show current directory (last directory of path) before branch name
+    if include_directory and vcs.directory:
+        dir_name = vcs.directory
+        if max_dir_len and len(dir_name) > max_dir_len:
+            dir_name = dir_name[: max_dir_len - 1] + "…"
+        if no_color:
+            return f"{dir_name} 🌿 {branch}"
+        return f"{gray}{dir_name} {blue}🌿 {branch}{reset}"
 
     if no_color:
         return f"🌿 {branch}"
@@ -505,12 +530,16 @@ def render_statusline(
     account_tag = f"{bold}{cyan}👤 {account}{reset}"
 
     # VCS tag
-    include_worktree = terminal_width >= 75
-    max_branch = None if terminal_width >= 75 else 18
+    include_worktree = terminal_width >= 55
+    include_directory = terminal_width >= 65
+    max_branch = None if terminal_width >= 85 else 16
+    max_dir = None if terminal_width >= 85 else 14
     vcs_tag = format_vcs_tag(
         vcs,
         include_worktree=include_worktree,
+        include_directory=include_directory,
         max_branch_len=max_branch,
+        max_dir_len=max_dir,
         no_color=no_color,
     )
 
@@ -601,10 +630,51 @@ def render_statusline(
     return f"{account_tag}{sep}{quota_5h_tag}"
 
 
+def resolve_python_executable(gui: bool = False) -> Path:
+    current = Path(sys.executable).resolve()
+    if gui and sys.platform == "win32":
+        candidate = current.with_name("pythonw.exe")
+        if candidate.is_file():
+            return candidate
+    return current
+
+
+def _get_short_path(path: Path) -> Path:
+    if sys.platform != "win32":
+        return path
+    resolved = path.resolve()
+    if " " not in str(resolved):
+        return resolved
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(500)
+        res = ctypes.windll.kernel32.GetShortPathNameW(str(resolved), buf, 500)
+        if res > 0 and buf.value:
+            return Path(buf.value)
+    except Exception:
+        pass
+    return resolved
+
+
 def get_statusline_script_path(data_root: Path | None = None) -> Path:
     root = Path(data_root) if data_root else _default_data_root()
-    ext = ".cmd" if sys.platform == "win32" or os.name == "nt" else ""
+    ext = ".cmd" if sys.platform == "win32" else ""
     return root / "bin" / f"statusline{ext}"
+
+
+def _format_command_path(path: Path) -> str:
+    if sys.platform == "win32":
+        cmd_path = path if path.suffix.lower() == ".cmd" else path.with_suffix(".cmd")
+        return str(_get_short_path(cmd_path))
+    resolved = str(path.resolve())
+    if " " in resolved and not (resolved.startswith('"') and resolved.endswith('"')):
+        return f'"{resolved}"'
+    return resolved
+
+
+def get_statusline_command(data_root: Path | None = None) -> str:
+    script_path = get_statusline_script_path(data_root)
+    return _format_command_path(script_path)
 
 
 def install_statusline_script(data_root: Path | None = None) -> Path:
@@ -615,8 +685,25 @@ def install_statusline_script(data_root: Path | None = None) -> Path:
     python_bin = sys.executable
     package_root = str(Path(__file__).resolve().parent.parent)
 
-    is_windows = sys.platform == "win32" or os.name == "nt"
-    py_target = script_path.parent / "statusline.py" if is_windows else script_path
+    is_windows = sys.platform == "win32"
+    if getattr(sys, "frozen", False):
+        if is_windows:
+            content = f'@echo off\r\n"{python_bin}" --statusline-render %*\r\n'
+        else:
+            content = f'#!/bin/sh\nexec "{python_bin}" --statusline-render "$@"\n'
+        fd, tmp_name = tempfile.mkstemp(prefix=".statusline.", suffix=".tmp", dir=script_path.parent)
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+            if not is_windows:
+                tmp.chmod(0o755)
+            os.replace(tmp, script_path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+        return script_path
+    py_target = script_path.parent / "statusline.py"
     content = (
         f"#!{python_bin}\n"
         "# Auto-generated by agym. Do not edit directly.\n"
@@ -628,7 +715,7 @@ def install_statusline_script(data_root: Path | None = None) -> Path:
         "    sys.exit(main())\n"
     )
 
-    fd, tmp_name = tempfile.mkstemp(prefix=".statusline.", suffix=".tmp", dir=script_path.parent)
+    fd, tmp_name = tempfile.mkstemp(prefix=".statusline_py.", suffix=".tmp", dir=script_path.parent)
     tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -641,9 +728,10 @@ def install_statusline_script(data_root: Path | None = None) -> Path:
             tmp.unlink()
 
     if is_windows:
+        pythonw_bin = resolve_python_executable(gui=True)
         cmd_content = (
             "@echo off\r\n"
-            f'"{python_bin}" "%~dp0statusline.py" %*\r\n'
+            f'"{pythonw_bin}" "%~dp0statusline.py" %*\r\n'
         )
         fd_cmd, tmp_cmd_name = tempfile.mkstemp(prefix=".statusline_cmd.", suffix=".tmp", dir=script_path.parent)
         tmp_cmd = Path(tmp_cmd_name)
@@ -654,6 +742,25 @@ def install_statusline_script(data_root: Path | None = None) -> Path:
         finally:
             if tmp_cmd.exists():
                 tmp_cmd.unlink()
+    else:
+        # On POSIX (Linux/macOS), wrap statusline.py in a /bin/sh runner script.
+        # This handles environments where sys.executable or data_root contains spaces
+        # (e.g. macOS ~/Library/Application Support/...), which breaks kernel shebang parsing.
+        sh_content = (
+            "#!/bin/sh\n"
+            'DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+            f'exec "{python_bin}" "$DIR/statusline.py" "$@"\n'
+        )
+        fd_sh, tmp_sh_name = tempfile.mkstemp(prefix=".statusline_sh.", suffix=".tmp", dir=script_path.parent)
+        tmp_sh = Path(tmp_sh_name)
+        try:
+            with os.fdopen(fd_sh, "w", encoding="utf-8") as handle:
+                handle.write(sh_content)
+            tmp_sh.chmod(0o755)
+            os.replace(tmp_sh, script_path)
+        finally:
+            if tmp_sh.exists():
+                tmp_sh.unlink()
 
     return script_path
 
@@ -664,8 +771,9 @@ def get_profile_settings_path(profile_home: Path) -> Path:
 
 def sync_profile_statusline(
     profile_home: Path,
-    script_path: Path,
+    script_path: Path | None = None,
     enabled: bool = True,
+    command: str | None = None,
 ) -> bool:
     settings_file = get_profile_settings_path(profile_home)
     settings_file.parent.mkdir(parents=True, exist_ok=True)
@@ -681,9 +789,16 @@ def sync_profile_statusline(
         except Exception:
             existing = {}
 
+    if command is not None:
+        target_command = command
+    elif script_path is not None:
+        target_command = _format_command_path(script_path)
+    else:
+        target_command = get_statusline_command()
+
     statusline_cfg = {
         "type": "command",
-        "command": str(script_path.resolve()),
+        "command": target_command,
         "enabled": enabled,
     }
 
@@ -749,27 +864,29 @@ def get_statusline_status(store: ProfileStore) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     if sys.platform == "win32":
         for stream in (sys.stdout, sys.stderr, sys.stdin):
-            if hasattr(stream, "reconfigure"):
+            if stream is not None and hasattr(stream, "reconfigure"):
                 try:
                     stream.reconfigure(encoding="utf-8", errors="replace")
                 except Exception:
                     pass
     try:
         raw = ""
-        if not sys.stdin.isatty():
+        if sys.stdin is not None and not getattr(sys.stdin, "isatty", lambda: False)():
             try:
                 raw = sys.stdin.read()
             except Exception:
                 raw = ""
         payload = json.loads(raw) if raw.strip() else {}
         output = render_statusline(payload)
-        sys.stdout.write(output + "\n")
-        sys.stdout.flush()
+        if sys.stdout is not None:
+            sys.stdout.write(output + "\n")
+            sys.stdout.flush()
         return 0
     except Exception:
         profile = os.environ.get("AGYM_PROFILE", "antigravity")
-        sys.stdout.write(f"[{profile}]\n")
-        sys.stdout.flush()
+        if sys.stdout is not None:
+            sys.stdout.write(f"[{profile}]\n")
+            sys.stdout.flush()
         return 0
 
 

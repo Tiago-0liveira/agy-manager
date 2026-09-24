@@ -13,6 +13,7 @@ from .profiles import _chmod_private_dir, _default_data_root
 TTL_USAGE_SECONDS = 60.0      # 1 minute for live quota
 USAGE_CACHE_TTL_SECONDS = 300.0  # 5 minutes for interactive picker cache freshness
 TTL_TOKENS_SECONDS = 600.0    # 10 minutes for token usage tracking
+USAGE_CACHE_VERSION = 2  # v1 may contain quota values from the inaccurate direct API path
 
 
 def should_refresh_cache(
@@ -172,10 +173,39 @@ class CacheManager:
             return None
 
         payload, age, cached_at = entry
+        if payload.get("version") != USAGE_CACHE_VERSION:
+            return None
         parsed_data = payload.get("parsed_data")
         raw_output = payload.get("raw_output", "")
         if not isinstance(parsed_data, dict):
             return None
+
+        # Check if cached 5h bucket reset_time has already passed
+        now_dt = now or datetime.now(timezone.utc)
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=timezone.utc)
+        groups = parsed_data.get("groups")
+        if isinstance(groups, list):
+            for g in groups:
+                if not isinstance(g, dict):
+                    continue
+                g_name = str(g.get("name") or g.get("displayName") or "").lower()
+                for b in g.get("buckets", []):
+                    if not isinstance(b, dict):
+                        continue
+                    b_id = str(b.get("id") or b.get("bucketId") or "").lower()
+                    w = str(b.get("window") or "").lower()
+                    if ("gemini" in g_name or "gemini" in b_id) and ("5h" in w or "5h" in b_id):
+                        raw_reset = b.get("reset_time") or b.get("resetTime")
+                        if raw_reset:
+                            from .usage import parse_iso_datetime
+                            reset_dt = parse_iso_datetime(str(raw_reset))
+                            if reset_dt is not None:
+                                if reset_dt.tzinfo is None:
+                                    reset_dt = reset_dt.replace(tzinfo=timezone.utc)
+                                if reset_dt <= now_dt:
+                                    return None
+
         return parsed_data, str(raw_output), age, cached_at
 
     def set_usage(
@@ -193,7 +223,7 @@ class CacheManager:
             now = now.replace(tzinfo=timezone.utc)
 
         payload = {
-            "version": 1,
+            "version": USAGE_CACHE_VERSION,
             "profile": profile_name,
             "cached_at": now.isoformat(),
             "cached_timestamp": now.timestamp(),
@@ -216,6 +246,8 @@ class CacheManager:
             with filepath.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)
             if not isinstance(payload, dict):
+                return None, None
+            if payload.get("version") != USAGE_CACHE_VERSION:
                 return None, None
             cached_timestamp = payload.get("cached_timestamp")
             if not isinstance(cached_timestamp, (int, float)):
@@ -302,7 +334,7 @@ class CacheManager:
         out = int(snapshot.get("output_tokens", 0))
         thk = int(snapshot.get("thinking_tokens", 0))
         crd = int(snapshot.get("cache_read_tokens", 0))
-        tot = int(snapshot.get("total_tokens", inp + out + thk + crd))
+        tot = int(snapshot.get("total_tokens", inp + out) or (inp + out))
 
         # Check if identical to last snapshot to avoid duplicate zero or redundant updates
         snapshots = data.get("snapshots", [])
@@ -315,9 +347,8 @@ class CacheManager:
                 and last.get("thinking_tokens") == thk
                 and last.get("cache_read_tokens") == crd
                 and last.get("total_tokens") == tot
-                and tot == 0
             ):
-                # Don't keep piling up empty 0-token snapshots repeatedly
+                # Don't keep piling up identical snapshots repeatedly
                 should_record = False
 
         if should_record and tot > 0:
@@ -488,4 +519,3 @@ def fetch_and_cache_usage(
         runner=runner,
         on_progress=on_progress,
     )
-

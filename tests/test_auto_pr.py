@@ -5,6 +5,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,11 +29,23 @@ from agym.profiles import ProfileStore
 
 class TestAutoPr(unittest.TestCase):
     def setUp(self):
+        self._real_subprocess_run = subprocess.run
+
         self.temp_dir = tempfile.mkdtemp(prefix="test_auto_pr_")
         self.bin_dir = os.path.join(self.temp_dir, "bin")
         os.makedirs(self.bin_dir, exist_ok=True)
         self.repo_dir = os.path.join(self.temp_dir, "repo")
         os.makedirs(self.repo_dir, exist_ok=True)
+
+        def _mockable_subprocess_run(cmd, *args, **kwargs):
+            if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "gh":
+                mock_gh_py = os.path.join(self.bin_dir, "mock_gh.py")
+                new_cmd = [sys.executable, mock_gh_py] + list(cmd[1:])
+                return self._real_subprocess_run(new_cmd, *args, **kwargs)
+            return self._real_subprocess_run(cmd, *args, **kwargs)
+
+        self._subp_patcher = mock.patch("subprocess.run", side_effect=_mockable_subprocess_run)
+        self._subp_patcher.start()
 
         # Initialize git repo in repo_dir
         self.run_git(["init", "-b", "main"], cwd=self.repo_dir)
@@ -63,11 +76,12 @@ class TestAutoPr(unittest.TestCase):
         self.profile = self.store.create("testprof")
 
     def tearDown(self):
+        self._subp_patcher.stop()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def run_git(self, args: list[str], cwd: str | None = None) -> str:
         cmd = ["git"] + args
-        res = subprocess.run(
+        res = self._real_subprocess_run(
             cmd, cwd=cwd or self.repo_dir, capture_output=True, text=True, check=True
         )
         return res.stdout.strip()
@@ -79,49 +93,68 @@ class TestAutoPr(unittest.TestCase):
         pr_url: str = "https://github.com/example/repo/pull/42",
         fail_create: bool = False,
     ):
-        mock_gh = os.path.join(self.bin_dir, "gh")
-        lines = [
-            "#!/usr/bin/env bash",
-            f'echo "$@" >> "{self.mock_gh_log}"',
+        mock_gh_py = os.path.join(self.bin_dir, "mock_gh.py")
+        py_lines = [
+            "import sys",
+            f"with open(r'{self.mock_gh_log}', 'a', encoding='utf-8') as f:",
+            "    f.write(' '.join(sys.argv[1:]) + '\\n')",
         ]
         if not authenticated:
-            lines.append('if [[ "$1" == "auth" ]]; then exit 1; fi')
+            py_lines.append("if len(sys.argv) > 1 and sys.argv[1] == 'auth': sys.exit(1)")
         else:
-            lines.append('if [[ "$1" == "auth" ]]; then exit 0; fi')
+            py_lines.append("if len(sys.argv) > 1 and sys.argv[1] == 'auth': sys.exit(0)")
 
-        lines.extend([
-            'if [[ "$1" == "pr" && "$2" == "view" ]]; then',
-        ])
         if existing_pr:
-            lines.append(f'  echo "{existing_pr}"')
-            lines.append("  exit 0")
+            py_lines.extend([
+                "if len(sys.argv) > 2 and sys.argv[1] == 'pr' and sys.argv[2] == 'view':",
+                f"    print({repr(existing_pr)})",
+                "    sys.exit(0)",
+            ])
         else:
-            lines.append("  exit 1")
-        lines.extend([
-            "fi",
-            'if [[ "$1" == "pr" && "$2" == "create" ]]; then',
-            '  for i in "$@"; do',
-            f'    echo "$i" >> "{self.mock_gh_body_log}"',
-            '  done',
+            py_lines.extend([
+                "if len(sys.argv) > 2 and sys.argv[1] == 'pr' and sys.argv[2] == 'view':",
+                "    sys.exit(1)",
+            ])
+
+        py_lines.extend([
+            "if len(sys.argv) > 2 and sys.argv[1] == 'pr' and sys.argv[2] == 'create':",
+            f"    with open(r'{self.mock_gh_body_log}', 'a', encoding='utf-8') as f:",
+            "        for a in sys.argv[1:]:",
+            "            f.write(a + '\\n')",
         ])
         if fail_create:
-            lines.append('  echo "fatal: error creating pull request" >&2')
-            lines.append("  exit 1")
+            py_lines.extend([
+                "    sys.stderr.write('fatal: error creating pull request\\n')",
+                "    sys.exit(1)",
+            ])
         else:
-            lines.append(f'  echo "{pr_url}"')
-            lines.append("  exit 0")
-        lines.extend([
-            "fi",
-            "exit 0",
-        ])
-        with open(mock_gh, "w") as f:
-            f.write("\n".join(lines) + "\n")
-        st = os.stat(mock_gh)
-        os.chmod(mock_gh, st.st_mode | stat.S_IEXEC)
+            py_lines.extend([
+                f"    print({repr(pr_url)})",
+                "    sys.exit(0)",
+            ])
+        py_lines.append("sys.exit(0)")
+
+        with open(mock_gh_py, "w", encoding="utf-8") as f:
+            f.write("\n".join(py_lines) + "\n")
+
+        # POSIX wrapper
+        mock_gh = os.path.join(self.bin_dir, "gh")
+        with open(mock_gh, "w", encoding="utf-8") as f:
+            f.write(f"#!/bin/sh\nexec \"{sys.executable}\" \"{mock_gh_py}\" \"$@\"\n")
+        try:
+            st = os.stat(mock_gh)
+            os.chmod(mock_gh, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        except OSError:
+            pass
+
+        # Windows batch wrapper
+        mock_gh_cmd = os.path.join(self.bin_dir, "gh.cmd")
+        with open(mock_gh_cmd, "w", encoding="utf-8") as f:
+            f.write(f"@echo off\r\n\"{sys.executable}\" \"{mock_gh_py}\" %*\r\n")
 
     def get_test_env(self) -> dict[str, str]:
         env = os.environ.copy()
-        env["PATH"] = f"{self.bin_dir}:{env['PATH']}"
+        env["PATH"] = f"{self.bin_dir}{os.pathsep}{env.get('PATH', '')}"
         return env
 
     # -------------------------------------------------------------------------

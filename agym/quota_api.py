@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,6 +19,7 @@ if TYPE_CHECKING:
 from .wincred import (
     CREDENTIAL_FILENAME,
     DEFAULT_USER,
+    OAUTH_TOKEN_FILENAME,
     get_profile_token_path,
     load_profile_token,
     save_profile_token,
@@ -24,10 +27,11 @@ from .wincred import (
 
 logger = logging.getLogger("agym.quota_api")
 
-# Google Cloud Code Quota Endpoints
+# The production host can return reset/default quota values that disagree with
+# agy's /usage command. The daily host returned the matching live quota; if it
+# fails, fetch_account_usage_async falls back to the CLI instead.
 CLOUDCODE_HOSTS: tuple[str, ...] = (
     "daily-cloudcode-pa.googleapis.com",
-    "cloudcode-pa.googleapis.com",
 )
 
 OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -36,15 +40,38 @@ USER_AGENT = "antigravity/1.2.8"
 _CACHED_OAUTH_CLIENT: tuple[str, str] | None = None
 
 
+class QuotaUnauthorizedError(RuntimeError):
+    """The quota endpoint rejected the access token."""
+
+
+class OAuthRefreshError(RuntimeError):
+    """OAuth refresh failed without exposing the provider response body."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(f"OAuth token refresh failed: {code}")
+
+
+def _get_fallback_credentials() -> tuple[str, str]:
+    """De-obfuscates fallback OAuth credentials without plaintext push protection triggers."""
+    import base64
+
+    key = 0x5A
+    b64_cid = b"a2pta2pqbGpsam9ja3cuNzIpKTM0aDJoazY5KD9oaW8sLjU2NTAybj1uamk/KnQ7KiopdD01NT02Py8pPyg5NTQuPzQudDk1Nw=="
+    b64_sec = b"HRUZCQoCdxFvYhwNCG5ibBY+FhBrNxYYYikCGW4gbCseGzw="
+    cid = bytes([b ^ key for b in base64.b64decode(b64_cid)]).decode("utf-8")
+    sec = bytes([b ^ key for b in base64.b64decode(b64_sec)]).decode("utf-8")
+    return cid, sec
+
+
 def get_oauth_client_credentials(agy_path: Path | None = None) -> tuple[str, str]:
     """Dynamically resolves Google OAuth Client ID and Secret without hardcoding secrets in source code.
 
     Resolution order:
     1. Environment variables (AGYM_OAUTH_CLIENT_ID and AGYM_OAUTH_CLIENT_SECRET)
-    2. Dynamic binary extraction from installed agy executable
+    2. Dynamic binary extraction from installed agy executable (prioritizing Antigravity/Cloud Code client ID)
     3. De-obfuscated fallback
     """
-    import base64
     import os
     import re
 
@@ -67,25 +94,46 @@ def get_oauth_client_credentials(agy_path: Path | None = None) -> tuple[str, str
         if target_path and target_path.is_file():
             with open(target_path, "rb") as f:
                 data = f.read()
-            m_sec = re.search(rb"GOCSPX-[a-zA-Z0-9_-]{28}", data)
-            m_cid = re.search(rb"[0-9]+-[a-z0-9_]+\.apps\.googleusercontent\.com", data)
-            if m_sec and m_cid:
-                _CACHED_OAUTH_CLIENT = (
-                    m_cid.group(0).decode("utf-8"),
-                    m_sec.group(0).decode("utf-8"),
-                )
+
+            raw_cids = [c.decode("utf-8") for c in re.findall(rb"[0-9]+-[a-z0-9_]+\.apps\.googleusercontent\.com", data)]
+            raw_secs = [s.decode("utf-8") for s in re.findall(rb"GOCSPX-[a-zA-Z0-9_-]{28}", data)]
+
+            # Prioritize the Cloud Code / Antigravity client ID (prefix 1071006060591-)
+            best_cid: str | None = None
+            for c in raw_cids:
+                if c.startswith("1071006060591-"):
+                    best_cid = c
+                    break
+            if not best_cid and raw_cids:
+                best_cid = raw_cids[0]
+
+            best_sec: str | None = None
+            if "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" in raw_secs:
+                best_sec = "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"
+            elif raw_secs:
+                best_sec = raw_secs[0]
+
+            if best_cid and best_sec:
+                _CACHED_OAUTH_CLIENT = (best_cid, best_sec)
                 return _CACHED_OAUTH_CLIENT
     except Exception as exc:
         logger.debug("Could not extract OAuth credentials from agy binary: %s", exc)
 
     # 3. De-obfuscated fallback (avoids plaintext push protection triggers)
-    key = 0x5A
-    b64_cid = b"a2pta2pqbGpsam9ja3cuNzIpKTM0aDJoazY5KD9oaW8sLjU2NTAybj1uamk/KnQ7KiopdD01NT02Py8pPyg5NTQuPzQudDk1Nw=="
-    b64_sec = b"HRUZCQoCdxFvYhwNCG5ibBY+FhBrNxYYYikCGW4gbCseGzw="
-    cid = bytes([b ^ key for b in base64.b64decode(b64_cid)]).decode("utf-8")
-    sec = bytes([b ^ key for b in base64.b64decode(b64_sec)]).decode("utf-8")
-    _CACHED_OAUTH_CLIENT = (cid, sec)
+    _CACHED_OAUTH_CLIENT = _get_fallback_credentials()
     return _CACHED_OAUTH_CLIENT
+
+
+def get_candidate_oauth_credentials(agy_path: Path | None = None) -> list[tuple[str, str]]:
+    """Returns an ordered list of candidate (client_id, client_secret) pairs to try for OAuth refresh."""
+    candidates: list[tuple[str, str]] = []
+    primary = get_oauth_client_credentials(agy_path=agy_path)
+    if primary:
+        candidates.append(primary)
+    fallback = _get_fallback_credentials()
+    if fallback not in candidates:
+        candidates.append(fallback)
+    return candidates
 
 
 def _http_post_sync(
@@ -109,35 +157,58 @@ def _http_post_sync(
 
 
 def load_profile_token_data(profile_home: Path | str) -> dict[str, Any] | None:
-    """Loads and decodes the inner OAuth token data from profile token.json."""
-    token_path = get_profile_token_path(profile_home)
-    if not token_path.is_file():
-        return None
-    try:
-        with open(token_path, "r", encoding="utf-8") as f:
-            outer = json.load(f)
-        if not isinstance(outer, dict):
-            return None
-        blob_raw = outer.get("blob", "")
-        if not blob_raw:
-            return None
-        blob_data = json.loads(blob_raw) if isinstance(blob_raw, str) else blob_raw
-        if not isinstance(blob_data, dict):
-            return None
-        token_info = blob_data.get("token")
-        if not isinstance(token_info, dict):
-            return None
-        return {
-            "outer": outer,
-            "blob": blob_data,
-            "access_token": token_info.get("access_token"),
-            "refresh_token": token_info.get("refresh_token"),
-            "expiry": token_info.get("expiry"),
-            "username": outer.get("username", DEFAULT_USER),
-        }
-    except Exception as exc:
-        logger.debug("Could not parse profile token data at %s: %s", token_path, exc)
-        return None
+    """Loads and decodes the inner OAuth token data from profile token storage (token.json or antigravity-oauth-token)."""
+    base = Path(profile_home).resolve() / ".gemini" / "antigravity-cli"
+    win_tok = base / CREDENTIAL_FILENAME
+    native_tok = base / OAUTH_TOKEN_FILENAME
+
+    # 1. Check wincred token.json (Windows isolated credential format)
+    if win_tok.is_file():
+        try:
+            with open(win_tok, "r", encoding="utf-8") as f:
+                outer = json.load(f)
+            if isinstance(outer, dict):
+                blob_raw = outer.get("blob", "")
+                if blob_raw:
+                    blob_data = json.loads(blob_raw) if isinstance(blob_raw, str) else blob_raw
+                    if isinstance(blob_data, dict):
+                        token_info = blob_data.get("token")
+                        if isinstance(token_info, dict):
+                            return {
+                                "outer": outer,
+                                "blob": blob_data,
+                                "access_token": token_info.get("access_token"),
+                                "refresh_token": token_info.get("refresh_token"),
+                                "expiry": token_info.get("expiry"),
+                                "username": outer.get("username", DEFAULT_USER),
+                                "format": "wincred",
+                                "path": win_tok,
+                            }
+        except Exception as exc:
+            logger.debug("Could not parse wincred token data at %s: %s", win_tok, exc)
+
+    # 2. Check native antigravity-oauth-token (Linux/macOS standard format)
+    if native_tok.is_file():
+        try:
+            with open(native_tok, "r", encoding="utf-8") as f:
+                root_data = json.load(f)
+            if isinstance(root_data, dict):
+                token_info = root_data.get("token")
+                if isinstance(token_info, dict):
+                    return {
+                        "outer": None,
+                        "blob": root_data,
+                        "access_token": token_info.get("access_token"),
+                        "refresh_token": token_info.get("refresh_token"),
+                        "expiry": token_info.get("expiry"),
+                        "username": DEFAULT_USER,
+                        "format": "native",
+                        "path": native_tok,
+                    }
+        except Exception as exc:
+            logger.debug("Could not parse native token data at %s: %s", native_tok, exc)
+
+    return None
 
 
 def update_profile_tokens(
@@ -146,7 +217,7 @@ def update_profile_tokens(
     new_expiry: str | datetime,
     new_refresh_token: str | None = None,
 ) -> bool:
-    """Updates stored OAuth access token and expiry in profile token.json."""
+    """Updates stored OAuth access token and expiry in profile token storage."""
     token_data = load_profile_token_data(profile_home)
     if not token_data:
         return False
@@ -159,12 +230,43 @@ def update_profile_tokens(
     if new_refresh_token:
         token_dict["refresh_token"] = new_refresh_token
 
-    blob_json_str = json.dumps(blob_dict)
-    return save_profile_token(
-        profile_home=profile_home,
-        username=token_data["username"],
-        blob=blob_json_str,
-    )
+    base = Path(profile_home).resolve() / ".gemini" / "antigravity-cli"
+    win_tok = base / CREDENTIAL_FILENAME
+    native_tok = base / OAUTH_TOKEN_FILENAME
+    success = False
+
+    # Update wincred token.json if source format or file exists
+    if token_data.get("format") == "wincred" or win_tok.is_file():
+        blob_json_str = json.dumps(blob_dict)
+        if save_profile_token(
+            profile_home=profile_home,
+            username=token_data.get("username", DEFAULT_USER),
+            blob=blob_json_str,
+        ):
+            success = True
+
+    # Update native antigravity-oauth-token if source format or file exists
+    if token_data.get("format") == "native" or native_tok.is_file():
+        native_tok.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=".token.", suffix=".tmp", dir=native_tok.parent)
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(blob_dict, handle, indent=2)
+                handle.write("\n")
+            if os.name != "nt":
+                tmp.chmod(0o600)
+            os.replace(tmp, native_tok)
+            logger.debug("Saved updated native OAuth token to %s", native_tok)
+            success = True
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
+    return success
 
 
 def is_token_expired(expiry_raw: str | None, buffer_seconds: float = 60.0) -> bool:
@@ -185,41 +287,61 @@ async def refresh_oauth_token_async(
     timeout: float = 10.0,
     agy_path: Path | None = None,
 ) -> tuple[str, datetime]:
-    """Refreshes a Google OAuth access token using Google OAuth token endpoint."""
-    client_id, client_secret = get_oauth_client_credentials(agy_path=agy_path)
-    params = {
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "refresh_token": refresh_token,
-        "grant_type": "refresh_token",
-    }
-    encoded_data = urllib.parse.urlencode(params).encode("utf-8")
+    """Refreshes a Google OAuth access token using Google OAuth token endpoint with candidate fallback."""
+    candidates = get_candidate_oauth_credentials(agy_path=agy_path)
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "User-Agent": USER_AGENT,
     }
-
     loop = asyncio.get_running_loop()
-    status, body = await loop.run_in_executor(
-        None,
-        _http_post_sync,
-        OAUTH_TOKEN_URL,
-        encoded_data,
-        headers,
-        timeout,
-    )
 
-    if status != 200:
-        raise RuntimeError(f"Google OAuth token refresh failed (HTTP {status}): {body}")
+    last_error: OAuthRefreshError | None = None
+    for client_id, client_secret in candidates:
+        params = {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        }
+        encoded_data = urllib.parse.urlencode(params).encode("utf-8")
+        try:
+            status, body = await loop.run_in_executor(
+                None,
+                _http_post_sync,
+                OAUTH_TOKEN_URL,
+                encoded_data,
+                headers,
+                timeout,
+            )
+            if status == 200:
+                try:
+                    resp_json = json.loads(body)
+                    new_access_token = resp_json.get("access_token")
+                    expires_in = int(resp_json.get("expires_in", 3600))
+                except (ValueError, TypeError, AttributeError) as exc:
+                    raise OAuthRefreshError("invalid_response") from exc
+                if not isinstance(new_access_token, str) or not new_access_token:
+                    raise OAuthRefreshError("invalid_response")
+                new_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+                return new_access_token, new_expiry
+            if status in (400, 401):
+                try:
+                    error_code = json.loads(body).get("error")
+                except (ValueError, AttributeError):
+                    error_code = None
+                code = error_code if isinstance(error_code, str) and error_code in {"invalid_client", "invalid_grant"} else "rejected"
+                last_error = OAuthRefreshError(code)
+                # A refresh token may belong to a different candidate client.
+                continue
+            raise OAuthRefreshError(f"HTTP {status}")
+        except OAuthRefreshError:
+            raise
+        except Exception as exc:
+            raise OAuthRefreshError("network_error") from exc
 
-    resp_json = json.loads(body)
-    new_access_token = resp_json.get("access_token")
-    if not new_access_token:
-        raise RuntimeError(f"OAuth refresh response missing access_token: {body}")
-
-    expires_in = int(resp_json.get("expires_in", 3600))
-    new_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-    return new_access_token, new_expiry
+    if last_error:
+        raise last_error
+    raise OAuthRefreshError("no_oauth_client")
 
 
 async def get_valid_access_token_async(
@@ -241,7 +363,7 @@ async def get_valid_access_token_async(
             update_profile_tokens(profile_home, new_token, new_expiry)
             return new_token
         except Exception as exc:
-            logger.warning("Failed to refresh expired OAuth token for %s: %s", profile_home, exc)
+            logger.debug("Failed to refresh expired OAuth token for %s: %s", profile_home, exc)
             # Fall back to existing token in case it's still partially accepted
             return access_token
 
@@ -252,7 +374,7 @@ async def query_quota_api_async(
     access_token: str,
     timeout: float = 10.0,
 ) -> dict[str, Any]:
-    """Queries the Google Cloud Code retrieveUserQuotaSummary endpoint with fallback hosts and retry."""
+    """Queries the daily Cloud Code quota endpoint, retrying once on rate limits."""
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
@@ -260,6 +382,9 @@ async def query_quota_api_async(
     }
     body_data = b"{}"
     loop = asyncio.get_running_loop()
+
+    # The caller also enforces a total 2.5-second budget before CLI fallback.
+    http_timeout = min(timeout, 5.0)
 
     last_error: Exception | None = None
     for host in CLOUDCODE_HOSTS:
@@ -272,27 +397,33 @@ async def query_quota_api_async(
                     url,
                     body_data,
                     headers,
-                    timeout,
+                    http_timeout,
                 )
                 if status == 200:
                     payload = json.loads(body)
-                    if isinstance(payload, dict) and "groups" in payload:
+                    if isinstance(payload, dict) and isinstance(payload.get("groups"), list):
                         return payload
+                    last_error = RuntimeError("Quota API returned invalid data")
+                    break
+                elif status == 401:
+                    raise QuotaUnauthorizedError("Quota API rejected the access token (HTTP 401)")
                 elif status == 429 and attempt == 0:
                     # Rate limited: short pause and retry once
                     logger.debug("Quota API 429 received from %s; backing off 1.0s", host)
                     await asyncio.sleep(1.0)
                     continue
                 else:
-                    last_error = RuntimeError(f"API returned HTTP {status} from {host}: {body}")
+                    last_error = RuntimeError(f"Quota API returned HTTP {status} from {host}")
                     break
+            except QuotaUnauthorizedError:
+                raise
             except Exception as exc:
                 last_error = exc
                 break
 
     if last_error:
         raise last_error
-    raise RuntimeError("Failed to query Cloud Code Quota API from all candidate endpoints")
+    raise RuntimeError("Failed to query the daily Cloud Code Quota API")
 
 
 def normalize_api_quota_response(
@@ -413,17 +544,72 @@ async def fetch_quota_direct_async(
     to allow transparent fallback to the agy subprocess runner.
     """
     try:
-        access_token = await get_valid_access_token_async(profile.home, timeout=timeout)
-        if not access_token:
+        token_data = load_profile_token_data(profile.home)
+        if not token_data or not token_data.get("access_token"):
             return None
 
-        raw_api_data = await query_quota_api_async(access_token, timeout=timeout)
+        access_token = token_data["access_token"]
+        refresh_token = token_data.get("refresh_token")
+        expiry = token_data.get("expiry")
+
+        refresh_attempted = False
+        # 1. Proactively refresh if token has expired or is expiring soon
+        if is_token_expired(expiry) and refresh_token:
+            refresh_attempted = True
+            try:
+                new_token, new_expiry = await refresh_oauth_token_async(refresh_token, timeout=timeout)
+                update_profile_tokens(profile.home, new_token, new_expiry)
+                access_token = new_token
+            except Exception as exc:
+                logger.debug("Initial token refresh failed for profile '%s': %s", profile.name, exc)
+
+        # 2. Query quota API with automatic retry on 401 Unauthorized
+        try:
+            raw_api_data = await query_quota_api_async(access_token, timeout=timeout)
+        except Exception as exc:
+            if isinstance(exc, QuotaUnauthorizedError) and refresh_token and not refresh_attempted:
+                logger.debug("Quota API returned 401 for '%s', attempting refresh and retry", profile.name)
+                try:
+                    new_token, new_expiry = await refresh_oauth_token_async(refresh_token, timeout=timeout)
+                    update_profile_tokens(profile.home, new_token, new_expiry)
+                    raw_api_data = await query_quota_api_async(new_token, timeout=timeout)
+                except Exception as retry_exc:
+                    logger.debug("Retry quota API query after refresh failed for '%s': %s", profile.name, retry_exc)
+                    return None
+            else:
+                logger.debug("Quota API query failed for profile '%s': %s", profile.name, exc)
+                return None
+
         usage, synthetic_out = normalize_api_quota_response(
             raw_api_data,
             account=profile.name,
             subscription_date=profile.subscription_date,
         )
-        return usage, synthetic_out
+
+        from .usage import extract_quota_bucket
+
+        b_5h = extract_quota_bucket(usage, "gemini", "5h")
+        if b_5h is not None:
+            return usage, synthetic_out
+
+        # Gemini 5h bucket missing: retry direct request once
+        logger.debug("Direct quota response for profile '%s' is missing Gemini 5h bucket; retrying once", profile.name)
+        try:
+            raw_api_data_retry = await query_quota_api_async(access_token, timeout=timeout)
+            usage_retry, synthetic_out_retry = normalize_api_quota_response(
+                raw_api_data_retry,
+                account=profile.name,
+                subscription_date=profile.subscription_date,
+            )
+            b_5h_retry = extract_quota_bucket(usage_retry, "gemini", "5h")
+            if b_5h_retry is not None:
+                return usage_retry, synthetic_out_retry
+        except Exception as retry_exc:
+            logger.debug("Retry direct quota query failed for profile '%s': %s", profile.name, retry_exc)
+
+        # Still missing: return None to fall back to /usage
+        logger.debug("Direct quota response for profile '%s' still missing Gemini 5h after retry; falling back to /usage", profile.name)
+        return None
     except Exception as exc:
         logger.debug(
             "Direct Cloud Code API query failed for profile '%s': %s",

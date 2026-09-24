@@ -33,9 +33,9 @@ SAMPLE_REAL_RESPONSE = json.dumps(
         "status": "SUCCESS",
         "response": (
             "Gemini Models\tWeekly Limit Remaining\t99%\t2026-09-27T22:17:44Z\n"
-            "Gemini Models\tFive Hour Limit Remaining\t96%\t2026-09-21T03:17:44Z\n"
+            "Gemini Models\tFive Hour Limit Remaining\t96%\t2026-09-27T03:17:44Z\n"
             "Claude and GPT models\tWeekly Limit Remaining\t100%\t2026-09-27T23:00:20Z\n"
-            "Claude and GPT models\tFive Hour Limit Remaining\t100%\t2026-09-21T04:00:20Z\n"
+            "Claude and GPT models\tFive Hour Limit Remaining\t100%\t2026-09-27T04:00:20Z\n"
         ),
         "duration_seconds": 0,
         "num_turns": 0,
@@ -72,7 +72,7 @@ SAMPLE_REAL_RESPONSE = json.dumps(
                                 "description": "You have used some of your 5-hour limit.",
                                 "window": "5h",
                                 "remaining_fraction": 0.8399444818496704,
-                                "reset_time": "2026-09-21T03:17:44Z",
+                                "reset_time": "2026-09-27T03:17:44Z",
                             },
                         ],
                     },
@@ -92,7 +92,7 @@ SAMPLE_REAL_RESPONSE = json.dumps(
                                 "name": "Five Hour Limit Remaining",
                                 "window": "5h",
                                 "remaining_fraction": 1,
-                                "reset_time": "2026-09-21T04:00:20Z",
+                                "reset_time": "2026-09-27T04:00:20Z",
                             },
                         ],
                     },
@@ -291,14 +291,18 @@ class ConcurrencyAndProgressivenessTests(unittest.IsolatedAsyncioTestCase):
             p2 = store.create("account-2")
             p3 = store.create("account-3")
 
-            barrier = asyncio.Barrier(3)
+            entered = asyncio.Event()
+            ready = 0
             entered_homes: list[str] = []
 
             async def barrier_runner(argv: list[str], env: dict[str, str], timeout: float) -> tuple[int, str, str]:
+                nonlocal ready
                 entered_homes.append(env["HOME"])
-                # If tasks were run sequentially, barrier.wait() would time out because
-                # subsequent tasks wouldn't enter until this task finishes.
-                await asyncio.wait_for(barrier.wait(), timeout=2.0)
+                ready += 1
+                if ready == 3:
+                    entered.set()
+                # Sequential execution cannot set the event before the first task times out.
+                await asyncio.wait_for(entered.wait(), timeout=2.0)
                 return 0, SAMPLE_REAL_RESPONSE, ""
 
             usages = await fetch_all_usage(
@@ -894,6 +898,7 @@ class UsageGraphsTests(unittest.TestCase):
         telemetry = compute_fleet_telemetry({"acc1": u1, "acc2": u2, "acc3": u3}, extract_quota_bucket)
         self.assertEqual(telemetry.total_accounts, 3)
         self.assertGreater(telemetry.gemini_avg_pct, 50.0)
+        self.assertGreater(telemetry.weekly_avg_pct, 50.0)
         self.assertEqual(telemetry.claude_avg_pct, 100.0)
         self.assertEqual(telemetry.ready_count, 2)
         self.assertEqual(telemetry.depleted_count, 1)
@@ -909,7 +914,8 @@ class UsageGraphsTests(unittest.TestCase):
         banner_text = "\n".join(lines)
         self.assertIn("Fleet Capacity", banner_text)
         self.assertIn("Gemini Pool", banner_text)
-        self.assertIn("Claude Pool", banner_text)
+        self.assertIn("Weekly Pool", banner_text)
+        self.assertNotIn("Claude Pool", banner_text)
 
     def test_render_views(self) -> None:
         from agym.usage import render_usage_view_lines
@@ -1110,5 +1116,4 @@ class UsageGraphsTests(unittest.TestCase):
         self.assertIn("Claude", narrow_text)
         dev_narrow = [l for l in narrow_lines if "dev" in l or "Claude" in l]
         self.assertGreaterEqual(len(dev_narrow), 2)
-
 

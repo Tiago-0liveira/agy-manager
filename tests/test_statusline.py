@@ -4,6 +4,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -14,6 +15,7 @@ from unittest.mock import MagicMock, patch
 from agym.cli import _statusline, main as cli_main
 from agym.profiles import ProfileSettings, ProfileStore
 from agym.statusline import (
+    _get_short_path,
     AccountQuotaInfo,
     BucketQuota,
     extract_payload_quota,
@@ -23,6 +25,7 @@ from agym.statusline import (
     format_vcs_tag,
     get_profile_settings_path,
     get_rank_color,
+    get_statusline_command,
     get_statusline_script_path,
     get_statusline_status,
     install_statusline_script,
@@ -34,6 +37,7 @@ from agym.statusline import (
     resolve_context_window,
     resolve_git_vcs,
     resolve_model_display,
+    resolve_python_executable,
     resolve_quota,
     sync_all_profiles,
     sync_profile_statusline,
@@ -356,11 +360,18 @@ class InstallationAndSyncTests(unittest.TestCase):
     def test_install_statusline_script(self) -> None:
         script_path = install_statusline_script(self.data_root)
         self.assertTrue(script_path.is_file())
-        if os.name != "nt":
+        py_target = script_path.parent / "statusline.py"
+        self.assertTrue(py_target.is_file())
+        self.assertIn("from agym.statusline import main", py_target.read_text())
+        if sys.platform != "win32":
             mode = script_path.stat().st_mode
             self.assertTrue(bool(mode & 0o111), "Script should be executable")
-        content = script_path.read_text()
-        self.assertIn("from agym.statusline import main", content)
+            content = script_path.read_text()
+            self.assertIn("#!/bin/sh", content)
+            self.assertIn("statusline.py", content)
+        else:
+            cmd_content = script_path.read_text()
+            self.assertIn("statusline.py", cmd_content)
 
     def test_sync_profile_statusline_preserves_existing_settings(self) -> None:
         profile = self.store.create("work")
@@ -386,12 +397,74 @@ class InstallationAndSyncTests(unittest.TestCase):
         # Check statusLine was added
         self.assertIn("statusLine", new_data)
         self.assertEqual(new_data["statusLine"]["type"], "command")
-        self.assertEqual(new_data["statusLine"]["command"], str(script_path.resolve()))
+        if sys.platform == "win32":
+            expected_cmd = str(_get_short_path(script_path))
+        else:
+            resolved = str(script_path.resolve())
+            expected_cmd = f'"{resolved}"' if " " in resolved else resolved
+        self.assertEqual(new_data["statusLine"]["command"], expected_cmd)
         self.assertTrue(new_data["statusLine"]["enabled"])
 
         # Subsequent sync without changes should return False (idempotent)
         updated2 = sync_profile_statusline(profile.home, script_path, enabled=True)
         self.assertFalse(updated2)
+
+    def test_resolve_python_executable_windows_gui(self) -> None:
+        with patch("sys.platform", "win32"):
+            with patch("pathlib.Path.is_file", return_value=True):
+                resolved = resolve_python_executable(gui=True)
+                self.assertEqual(resolved.name.lower(), "pythonw.exe")
+
+    def test_resolve_python_executable_windows_console(self) -> None:
+        with patch("sys.platform", "win32"):
+            resolved = resolve_python_executable(gui=False)
+            self.assertEqual(resolved, Path(sys.executable).resolve())
+
+    def test_resolve_python_executable_posix(self) -> None:
+        with patch("sys.platform", "linux"):
+            resolved = resolve_python_executable(gui=True)
+            self.assertEqual(resolved, Path(sys.executable).resolve())
+
+    def test_get_statusline_command_windows(self) -> None:
+        with patch("sys.platform", "win32"):
+            cmd = get_statusline_command(self.data_root)
+            self.assertTrue(cmd.endswith("statusline.cmd") or cmd.endswith("STATUS~1.CMD"))
+            self.assertNotIn('"', cmd)
+
+    def test_get_statusline_command_posix(self) -> None:
+        with patch("sys.platform", "linux"):
+            cmd = get_statusline_command(self.data_root)
+            resolved = str((self.data_root / "bin" / "statusline").resolve())
+            expected = f'"{resolved}"' if " " in resolved else resolved
+            self.assertEqual(cmd, expected)
+
+    def test_get_statusline_command_posix_with_spaces(self) -> None:
+        space_root = self.data_root / "space path" / "agym"
+        with patch("sys.platform", "darwin"):
+            cmd = get_statusline_command(space_root)
+            expected = f'"{space_root.resolve() / "bin" / "statusline"}"'
+            self.assertEqual(cmd, expected)
+
+    def test_sync_profile_statusline_with_spaces_executable(self) -> None:
+        space_root = self.data_root / "Library" / "Application Support" / "agym"
+        profile = self.store.create("test_spaces")
+        settings_file = get_profile_settings_path(profile.home)
+
+        script_path = install_statusline_script(space_root)
+        self.assertTrue(script_path.is_file())
+        self.assertTrue((space_root / "bin" / "statusline.py").is_file())
+
+        updated = sync_profile_statusline(profile.home, script_path, enabled=True)
+        self.assertTrue(updated)
+
+        with settings_file.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        cmd = data["statusLine"]["command"]
+        self.assertEqual(cmd, get_statusline_command(space_root))
+
+        if sys.platform != "win32":
+            res = subprocess.run(["sh", "-c", f"{cmd}"], input="{}", text=True, capture_output=True)
+            self.assertEqual(res.returncode, 0)
 
     def test_sync_all_profiles(self) -> None:
         p1 = self.store.create("acc1")
@@ -429,6 +502,13 @@ class InstallationAndSyncTests(unittest.TestCase):
             py_script = self.data_root / "bin" / "statusline.py"
             self.assertTrue(py_script.is_file())
             self.assertIn("from agym.statusline import main", py_script.read_text())
+
+    def test_frozen_statusline_script_calls_binary(self) -> None:
+        with patch.object(sys, "frozen", True, create=True):
+            script_path = install_statusline_script(self.data_root)
+        content = script_path.read_text()
+        self.assertIn("--statusline-render", content)
+        self.assertIn(sys.executable, content)
 
     def test_detect_profile_escape_roots_windows(self) -> None:
         from agym.profiles import _detect_profile_escape_roots
@@ -516,9 +596,10 @@ class CliStatuslineCommandTests(unittest.TestCase):
         self.assertIn("5h: 80%", output)
 
     def test_statusline_main_exception_safe_fallback(self) -> None:
+        stdin = io.StringIO("")
         stdout = io.StringIO()
         with patch("agym.statusline.render_statusline", side_effect=RuntimeError("unexpected crash")):
-            with patch("sys.stdout", stdout):
+            with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
                 with patch.dict(os.environ, {"AGYM_PROFILE": "safe_profile"}):
                     code = statusline_main()
         self.assertEqual(code, 0)
@@ -585,23 +666,36 @@ class StatuslineVCSTests(unittest.TestCase):
         self.assertIsNone(parse_git_head("   \n"))
 
     def test_format_vcs_tag(self) -> None:
-        vcs_wt = VCSInfo(branch="feat/statusline", worktree="statusline")
+        vcs_wt = VCSInfo(branch="feat/statusline", worktree="statusline", directory="wt_dir")
         formatted_color = format_vcs_tag(vcs_wt, include_worktree=True, no_color=False)
-        self.assertIn("🌿 feat/statusline", formatted_color)
-        self.assertIn("[statusline]", formatted_color)
+        self.assertIn("🌳 🌿 feat/statusline", formatted_color)
         self.assertIn("\033[38;5;75m", formatted_color)
 
         formatted_no_color = format_vcs_tag(vcs_wt, include_worktree=True, no_color=True)
-        self.assertEqual(formatted_no_color, "🌿 feat/statusline [statusline]")
+        self.assertEqual(formatted_no_color, "🌳 🌿 feat/statusline")
 
         formatted_no_wt = format_vcs_tag(vcs_wt, include_worktree=False, no_color=True)
         self.assertEqual(formatted_no_wt, "🌿 feat/statusline")
+
+        # Normal repository with directory
+        vcs_repo = VCSInfo(branch="main", directory="my-project")
+        self.assertEqual(format_vcs_tag(vcs_repo, no_color=True), "my-project 🌿 main")
+        formatted_repo_color = format_vcs_tag(vcs_repo, no_color=False)
+        self.assertIn("my-project", formatted_repo_color)
+        self.assertIn("🌿 main", formatted_repo_color)
+
+        # Directory truncation
+        long_dir = VCSInfo(branch="main", directory="very-long-project-folder")
+        self.assertEqual(format_vcs_tag(long_dir, max_dir_len=14, no_color=True), "very-long-pro… 🌿 main")
+
+        # Directory disabled
+        self.assertEqual(format_vcs_tag(vcs_repo, include_directory=False, no_color=True), "🌿 main")
 
         # None inputs
         self.assertIsNone(format_vcs_tag(None))
         self.assertIsNone(format_vcs_tag(VCSInfo()))
 
-        # Truncation
+        # Branch Truncation
         long_vcs = VCSInfo(branch="feature/very-long-branch-name", worktree=None)
         truncated = format_vcs_tag(long_vcs, include_worktree=False, max_branch_len=14, no_color=True)
         self.assertEqual(truncated, "🌿 feature/very-…")
@@ -615,6 +709,7 @@ class StatuslineVCSTests(unittest.TestCase):
         vcs = resolve_git_vcs(cwd=repo_dir)
         self.assertEqual(vcs.branch, "main")
         self.assertIsNone(vcs.worktree)
+        self.assertEqual(vcs.directory, "standard_repo")
 
     def test_resolve_git_vcs_linked_worktree(self) -> None:
         main_git = self.tmp_dir / "main_repo" / ".git"
@@ -709,7 +804,7 @@ class StatuslineVCSTests(unittest.TestCase):
             "quota": {"gemini-5h": {"remaining_fraction": 0.85}},
         }
 
-        # Wide terminal: includes [worktree]
+        # Wide terminal in worktree: includes worktree icon
         wide_line = render_statusline(
             payload,
             profile_name="tiagoliv",
@@ -718,10 +813,25 @@ class StatuslineVCSTests(unittest.TestCase):
             cwd=wt_dir,
         )
         self.assertIn("👤 tiagoliv", wide_line)
-        self.assertIn("🌿 feat/statusline [my-feature-wt]", wide_line)
+        self.assertIn("🌳 🌿 feat/statusline", wide_line)
         self.assertIn("5h: [█████░] 85%", wide_line)
 
-        # Narrower terminal (70 columns): includes branch only
+        # Standard repository (non-worktree): includes current directory before branch
+        repo_dir = self.tmp_dir / "standard_repo"
+        git_dir = repo_dir / ".git"
+        git_dir.mkdir(parents=True, exist_ok=True)
+        (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
+        repo_line = render_statusline(
+            payload,
+            profile_name="tiagoliv",
+            terminal_width=110,
+            no_color=True,
+            cwd=repo_dir,
+        )
+        self.assertIn("👤 tiagoliv", repo_line)
+        self.assertIn("standard_repo 🌿 main", repo_line)
+
+        # Narrower terminal (70 columns): worktree icon still included
         narrow_line = render_statusline(
             payload,
             profile_name="tiagoliv",
@@ -730,8 +840,7 @@ class StatuslineVCSTests(unittest.TestCase):
             cwd=wt_dir,
         )
         self.assertIn("👤 tiagoliv", narrow_line)
-        self.assertIn("🌿 feat/statusline", narrow_line)
-        self.assertNotIn("[my-feature-wt]", narrow_line)
+        self.assertIn("🌳 🌿 feat/statusline", narrow_line)
 
         # Ultra compact terminal (50 columns): omits vcs tag
         ultra_line = render_statusline(
@@ -747,4 +856,3 @@ class StatuslineVCSTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
