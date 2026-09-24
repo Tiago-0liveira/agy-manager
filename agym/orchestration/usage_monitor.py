@@ -58,14 +58,16 @@ class UsagePollingEventSink(EventSink):
     def emit(self, event: OrchestrationEvent) -> None:
         self._sink.emit(event)
 
-        if event.type == EventType.RUN_CREATED:
-            self._start(event.run_id)
-        elif event.type in {
+        if event.type in {
             EventType.RUN_COMPLETED,
             EventType.RUN_FAILED,
             EventType.RUN_INTERRUPTED,
         }:
             self.close()
+        else:
+            # RUN_CREATED starts normal runs; the fallback also covers resume,
+            # where the first observed event may be ROUND_STARTED/ACTION_REQUESTED.
+            self._start(event.run_id)
 
     def close(self) -> None:
         self._stop.set()
@@ -125,6 +127,9 @@ class UsagePollingEventSink(EventSink):
             self._emit_snapshot(run_id, profiles, error=f"usage refresh failed: {exc}")
             return
 
+        if self._stop.is_set():
+            return
+
         payload_profiles = []
         for usage in usages:
             five_hour = extract_quota_bucket(usage, "gemini", "5h")
@@ -140,6 +145,9 @@ class UsagePollingEventSink(EventSink):
                     "error": usage.error,
                 }
             )
+
+        if self._stop.is_set():
+            return
 
         self._sink.emit(
             OrchestrationEvent(
