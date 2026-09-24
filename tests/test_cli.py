@@ -192,7 +192,7 @@ class CliTests(unittest.TestCase):
             code = cli.main(["personal", "--auto-prompt=make a plan"])
             self.assertEqual(code, 0)
             mock_run_auto_prompt.assert_called_once_with(
-                Path("/usr/bin/agy"), profile, "make a plan", replace_process=True
+                Path("/usr/bin/agy"), profile, "make a plan", replace_process=True, data_root=store.data_root
             )
             mock_run_agy.assert_not_called()
 
