@@ -156,6 +156,10 @@ class WorkerPresentation:
     completed_at: str | None = None
     duration_seconds: float | None = None
     error_message: str | None = None
+    objective: str = ""
+    strategy: str = ""
+    current_activity: str = ""
+    artifact_path: str | None = None
     wave_number: int = 1
 
 
@@ -185,6 +189,18 @@ class PresentationState:
     workers: dict[str, WorkerPresentation] = field(default_factory=dict)
     failure_reason: str | None = None
     final_result: str | None = None
+    final_artifact_path: str | None = None
+    coordinator_profile: str | None = None
+    coordinator_strategy: str = ""
+    budget_invocations: int = 0
+    budget_max_invocations: int | None = None
+    budget_rounds: int = 0
+    budget_max_rounds: int | None = None
+    started_at: str | None = None
+    runtime_seconds: float = 0.0
+    current_action_kind: str = ""
+    action_reason: str = ""
+    artifact_paths: list[str] = field(default_factory=list)
 
 
 def render_dry_run(
@@ -484,6 +500,7 @@ class TerminalEventSink(EventSink):
 
         if etype == EventType.RUN_CREATED:
             self.state.run_status = RunStatus.CREATED.value
+            self.state.started_at = event.timestamp
             if "task" in payload:
                 self.state.task = str(payload["task"])
             if "mode" in payload:
@@ -501,14 +518,23 @@ class TerminalEventSink(EventSink):
                     self.state.task_type = ass.task_type.value if hasattr(ass.task_type, "value") else str(ass.task_type).upper()
                 elif isinstance(ass, dict) and "task_type" in ass:
                     self.state.task_type = str(ass["task_type"]).upper()
-                if hasattr(ass, "summary") and ass.summary:
-                    self.state.task = str(ass.summary)
-                elif isinstance(ass, dict) and ass.get("summary"):
-                    self.state.task = str(ass["summary"])
+                if not self.state.task:
+                    if hasattr(ass, "summary") and ass.summary:
+                        self.state.task = str(ass.summary)
+                    elif isinstance(ass, dict) and ass.get("summary"):
+                        self.state.task = str(ass["summary"])
             if "complexity" in payload:
                 self.state.complexity = str(payload["complexity"]).upper()
             if "task_type" in payload:
                 self.state.task_type = str(payload["task_type"]).upper()
+            if payload.get("coordinator_profile"):
+                self.state.coordinator_profile = str(payload["coordinator_profile"])
+            if payload.get("coordinator_strategy"):
+                self.state.coordinator_strategy = str(payload["coordinator_strategy"])
+            budget = payload.get("budget")
+            if isinstance(budget, dict):
+                self.state.budget_max_invocations = int(budget.get("max_invocations", 0) or 0)
+                self.state.budget_max_rounds = int(budget.get("max_rounds", 0) or 0)
 
         elif etype == EventType.ROUND_STARTED:
             round_num = payload.get("round_number") or payload.get("round") or payload.get("wave")
@@ -518,6 +544,15 @@ class TerminalEventSink(EventSink):
                 except (ValueError, TypeError):
                     pass
             self._ensure_wave(self.state.current_wave)
+            usage = payload.get("budget_usage")
+            if isinstance(usage, dict):
+                self.state.budget_invocations = int(usage.get("invocations", self.state.budget_invocations) or 0)
+                self.state.budget_rounds = int(usage.get("rounds", self.state.budget_rounds) or 0)
+                self.state.runtime_seconds = float(usage.get("runtime_seconds", self.state.runtime_seconds) or 0.0)
+            budget = payload.get("budget")
+            if isinstance(budget, dict):
+                self.state.budget_max_invocations = int(budget.get("max_invocations", 0) or 0)
+                self.state.budget_max_rounds = int(budget.get("max_rounds", 0) or 0)
 
         elif etype == EventType.ROUND_COMPLETED:
             round_num = payload.get("round_number") or payload.get("round") or payload.get("wave")
@@ -528,21 +563,59 @@ class TerminalEventSink(EventSink):
                         self.state.waves[wn].status = "COMPLETED"
                 except (ValueError, TypeError):
                     pass
+            usage = payload.get("budget_usage")
+            if isinstance(usage, dict):
+                self.state.budget_invocations = int(
+                    usage.get("invocations", self.state.budget_invocations) or 0
+                )
+                self.state.budget_rounds = int(
+                    usage.get("rounds", self.state.budget_rounds) or 0
+                )
+                self.state.runtime_seconds = float(
+                    usage.get("runtime_seconds", self.state.runtime_seconds) or 0.0
+                )
+            budget = payload.get("budget")
+            if isinstance(budget, dict):
+                self.state.budget_max_invocations = int(budget.get("max_invocations", 0) or 0)
+                self.state.budget_max_rounds = int(budget.get("max_rounds", 0) or 0)
 
         elif etype in (EventType.ACTION_REQUESTED, EventType.ACTION_ACCEPTED):
             act = payload.get("action")
-            workers_list = payload.get("workers") or (getattr(act, "workers", []) if act else [])
+            if isinstance(act, dict):
+                workers_list = payload.get("workers") or act.get("workers", [])
+                auditors_list = payload.get("auditors") or act.get("auditors", [])
+                kind = act.get("kind", "")
+                reason = act.get("reason") or act.get("reason_summary") or ""
+            else:
+                workers_list = payload.get("workers") or (getattr(act, "workers", []) if act else [])
+                auditors_list = payload.get("auditors") or (getattr(act, "auditors", []) if act else [])
+                kind = payload.get("kind") or (getattr(act, "kind", "") if act else "")
+                reason = getattr(act, "reason", "") or getattr(act, "reason_summary", "") if act else ""
+            if hasattr(kind, "value"):
+                kind = kind.value
+            if kind:
+                self.state.current_action_kind = str(kind)
+            if reason:
+                self.state.action_reason = str(reason)[:500]
+
             for w in workers_list:
                 wid = w.get("worker_id") if isinstance(w, dict) else getattr(w, "worker_id", None)
                 wrole = w.get("role") if isinstance(w, dict) else getattr(w, "role", None)
                 if wid:
-                    self._ensure_worker(str(wid), wrole, self.state.current_wave)
+                    wp = self._ensure_worker(str(wid), wrole, self.state.current_wave)
+                    objective = w.get("objective", "") if isinstance(w, dict) else getattr(w, "objective", "")
+                    strategy = w.get("strategy", "") if isinstance(w, dict) else getattr(w, "strategy", "")
+                    wp.objective = str(objective or "")
+                    wp.strategy = strategy.value if hasattr(strategy, "value") else str(strategy or "")
 
-            auditors_list = payload.get("auditors") or (getattr(act, "auditors", []) if act else [])
             for a in auditors_list:
                 aid = a.get("worker_id") if isinstance(a, dict) else getattr(a, "worker_id", None)
                 if aid:
-                    self._ensure_worker(str(aid), WorkerRole.AUDITOR, self.state.current_wave)
+                    wp = self._ensure_worker(str(aid), WorkerRole.AUDITOR, self.state.current_wave)
+                    focus = a.get("focus", "") if isinstance(a, dict) else getattr(a, "focus", "")
+                    strategy = a.get("strategy", "") if isinstance(a, dict) else getattr(a, "strategy", "")
+                    wp.objective = str(focus or "")
+                    wp.strategy = strategy.value if hasattr(strategy, "value") else str(strategy or "")
 
         elif etype == EventType.ACTION_REJECTED:
             reason = payload.get("reason", "Action rejected")
@@ -557,8 +630,11 @@ class TerminalEventSink(EventSink):
             p_name = payload.get("profile_name") or payload.get("profile") or (getattr(lease, "profile_name", None) if lease else None)
             wid = payload.get("worker_id") or payload.get("worker") or (getattr(lease, "worker_id", None) if lease else None)
             if wid and p_name:
-                wp = self._ensure_worker(str(wid))
-                wp.profile_name = str(p_name)
+                if str(wid) == "coordinator":
+                    self.state.coordinator_profile = str(p_name)
+                else:
+                    wp = self._ensure_worker(str(wid))
+                    wp.profile_name = str(p_name)
 
         elif etype == EventType.INVOCATION_STARTED:
             inv = payload.get("invocation")
@@ -570,6 +646,10 @@ class TerminalEventSink(EventSink):
                 wp.started_at = payload.get("started_at") or event.timestamp
                 if "profile_name" in payload and payload["profile_name"]:
                     wp.profile_name = str(payload["profile_name"])
+                if payload.get("strategy"):
+                    wp.strategy = str(payload["strategy"])
+                if payload.get("objective") and not wp.objective:
+                    wp.objective = str(payload["objective"])
 
         elif etype == EventType.INVOCATION_COMPLETED:
             res = payload.get("result")
@@ -637,9 +717,25 @@ class TerminalEventSink(EventSink):
                     if st and et:
                         wp.duration_seconds = max(0.0, (et - st).total_seconds())
 
+        elif etype == EventType.INVOCATION_ACTIVITY:
+            wid = payload.get("worker_id")
+            if wid:
+                wp = self._ensure_worker(str(wid))
+                wp.current_activity = str(payload.get("activity", ""))[:120]
+
+        elif etype == EventType.ARTIFACT_WRITTEN:
+            artifact_path = str(payload.get("artifact_path", ""))
+            wid = payload.get("worker_id")
+            if artifact_path and artifact_path not in self.state.artifact_paths:
+                self.state.artifact_paths.append(artifact_path)
+            if wid:
+                wp = self._ensure_worker(str(wid), payload.get("role"))
+                wp.artifact_path = artifact_path or None
+
         elif etype == EventType.RUN_COMPLETED:
             self.state.run_status = RunStatus.COMPLETED.value
-            self.state.final_result = payload.get("summary") or payload.get("final_result")
+            self.state.final_result = payload.get("summary")
+            self.state.final_artifact_path = payload.get("final_artifact_path")
 
         elif etype == EventType.RUN_FAILED:
             self.state.run_status = RunStatus.FAILED.value
@@ -670,7 +766,22 @@ class TerminalEventSink(EventSink):
         lines.append(colorize(header, BOLD + CYAN, use_color))
         lines.append("")
 
-        # 2. Assessment
+        # 2. Run overview
+        if self.state.task:
+            lines.append(f"{'Task'.ljust(15)}{self.state.task[:100]}")
+        if self.state.mode:
+            lines.append(f"{'Mode'.ljust(15)}{self.state.mode}")
+        if self.state.complexity:
+            lines.append(f"{'Complexity'.ljust(15)}{self.state.complexity}")
+        if self.state.coordinator_profile or self.state.coordinator_strategy:
+            coord = " · ".join(v for v in [self.state.coordinator_profile, self.state.coordinator_strategy] if v)
+            lines.append(f"{'Coordinator'.ljust(15)}{coord}")
+        if self.state.budget_max_invocations is not None or self.state.budget_max_rounds is not None:
+            inv = f"{self.state.budget_invocations}/{self.state.budget_max_invocations or '?'} calls"
+            rnd = f"{self.state.budget_rounds}/{self.state.budget_max_rounds or '?'} rounds"
+            lines.append(f"{'Budget'.ljust(15)}{inv} · {rnd}")
+
+        # Assessment
         label_assessment = "Assessment".ljust(15)
         if self.state.assessment_done and self.state.complexity:
             icon = colorize(ICON_SUCCESS, GREEN, use_color)
@@ -701,6 +812,12 @@ class TerminalEventSink(EventSink):
             lines.append(f"{label_fleet}{icon} checking")
 
         lines.append("")
+        if self.state.current_action_kind:
+            lines.append(colorize("Coordinator", BOLD, use_color))
+            lines.append(f"  → {self.state.current_action_kind}")
+            if self.state.action_reason:
+                lines.append(f"  Reason: {self.state.action_reason}")
+            lines.append("")
 
         # 4. Waves
         for wave_num in sorted(self.state.waves.keys()):
@@ -758,6 +875,11 @@ class TerminalEventSink(EventSink):
                     line = f"  {name_col}{icon} {p_name}".rstrip()
 
                 lines.append(line)
+                detail = w.current_activity or w.objective
+                if detail and w.status in (WorkerStatus.RUNNING, WorkerStatus.PENDING):
+                    lines.append(f"    {detail[:100]}")
+                if w.artifact_path:
+                    lines.append(f"    Artifact: {w.artifact_path}")
                 if w.error_message:
                     for eline in w.error_message.splitlines():
                         eline = eline.strip()
@@ -766,9 +888,52 @@ class TerminalEventSink(EventSink):
 
             lines.append("")
 
+        if self.state.artifact_paths:
+            lines.append(colorize("Artifacts", BOLD, use_color))
+            for artifact_path in self.state.artifact_paths[-8:]:
+                lines.append(f"  {ICON_SUCCESS} {artifact_path}")
+            lines.append("")
+
+        if self.state.run_status not in {
+            RunStatus.COMPLETED.value,
+            RunStatus.FAILED.value,
+            RunStatus.INTERRUPTED.value,
+        }:
+            started = _parse_timestamp(self.state.started_at)
+            elapsed = self.state.runtime_seconds
+            if started is not None:
+                now = datetime.now(started.tzinfo) if started.tzinfo else datetime.now()
+                elapsed = max(elapsed, (now - started).total_seconds())
+            lines.append(f"Elapsed {format_duration(elapsed)}")
+            lines.append("")
+
         # Trailing run status if finished
         if self.state.run_status == RunStatus.COMPLETED.value:
-            lines.append(colorize("✓ Orchestration completed successfully.", GREEN + BOLD, use_color))
+            lines.append(colorize("✓ Orchestration completed", GREEN + BOLD, use_color))
+            if self.state.final_artifact_path:
+                lines.append("")
+                lines.append(f"Final: {self.state.final_artifact_path}")
+
+            succeeded = [
+                w for w in self.state.workers.values()
+                if w.status == WorkerStatus.SUCCEEDED and w.worker_id != "coordinator"
+            ]
+            audit_count = sum(1 for w in succeeded if str(w.role).upper() == WorkerRole.AUDITOR.value)
+            worker_count = len(succeeded) - audit_count
+            lines.extend([
+                "",
+                f"Rounds:       {self.state.budget_rounds}",
+                f"Workers:      {worker_count}",
+                f"Audits:       {audit_count}",
+                f"Invocations:  {self.state.budget_invocations}",
+                f"Runtime:      {format_duration(self.state.runtime_seconds)}",
+            ])
+            if self.state.run_id:
+                lines.extend([
+                    "",
+                    "Inspect:",
+                    f"  agym orchestrate inspect {self.state.run_id}",
+                ])
         elif self.state.run_status == RunStatus.FAILED.value:
             reason = f": {self.state.failure_reason}" if self.state.failure_reason else ""
             lines.append(colorize(f"✗ Orchestration FAILED{reason}", RED + BOLD, use_color))
@@ -838,16 +1003,26 @@ class TerminalEventSink(EventSink):
 
         if etype == EventType.ACTION_REQUESTED:
             act = payload.get("action")
-            kind = payload.get("kind") or (getattr(act, "kind", "") if act else "")
+            if isinstance(act, dict):
+                kind = payload.get("kind") or act.get("kind", "")
+                reason = act.get("reason") or act.get("reason_summary") or ""
+            else:
+                kind = payload.get("kind") or (getattr(act, "kind", "") if act else "")
+                reason = getattr(act, "reason", "") or getattr(act, "reason_summary", "") if act else ""
             if hasattr(kind, "value"):
                 kind = kind.value
-            return f"[action] requested {kind}".rstrip()
+            suffix = f" - {str(reason)[:120]}" if reason else ""
+            return f"[action] requested {kind}{suffix}".rstrip()
 
         if etype == EventType.ACTION_ACCEPTED:
             act = payload.get("action")
-            kind = payload.get("kind") or (getattr(act, "kind", "") if act else "")
+            if isinstance(act, dict):
+                kind = payload.get("kind") or act.get("kind", "")
+            else:
+                kind = payload.get("kind") or (getattr(act, "kind", "") if act else "")
             if hasattr(kind, "value"):
                 kind = kind.value
+            kind = kind or self.state.current_action_kind
             return f"[action] accepted {kind}".rstrip()
 
         if etype == EventType.ACTION_REJECTED:
@@ -858,6 +1033,8 @@ class TerminalEventSink(EventSink):
             lease = payload.get("lease")
             p_name = payload.get("profile_name") or payload.get("profile") or (getattr(lease, "profile_name", "") if lease else "")
             wid = payload.get("worker_id") or payload.get("worker") or (getattr(lease, "worker_id", "") if lease else "")
+            if str(wid) == "coordinator":
+                return None
             return f"[fleet] leased {p_name} for {wid}"
 
         if etype == EventType.PROFILE_RELEASED:
@@ -881,6 +1058,16 @@ class TerminalEventSink(EventSink):
             dur = payload.get("duration") or payload.get("duration_seconds")
             dur_info = f" ({int(round(float(dur)))}s)" if dur is not None else ""
             return f"[worker] {name} completed{dur_info}"
+
+        if etype == EventType.INVOCATION_ACTIVITY:
+            wid = str(payload.get("worker_id") or "")
+            name = self._resolve_worker_display_name(wid, None)
+            activity = str(payload.get("activity") or "")[:120]
+            return f"[worker] {name}: {activity}" if activity else None
+
+        if etype == EventType.ARTIFACT_WRITTEN:
+            path = str(payload.get("artifact_path") or "")
+            return f"[artifact] {path}" if path else None
 
         if etype == EventType.INVOCATION_FAILED:
             res = payload.get("result")
@@ -909,9 +1096,11 @@ class TerminalEventSink(EventSink):
             return f"[worker] {name} {tag}{err_info}"
 
         if etype == EventType.RUN_COMPLETED:
+            final_path = payload.get("final_artifact_path") or ""
+            if final_path:
+                return f"[run] completed - final: {final_path}"
             summary = payload.get("summary") or ""
-            s_info = f": {summary[:80]}" if summary else ""
-            return f"[run] completed{s_info}"
+            return f"[run] completed" + (f": {str(summary)[:80]}" if summary else "")
 
         if etype == EventType.RUN_FAILED:
             err = payload.get("error") or payload.get("reason") or ""

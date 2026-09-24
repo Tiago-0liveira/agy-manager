@@ -622,6 +622,26 @@ class OrchestrateCliTests(unittest.TestCase):
         self.assertIn("run not found: run-ghost", err.getvalue())
 
     @mock.patch("agym.cli.build_orchestration_dependencies")
+    def test_orchestrate_inspect(self, mock_build: mock.Mock) -> None:
+        mock_build.return_value = self.deps
+        self.mock_store.get_run.return_value = self.default_state
+        self.mock_store.get_results.return_value = []
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            code = cli.main(["orchestrate", "inspect", "run-test-1"])
+        self.assertEqual(code, 0)
+        self.assertIn("Run ID:        run-test-1", out.getvalue())
+
+    @mock.patch("agym.cli.build_orchestration_dependencies")
+    def test_orchestrate_depth_is_forwarded(self, mock_build: mock.Mock) -> None:
+        mock_build.return_value = self.deps
+        code = cli.main(["orchestrate", "Deep review", "--depth", "deep"])
+        self.assertEqual(code, 0)
+        self.assertEqual(mock_build.call_args.kwargs["depth"], "deep")
+        self.assertIsNone(mock_build.call_args.kwargs["coordinator_profile"])
+        self.assertIn("profile_store", mock_build.call_args.kwargs)
+
+    @mock.patch("agym.cli.build_orchestration_dependencies")
     def test_orchestrate_resume(self, mock_build: mock.Mock) -> None:
         mock_build.return_value = self.deps
         code = cli.main(["orchestrate", "resume", "run-test-1"])
@@ -651,7 +671,6 @@ class OrchestrateCliTests(unittest.TestCase):
             ["orchestrate", "invalid"],
             ["orchestrate", "unknown-subcommand", "foo"],
             ["orchestrate", "cancel", "run-123"],
-            ["orchestrate", "inspect", "run-123"],
             ["orchestrate", "foobar", "extra"],
         ]:
             err = io.StringIO()
@@ -667,6 +686,8 @@ class OrchestrateCliTests(unittest.TestCase):
             ["orchestrate", "status"],
             ["orchestrate", "status", ""],
             ["orchestrate", "status", "   "],
+            ["orchestrate", "inspect"],
+            ["orchestrate", "inspect", ""],
             ["orchestrate", "resume"],
             ["orchestrate", "resume", ""],
             ["orchestrate", "resume", "   "],
@@ -753,6 +774,8 @@ class OrchestrateCliTests(unittest.TestCase):
             self.assertIn("agym orchestrate", out.getvalue())
             self.assertIn("Usage:", out.getvalue())
             self.assertIn("status <run-id>", out.getvalue())
+            self.assertIn("inspect <run-id>", out.getvalue())
+            self.assertIn("--depth {quick,balanced,deep}", out.getvalue())
             self.assertIn("resume <run-id>", out.getvalue())
 
     @mock.patch("agym.cli.build_orchestration_dependencies")

@@ -587,23 +587,21 @@ class TestCoordinatorActionValidation(unittest.TestCase):
                 ],
             )
 
-    def test_run_executor_valid_read_only_and_mutating(self) -> None:
-        # Read-only executor
-        a1 = CoordinatorAction(
-            action_id=ActionId("act-exec-1"),
-            kind=ActionKind.RUN_EXECUTOR,
-            workers=[
-                WorkerRequest(
-                    worker_id=WorkerId("exec-1"),
-                    role=WorkerRole.EXECUTOR,
-                    workspace_mode=WorkspaceMode.READ_ONLY,
-                )
-            ],
-        )
-        self.assertEqual(len(a1.workers), 1)
+    def test_run_executor_requires_mutating_workspace(self) -> None:
+        with self.assertRaises(ValueError):
+            CoordinatorAction(
+                action_id=ActionId("act-exec-1"),
+                kind=ActionKind.RUN_EXECUTOR,
+                workers=[
+                    WorkerRequest(
+                        worker_id=WorkerId("exec-1"),
+                        role=WorkerRole.EXECUTOR,
+                        workspace_mode=WorkspaceMode.READ_ONLY,
+                    )
+                ],
+            )
 
-        # Mutating executor (single)
-        a2 = CoordinatorAction(
+        action = CoordinatorAction(
             action_id=ActionId("act-exec-2"),
             kind=ActionKind.RUN_EXECUTOR,
             workers=[
@@ -614,7 +612,7 @@ class TestCoordinatorActionValidation(unittest.TestCase):
                 )
             ],
         )
-        self.assertEqual(a2.workers[0].workspace_mode, WorkspaceMode.MUTATING)
+        self.assertEqual(action.workers[0].workspace_mode, WorkspaceMode.MUTATING)
 
     def test_run_executor_multiple_workers_fails(self) -> None:
         # At most one mutating executor / worker allowed

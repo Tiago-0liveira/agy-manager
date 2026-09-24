@@ -184,7 +184,7 @@ class _RunnerSessionAdapter:
         *,
         run_id: RunId,
         profile_name: str | None = None,
-        strategy: ExecutionStrategy = ExecutionStrategy.STANDARD,
+        strategy: ExecutionStrategy = ExecutionStrategy.HIGH_EFFORT,
         timeout_seconds: float = 300.0,
         conversation_id: ConversationId | str | None = None,
     ) -> None:
@@ -246,7 +246,7 @@ class CoordinatorClient:
         run_store: RunStore | None = None,
         run_id: RunId | str | None = None,
         profile_name: str | None = None,
-        strategy: ExecutionStrategy = ExecutionStrategy.STANDARD,
+        strategy: ExecutionStrategy = ExecutionStrategy.HIGH_EFFORT,
         timeout_seconds: float = 300.0,
         max_correction_attempts: int = 2,
     ) -> None:

@@ -530,6 +530,11 @@ class FileRunStore:
             (stage_dir / "outputs").mkdir(parents=True, exist_ok=True)
             _chmod_private_dir(stage_dir / "outputs")
 
+            (stage_dir / "artifacts").mkdir(parents=True, exist_ok=True)
+            _chmod_private_dir(stage_dir / "artifacts")
+            (stage_dir / "deliverables").mkdir(parents=True, exist_ok=True)
+            _chmod_private_dir(stage_dir / "deliverables")
+
             atomic_write_text(stage_dir / "task.txt", task)
             atomic_write_json(stage_dir / "run.json", state.to_dict())
 
@@ -858,6 +863,8 @@ class FileRunStore:
                 "invocation_id": str(iid),
                 "worker_id": str(wid),
                 "role": role.value,
+                "strategy": strategy.value,
+                "objective": prompt[:300],
             },
         )
         self.emit(event)
@@ -960,6 +967,8 @@ class FileRunStore:
             payload={
                 "invocation_id": str(iid),
                 "worker_id": str(record.worker_id),
+                "role": record.role.value,
+                "strategy": record.strategy.value,
                 "status": InvocationStatus.SUCCEEDED.value,
             },
         )
@@ -1395,11 +1404,19 @@ class FileRunStore:
         }
         atomic_write_json(self.run_dir(rid) / "final.json", final_data)
 
+        deliverables_dir = self.run_dir(rid) / "deliverables"
+        deliverables_dir.mkdir(parents=True, exist_ok=True)
+        _chmod_private_dir(deliverables_dir)
+        final_md = deliverables_dir / "final.md"
+        final_text = json.dumps(final_result, indent=2) if isinstance(final_result, dict) else str(final_result)
+        atomic_write_text(final_md, final_text.rstrip() + "\n")
+
         state.status = status_enum
         state.final_result = (
             json.dumps(final_result) if isinstance(final_result, dict) else str(final_result)
         )
         state.updated_at = now
+        state.final_artifact_path = str(final_md)
         self.save_run(state)
 
         # Emit RUN_COMPLETED event
@@ -1412,6 +1429,7 @@ class FileRunStore:
                 "completed_at": now,
                 "final_result": state.final_result,
                 "summary": str(final_result)[:200],
+                "final_artifact_path": str(final_md),
             },
         )
         self.emit(event)

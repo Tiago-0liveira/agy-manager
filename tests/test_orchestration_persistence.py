@@ -147,6 +147,8 @@ class TestRunCreationAndLayout(TestPersistenceBase):
         self.assertTrue((run_dir / "events.jsonl").is_file())
         self.assertTrue((run_dir / "invocations").is_dir())
         self.assertTrue((run_dir / "outputs").is_dir())
+        self.assertTrue((run_dir / "artifacts").is_dir())
+        self.assertTrue((run_dir / "deliverables").is_dir())
 
         # Verify task.txt contents
         self.assertEqual((run_dir / "task.txt").read_text(encoding="utf-8"), task_text)
@@ -579,6 +581,11 @@ class TestInterruptedAndCompletedState(TestPersistenceBase):
             fdata = json.load(f)
         self.assertEqual(fdata["status"], "COMPLETED")
         self.assertEqual(fdata["final_result"]["summary"], final_data["summary"])
+
+        final_md = self.store.run_dir(run_id) / "deliverables" / "final.md"
+        self.assertTrue(final_md.is_file())
+        self.assertEqual(completed_state.final_artifact_path, str(final_md))
+        self.assertIn("Full orchestration plan implemented and validated", final_md.read_text(encoding="utf-8"))
 
         # Check RUN_COMPLETED event
         events = self.store.get_events(run_id)

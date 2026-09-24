@@ -126,7 +126,7 @@ class TestRunnerArgvAndEnvironment(unittest.TestCase):
             prompt="Hello world",
         )
         argv = self.runner.build_argv(inv)
-        self.assertIn("/usr/local/bin/agy", argv[0])
+        self.assertEqual(Path(argv[0]), Path("/usr/local/bin/agy"))
         self.assertIn("--effort", argv)
         idx = argv.index("--effort")
         self.assertEqual(argv[idx + 1], "medium")

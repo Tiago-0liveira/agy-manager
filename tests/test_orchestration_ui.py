@@ -409,13 +409,15 @@ class TestTTYModeRendering(unittest.TestCase):
         # Line-by-line verification
         self.assertEqual(lines[0], "AGYM Orchestrator · RUN-ID")
         self.assertEqual(lines[1], "")
-        self.assertEqual(lines[2], "Assessment     ✓ LARGE")
-        self.assertEqual(lines[3], "Fleet          ✓ 8 available")
-        self.assertEqual(lines[4], "")
-        self.assertEqual(lines[5], "Wave 1")
-        self.assertEqual(lines[6], "  architect    ✓ AI3   42s")
-        self.assertEqual(lines[7], "  testing      ⠹ AI7")
-        self.assertEqual(lines[8], "  alternative  ✓ AI2   31s")
+        self.assertEqual(lines[2], "Task           Orchestration demo")
+        self.assertEqual(lines[3], "Complexity     LARGE")
+        self.assertEqual(lines[4], "Assessment     ✓ LARGE")
+        self.assertEqual(lines[5], "Fleet          ✓ 8 available")
+        self.assertEqual(lines[6], "")
+        self.assertEqual(lines[7], "Wave 1")
+        self.assertEqual(lines[8], "  architect    ✓ AI3   42s")
+        self.assertEqual(lines[9], "  testing      ⠹ AI7")
+        self.assertEqual(lines[10], "  alternative  ✓ AI2   31s")
 
     def test_assessment_pending_and_failed_states(self) -> None:
         sink = TerminalEventSink(stream=io.StringIO(), is_tty=False, use_color=False, run_id="run-pending")

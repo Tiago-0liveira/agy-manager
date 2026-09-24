@@ -58,7 +58,7 @@ from agym.orchestration.strategies import (
 )
 from agym.profiles import Profile, ProfileError, ProfileNotFound, ProfileStore
 from agym.orchestration.recording import current_attempt
-from agym.orchestration.streaming import decode_response
+from agym.orchestration.streaming import decode_response, extract_activity_description
 from agym.orchestration.locking import FileLock
 from agym.orchestration.prompts import redact_profile_identities
 from agym.wincred import (
@@ -175,11 +175,17 @@ def kill_process_tree(
     if not isinstance(pid, int) or pid <= 0:
         return
 
-    if is_windows_platform():
+    # Process semantics must follow the actual OS, independently of whether
+    # Windows credential integration is disabled for tests/headless use.
+    if os.name == "nt":
         try:
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, check=False)
         except Exception:
-            pass
+            try:
+                if hasattr(proc, "kill") and callable(proc.kill):
+                    proc.kill()
+            except Exception:
+                pass
     else:
         try:
             pgid = os.getpgid(pid)
@@ -215,6 +221,7 @@ class AntigravityRunner:
 
         self._profile_store = profile_store or ProfileStore()
         self._base_env = dict(base_env) if base_env else None
+        self._activity_callback: Callable[[RunId, InvocationId, str, str], None] | None = None
 
         # Instance-scoped process tracking: run_id -> {invocation_id -> Process}
         self._active_processes: dict[RunId, dict[InvocationId, asyncio.subprocess.Process]] = {}
@@ -223,6 +230,29 @@ class AntigravityRunner:
     @property
     def agy_path(self) -> Path:
         return self._agy_path
+
+    def set_activity_callback(
+        self,
+        callback: Callable[[RunId, InvocationId, str, str], None] | None,
+    ) -> None:
+        """Register a safe stream activity callback used by the orchestration UI."""
+        self._activity_callback = callback
+
+    def _emit_activity_line(self, invocation: ModelInvocation | None, line: str) -> None:
+        if invocation is None or self._activity_callback is None:
+            return
+        activity = extract_activity_description(line)
+        if not activity:
+            return
+        try:
+            self._activity_callback(
+                invocation.run_id,
+                invocation.invocation_id,
+                str(invocation.worker_id),
+                activity,
+            )
+        except Exception:
+            logger.debug("Activity callback failed", exc_info=True)
 
     # =========================================================================
     # Process management and cancellation (scoped per run)
@@ -270,7 +300,7 @@ class AntigravityRunner:
 
         for proc in procs:
             if getattr(proc, "returncode", None) is None:
-                kill_process_tree(proc, signal.SIGKILL)
+                kill_process_tree(proc, getattr(signal, "SIGKILL", signal.SIGTERM))
                 try:
                     if hasattr(proc, "kill") and callable(proc.kill):
                         proc.kill()
@@ -400,20 +430,42 @@ class AntigravityRunner:
         else:
             return asyncio.run(self.run_async(invocation, profile_name))
 
-    async def _collect_output(self, proc: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
+    async def _collect_output(
+        self,
+        proc: asyncio.subprocess.Process,
+        invocation: ModelInvocation | None = None,
+    ) -> tuple[bytes, bytes]:
         capture = current_attempt.get()
-        if capture is None:
+        if capture is None and self._activity_callback is None:
             return await proc.communicate()
 
         async def drain(reader: asyncio.StreamReader, stream: str) -> bytes:
-            chunks = []
+            chunks: list[bytes] = []
+            pending = b""
             while chunk := await reader.read(65536):
-                capture.write(stream, chunk)
+                if capture is not None:
+                    capture.write(stream, chunk)
                 chunks.append(chunk)
+                if stream == "stdout" and self._activity_callback is not None:
+                    pending += chunk
+                    lines = pending.split(b"\n")
+                    pending = lines.pop()
+                    for raw_line in lines:
+                        self._emit_activity_line(
+                            invocation,
+                            raw_line.decode("utf-8", errors="replace"),
+                        )
+            if stream == "stdout" and pending and self._activity_callback is not None:
+                self._emit_activity_line(
+                    invocation,
+                    pending.decode("utf-8", errors="replace"),
+                )
             return b"".join(chunks)
 
-        tasks = [asyncio.create_task(drain(proc.stdout, "stdout")),
-                 asyncio.create_task(drain(proc.stderr, "stderr"))]
+        tasks = [
+            asyncio.create_task(drain(proc.stdout, "stdout")),
+            asyncio.create_task(drain(proc.stderr, "stderr")),
+        ]
         try:
             stdout, stderr = await asyncio.gather(*tasks)
             await proc.wait()
@@ -493,10 +545,10 @@ class AntigravityRunner:
         # Async subprocess execution
         proc: asyncio.subprocess.Process | None = None
         popen_kwargs: dict[str, Any] = {}
-        if not is_windows_platform():
-            popen_kwargs["start_new_session"] = True
-        else:
+        if os.name == "nt":
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
 
         try:
             if is_windows_platform() and profile is not None:
@@ -527,7 +579,7 @@ class AntigravityRunner:
                              output_format="stream-json")
 
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                self._collect_output(proc),
+                self._collect_output(proc, invocation),
                 timeout=invocation.timeout_seconds,
             )
         except asyncio.TimeoutError:
@@ -883,10 +935,10 @@ class AntigravitySession:
             cmd = [str(self._agy_path), *op_args]
 
         popen_kwargs: dict[str, Any] = {}
-        if not is_windows_platform():
-            popen_kwargs["start_new_session"] = True
-        else:
+        if os.name == "nt":
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
 
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,

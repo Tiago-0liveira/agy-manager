@@ -101,3 +101,53 @@ def decode_response(stream: str) -> tuple[str, str | None, dict[str, Any] | None
 
     text = response if isinstance(response, str) else json.dumps(response)
     return text, conversation_id, usage
+
+
+
+def extract_activity_description(line: str, *, max_length: int = 120) -> str | None:
+    """Extract a short, safe lifecycle description from one stream-json line.
+
+    Unknown provider events intentionally return None and remain available in
+    the raw attempt trace instead of polluting the main TTY.
+    """
+    try:
+        event = json.loads(line.strip())
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(event, dict):
+        return None
+
+    kind = str(event.get("event") or event.get("step_type") or event.get("type") or "").lower()
+    if kind in {"result", "turn_complete", "response", "error"}:
+        return None
+
+    update = event.get("step_update") if isinstance(event.get("step_update"), dict) else event
+    if not isinstance(update, dict):
+        return None
+
+    candidates: list[str] = []
+    for key in ("activity", "summary", "message", "title", "description"):
+        value = update.get(key)
+        if isinstance(value, str) and value.strip():
+            candidates.append(value.strip())
+
+    tool = update.get("tool_info")
+    if isinstance(tool, dict):
+        tool_name = str(tool.get("display_name") or tool.get("name") or tool.get("action") or "").strip()
+        target = str(
+            tool.get("path")
+            or tool.get("file")
+            or tool.get("query")
+            or tool.get("target")
+            or ""
+        ).strip()
+        if tool_name:
+            candidates.insert(0, f"{tool_name} {target}".strip())
+
+    if not candidates:
+        return None
+
+    activity = " ".join(candidates[0].split())
+    if not activity:
+        return None
+    return activity[:max_length]

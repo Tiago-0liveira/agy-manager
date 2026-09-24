@@ -453,17 +453,21 @@ def build_doctor_parser() -> argparse.ArgumentParser:
 ORCHESTRATE_USAGE = """agym orchestrate — Multi-agent orchestration for Google Antigravity CLI
 
 Usage:
-  agym orchestrate "<task>" [--mode plan|implement] [--dry-run]
+  agym orchestrate "<task>" [--mode plan|implement] [--depth quick|balanced|deep] [--dry-run]
   agym orchestrate status <run-id>
+  agym orchestrate inspect <run-id>
   agym orchestrate resume <run-id>
 
 Options:
   --mode {plan,implement}   Operating mode: plan (default) or implement
+  --depth {quick,balanced,deep}
+                            Maximum orchestration budget preset (default: balanced)
   -n, --dry-run             Preview execution plan without worker execution
   -h, --help                Show this help message and exit
 
 Commands:
-  status <run-id>           Display status of a run from persisted state
+  status <run-id>           Display concise status from persisted state
+  inspect <run-id>          Inspect run state, results, and artifact locations
   resume <run-id>           Resume an interrupted or failed run
 """
 
@@ -1134,10 +1138,13 @@ def _format_run_status(state: RunState, results: Sequence[Any] | None = None) ->
             lines.append(f"  - [{wid}] {r_val}: {st_val}")
             if getattr(r, "error", None):
                 lines.append(f"    Error: {r.error}")
-    if state.final_result:
-        lines.append("")
-        lines.append("Final Result:")
-        lines.append(state.final_result)
+    if state.final_artifact_path:
+        lines.append(f"Final:         {state.final_artifact_path}")
+    elif state.final_result:
+        summary = " ".join(state.final_result.split())
+        if len(summary) > 200:
+            summary = summary[:197] + "..."
+        lines.append(f"Final summary: {summary}")
     return "\n".join(lines)
 
 
@@ -1157,13 +1164,13 @@ def _orchestrate(
 
     subcommand = argv[0]
 
-    # Subcommand: status
-    if subcommand == "status":
+    # Subcommands: status / inspect
+    if subcommand in {"status", "inspect"}:
         if len(argv) < 2 or not argv[1].strip():
-            _print_err("missing run ID for status")
+            _print_err(f"missing run ID for {subcommand}")
             return 2
         if len(argv) > 2:
-            _print_err("status takes exactly one run ID")
+            _print_err(f"{subcommand} takes exactly one run ID")
             return 2
         run_id = argv[1].strip()
         d = deps or build_orchestration_dependencies(profile_store=store)
@@ -1205,12 +1212,11 @@ def _orchestrate(
             return 1
 
     # Check for unrecognized subcommand
-    KNOWN_SUBCOMMANDS = {"status", "resume", "run"}
+    KNOWN_SUBCOMMANDS = {"status", "inspect", "resume", "run"}
     UNKNOWN_SUBCOMMANDS = {
         "cancel",
         "stop",
         "kill",
-        "inspect",
         "info",
         "show",
         "list",
@@ -1246,6 +1252,13 @@ def _orchestrate(
         choices=["plan", "implement"],
         type=str.lower,
     )
+    parser.add_argument(
+        "--depth",
+        dest="depth",
+        default="balanced",
+        choices=["quick", "balanced", "deep"],
+        type=str.lower,
+    )
     parser.add_argument("-n", "--dry-run", dest="dry_run", action="store_true")
     parser.add_argument("--profile", dest="profile", default=None, help="Profile to use for the coordinator")
 
@@ -1260,7 +1273,11 @@ def _orchestrate(
 
     task = ns.task.strip()
     run_mode = RunMode.IMPLEMENT if ns.mode == "implement" else RunMode.PLAN
-    d = deps or build_orchestration_dependencies(profile_store=store, coordinator_profile=ns.profile)
+    d = deps or build_orchestration_dependencies(
+        profile_store=store,
+        coordinator_profile=ns.profile,
+        depth=ns.depth,
+    )
 
     if ns.dry_run:
         try:

@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Collection, Sequence
 
 from agym.orchestration.locking import FileLock, LockTimeoutError
+from agym.orchestration.artifacts import ArtifactWriter
 
 from agym.orchestration.recording import capture_attempt
 from agym.orchestration.contracts import (
@@ -57,6 +58,7 @@ from agym.orchestration.contracts import (
     ProfileLease,
     ProfileLeaseManager,
     ProfileScheduler,
+    QualityState,
     RunId,
     RunMode,
     RunState,
@@ -380,6 +382,12 @@ class OrchestrationEngine:
 
         self.coordinator = coordinator
         self.default_budget = default_budget or OrchestrationBudget()
+        self.artifact_writer = ArtifactWriter(self.store)
+        if hasattr(self.runner, "set_activity_callback"):
+            try:
+                self.runner.set_activity_callback(self._on_runner_activity)
+            except Exception:
+                logger.debug("Runner does not accept activity callback", exc_info=True)
 
         # Per-run active registries (Do not use global process tracking)
         self._active_tasks: dict[RunId, dict[InvocationId, asyncio.Task[Any]]] = {}
@@ -432,16 +440,194 @@ class OrchestrationEngine:
                 logger.warning("Failed to emit event %s for run %s: %s", event_type, run_id, exc)
         return evt
 
+    def _on_runner_activity(
+        self,
+        run_id: RunId,
+        invocation_id: InvocationId,
+        worker_id: str,
+        activity: str,
+    ) -> None:
+        if worker_id == "coordinator":
+            return
+        self._emit_event(
+            EventType.INVOCATION_ACTIVITY,
+            run_id,
+            {
+                "invocation_id": str(invocation_id),
+                "worker_id": worker_id,
+                "activity": activity[:120],
+            },
+        )
+
     # ========================================================================
     # Action & Budget Validation
     # ========================================================================
 
-    def _check_finalization(self, state: RunState) -> None:
-        """Do not report success when delegated work produced no successful result."""
-        results = [r for r in self.store.get_results(state.run_id) if isinstance(r, WorkerResult)]
-        if results and not any(r.status == InvocationStatus.SUCCEEDED for r in results):
-            details = "; ".join(f"{r.worker_id}: {r.error or r.status.value}" for r in results)
-            raise EngineError(f"No workers succeeded. {details}")
+    @staticmethod
+    def _quality_tier(state: RunState) -> str:
+        # Historical/interrupted runs may predate persisted assessment state.
+        # Do not silently upgrade those runs to MEDIUM quality requirements.
+        if state.assessment is None:
+            return "LOW"
+        complexity = state.assessment.complexity
+        if complexity in (ComplexityLevel.TRIVIAL, ComplexityLevel.SMALL):
+            return "LOW"
+        if complexity == ComplexityLevel.MEDIUM:
+            return "MEDIUM"
+        return "HIGH"
+
+    def _check_finalization(self, state: RunState) -> list[str]:
+        """Return deterministic missing quality requirements for FINALIZE."""
+        q = state.quality_state
+        tier = self._quality_tier(state)
+        missing: list[str] = []
+
+        results = list(self.store.get_results(state.run_id))
+        successful_workers = [
+            r for r in results
+            if isinstance(r, WorkerResult)
+            and r.status == InvocationStatus.SUCCEEDED
+            and r.role not in (WorkerRole.SYNTHESIZER, WorkerRole.EXECUTOR)
+        ]
+        attempted_workers = [r for r in results if isinstance(r, WorkerResult)]
+
+        if attempted_workers and not any(r.status == InvocationStatus.SUCCEEDED for r in attempted_workers):
+            missing.append("No workers succeeded after delegation")
+
+        if tier == "LOW":
+            # Direct completion is allowed for genuinely self-contained low-complexity tasks.
+            if attempted_workers and not successful_workers and not q.executor_completed:
+                missing.append("at least one successful worker is required after delegation")
+        elif tier == "MEDIUM":
+            if q.independent_perspectives < 2:
+                missing.append("at least 2 independent worker perspectives are required")
+            if q.synthesis_completed < 1:
+                missing.append("a synthesis is required")
+        else:
+            if q.independent_perspectives < 3:
+                missing.append("at least 3 independent worker perspectives are required")
+            if q.audits_completed < 1:
+                missing.append("at least 1 independent audit is required")
+            if q.synthesis_completed < 1:
+                missing.append("at least 1 synthesis is required")
+            if q.final_critique_completed < 1:
+                missing.append("the synthesis has not been independently critiqued")
+            if q.disagreements:
+                missing.append(f"{len(q.disagreements)} high-priority disagreement(s) remain unresolved")
+
+        if q.open_critical_findings:
+            missing.append(f"{len(q.open_critical_findings)} critical finding(s) remain unresolved")
+
+        if state.mode == RunMode.IMPLEMENT and state.assessment and state.assessment.mutation_required:
+            if not q.executor_completed:
+                missing.append("implementation has not been executed successfully")
+            if tier in ("MEDIUM", "HIGH") and q.post_implementation_verifications < 1:
+                missing.append("independent post-implementation verification is required")
+            if tier == "HIGH" and q.implementation_audits_completed < 1:
+                missing.append("a post-implementation audit is required")
+
+        return missing
+
+    def _check_executor_readiness(self, state: RunState) -> list[str]:
+        """Require an independently reasoned plan before mutation begins."""
+        q = state.quality_state
+        tier = self._quality_tier(state)
+        missing: list[str] = []
+        if q.open_critical_findings:
+            missing.append("critical findings must be resolved before mutation")
+        if tier == "MEDIUM":
+            if q.independent_perspectives < 2:
+                missing.append("2 independent planning perspectives are required before execution")
+            if q.synthesis_completed < 1:
+                missing.append("an approved synthesized plan is required before execution")
+        elif tier == "HIGH":
+            if q.independent_perspectives < 3:
+                missing.append("3 independent planning perspectives are required before execution")
+            if q.audits_completed < 1:
+                missing.append("the plan must be independently audited before execution")
+            if q.synthesis_completed < 1:
+                missing.append("an approved synthesized plan is required before execution")
+            if q.disagreements:
+                missing.append("high-priority planning disagreements must be resolved before execution")
+        return missing
+
+    @staticmethod
+    def _apply_quality_update(state: RunState, action: CoordinatorAction) -> None:
+        state.quality_state.apply_coordinator_update(action.quality_update)
+
+    def _record_quality_evidence(
+        self,
+        state: RunState,
+        action: CoordinatorAction,
+        completed: Sequence[WorkerResult | AuditResult],
+    ) -> None:
+        """Derive mechanical quality evidence solely from successful executed actions."""
+        q = state.quality_state
+        successful = [r for r in completed if r.status == InvocationStatus.SUCCEEDED]
+
+        if action.kind == ActionKind.RUN_WORKERS:
+            for result in successful:
+                if not isinstance(result, WorkerResult):
+                    continue
+                wid = str(result.worker_id)
+                if wid not in q.independent_worker_ids:
+                    q.independent_worker_ids.append(wid)
+            q.independent_perspectives = len(q.independent_worker_ids)
+
+            # Once implementation has mutated the workspace, non-mutating workers
+            # are independent verification evidence for the latest mutation.
+            if state.mode == RunMode.IMPLEMENT and q.executor_completed:
+                for result in successful:
+                    if not isinstance(result, WorkerResult):
+                        continue
+                    wid = str(result.worker_id)
+                    if wid != q.last_executor_worker_id and wid not in q.verification_worker_ids:
+                        q.verification_worker_ids.append(wid)
+                q.post_implementation_verifications = len(q.verification_worker_ids)
+
+        elif action.kind == ActionKind.RUN_AUDITORS:
+            synthesis_targets = set(q.synthesis_worker_ids)
+            for result in successful:
+                wid = str(result.worker_id)
+                if wid not in q.audit_worker_ids:
+                    q.audit_worker_ids.append(wid)
+
+                req = next((a for a in action.auditors if str(a.worker_id) == wid), None)
+                targets = {str(t) for t in req.target_worker_ids} if req else set()
+                if targets & synthesis_targets and wid not in q.synthesis_critique_worker_ids:
+                    q.synthesis_critique_worker_ids.append(wid)
+                if state.mode == RunMode.IMPLEMENT and q.executor_completed:
+                    implementation_targets = {
+                        value for value in [q.last_executor_worker_id, *q.verification_worker_ids] if value
+                    }
+                    if targets & implementation_targets and wid not in q.implementation_audit_worker_ids:
+                        q.implementation_audit_worker_ids.append(wid)
+
+            q.audits_completed = len(q.audit_worker_ids)
+            q.final_critique_completed = len(q.synthesis_critique_worker_ids)
+            q.implementation_audits_completed = len(q.implementation_audit_worker_ids)
+
+        elif action.kind == ActionKind.RUN_SYNTHESIS:
+            for result in successful:
+                wid = str(result.worker_id)
+                if wid not in q.synthesis_worker_ids:
+                    q.synthesis_worker_ids.append(wid)
+            q.synthesis_completed = len(q.synthesis_worker_ids)
+
+        elif action.kind == ActionKind.RUN_EXECUTOR:
+            successful_executors = [
+                r for r in successful
+                if isinstance(r, WorkerResult) and r.role == WorkerRole.EXECUTOR
+            ]
+            if successful_executors:
+                latest = successful_executors[-1]
+                q.executor_completed = True
+                q.last_executor_worker_id = str(latest.worker_id)
+                # Any mutation invalidates verification evidence from the previous workspace state.
+                q.verification_worker_ids = []
+                q.post_implementation_verifications = 0
+                q.implementation_audit_worker_ids = []
+                q.implementation_audits_completed = 0
 
     def _validate_action(
         self,
@@ -474,6 +660,11 @@ class OrchestrationEngine:
                 # Executor safety: exactly one mutating worker, role EXECUTOR
                 if len(action.workers) != 1 or action.workers[0].role != WorkerRole.EXECUTOR:
                     return False, "RUN_EXECUTOR action must contain exactly one worker with EXECUTOR role"
+                if action.workers[0].workspace_mode != WorkspaceMode.MUTATING:
+                    return False, "RUN_EXECUTOR worker must use MUTATING workspace mode"
+                readiness = self._check_executor_readiness(state)
+                if readiness:
+                    return False, "RUN_EXECUTOR rejected: " + "; ".join(readiness)
 
         # 3. Finalize action does not require worker budget checks
         if action.kind == ActionKind.FINALIZE:
@@ -557,6 +748,71 @@ class OrchestrationEngine:
             )
 
         return True, None
+
+    def _write_action_artifacts(
+        self,
+        action: CoordinatorAction,
+        state: RunState,
+        completed: Sequence[WorkerResult | AuditResult],
+    ) -> None:
+        """Mirror successful action outputs as human-readable Markdown artifacts."""
+        successful = [r for r in completed if r.status == InvocationStatus.SUCCEEDED]
+        if not successful:
+            return
+
+        request_by_id: dict[str, WorkerRequest | AuditRequest] = {
+            str(req.worker_id): req for req in [*action.workers, *action.auditors]
+        }
+        synthesis_targets = set(state.quality_state.synthesis_worker_ids)
+        next_synthesis = state.quality_state.synthesis_completed + 1
+        next_critique = state.quality_state.final_critique_completed + 1
+
+        for result in successful:
+            request = request_by_id.get(str(result.worker_id))
+            synthesis_version: int | None = None
+            critique_version: int | None = None
+
+            if action.kind == ActionKind.RUN_SYNTHESIS:
+                synthesis_version = next_synthesis
+                next_synthesis += 1
+            elif action.kind == ActionKind.RUN_AUDITORS and isinstance(request, AuditRequest):
+                targets = {str(t) for t in request.target_worker_ids}
+                if targets & synthesis_targets:
+                    critique_version = next_critique
+                    next_critique += 1
+
+            try:
+                path = self.artifact_writer.write_result(
+                    state.run_id,
+                    result,
+                    request,
+                    round_number=state.round_number + 1,
+                    synthesis_version=synthesis_version,
+                    critique_version=critique_version,
+                )
+            except Exception as exc:
+                logger.warning("Failed to write artifact for %s: %s", result.worker_id, exc)
+                continue
+
+            try:
+                relative = path.relative_to(Path(self.store.run_dir(state.run_id)).resolve())
+                artifact_path = str(relative)
+            except Exception:
+                artifact_path = str(path)
+            self._emit_event(
+                EventType.ARTIFACT_WRITTEN,
+                state.run_id,
+                {
+                    "worker_id": str(result.worker_id),
+                    "role": (
+                        WorkerRole.AUDITOR.value
+                        if isinstance(result, AuditResult)
+                        else result.role.value
+                    ),
+                    "round_number": state.round_number + 1,
+                    "artifact_path": artifact_path,
+                },
+            )
 
     # ========================================================================
     # Resource Cleanup & Interruption
@@ -704,6 +960,7 @@ class OrchestrationEngine:
             ),
             fleet_view=fleet_view,
             round_number=state.round_number,
+            quality_state=QualityState.from_dict(state.quality_state.to_dict()),
         )
 
     # ========================================================================
@@ -1403,7 +1660,21 @@ class OrchestrationEngine:
             state.assessment = assessment
             if hasattr(self.store, "save_assessment"):
                 self.store.save_assessment(state.run_id, assessment)
-            self._emit_event(EventType.TASK_ASSESSED, state.run_id, {"assessment": assessment.to_dict()})
+            self._emit_event(
+                EventType.TASK_ASSESSED,
+                state.run_id,
+                {
+                    "assessment": assessment.to_dict(),
+                    "budget": state.budget.to_dict(),
+                    "budget_usage": state.budget_usage.to_dict(),
+                    "fleet_view": fleet_view.to_dict(),
+                    "coordinator_profile": getattr(coord, "profile_name", None),
+                    "coordinator_strategy": (
+                        getattr(getattr(coord, "strategy", None), "value", None)
+                        or str(getattr(coord, "strategy", ExecutionStrategy.HIGH_EFFORT))
+                    ),
+                },
+            )
             self.store.save_run(state)
 
             if hasattr(coord, "conversation_id") and getattr(coord, "conversation_id") is not None:
@@ -1440,7 +1711,11 @@ class OrchestrationEngine:
                     self._emit_event(
                         EventType.ROUND_STARTED,
                         state.run_id,
-                        {"round_number": state.round_number},
+                        {
+                            "round_number": state.round_number,
+                            "budget": state.budget.to_dict(),
+                            "budget_usage": state.budget_usage.to_dict(),
+                        },
                     )
                     emitted_rounds.add(state.round_number)
 
@@ -1496,6 +1771,8 @@ class OrchestrationEngine:
                         action = None
                         continue
 
+                self._apply_quality_update(state, action)
+                self.store.save_run(state)
                 self._emit_event(
                     EventType.ACTION_REQUESTED,
                     state.run_id,
@@ -1504,19 +1781,55 @@ class OrchestrationEngine:
 
                 # Step 12 & Step 17: Check FINALIZE
                 if action.kind == ActionKind.FINALIZE:
-                    self._check_finalization(state)
+                    missing = self._check_finalization(state)
+                    if missing:
+                        consecutive_rejections += 1
+                        reason = "FINALIZE rejected:\n- " + "\n- ".join(missing)
+                        self._emit_event(
+                            EventType.ACTION_REJECTED,
+                            state.run_id,
+                            {"action_id": str(action.action_id), "reason": reason},
+                        )
+                        if consecutive_rejections >= state.budget.max_consecutive_rejections:
+                            raise ActionRejectedError(
+                                f"Coordinator exceeded maximum consecutive rejected actions limit "
+                                f"({state.budget.max_consecutive_rejections}): {reason}"
+                            )
+                        observation = self._build_observation(
+                            state, completed=[], failed=[], rejected=[]
+                        )
+                        observation.finalization_rejection = list(missing)
+                        action = None
+                        continue
+
+                    consecutive_rejections = 0
                     self._emit_event(EventType.ACTION_ACCEPTED, state.run_id, {"action_id": str(action.action_id)})
                     state.status = RunStatus.COMPLETED
                     state.final_result = action.final_response
                     state.updated_at = datetime.now(timezone.utc).isoformat()
                     if hasattr(self.store, "finalize_run") and callable(self.store.finalize_run):
-                        self.store.finalize_run(state.run_id, state.final_result or "", status=RunStatus.COMPLETED)
+                        finalized = self.store.finalize_run(
+                            state.run_id, state.final_result or "", status=RunStatus.COMPLETED
+                        )
+                        state = finalized
                     else:
+                        try:
+                            final_path = self.artifact_writer._write(
+                                state.run_id,
+                                Path("deliverables") / "final.md",
+                                (state.final_result or "").rstrip() + "\n",
+                            )
+                            state.final_artifact_path = str(final_path)
+                        except Exception:
+                            pass
                         self.store.save_run(state)
                         self._emit_event(
                             EventType.RUN_COMPLETED,
                             state.run_id,
-                            {"final_result": state.final_result},
+                            {
+                                "summary": (state.final_result or "")[:200],
+                                "final_artifact_path": state.final_artifact_path,
+                            },
                         )
                     self._cleanup_leases(state.run_id)
                     return state
@@ -1578,6 +1891,8 @@ class OrchestrationEngine:
                 for r in failed:
                     known_worker_ids.add(r.worker_id)
 
+                self._write_action_artifacts(action, state, completed)
+                self._record_quality_evidence(state, action, completed)
                 state.round_number += 1
                 state.budget_usage.rounds = state.round_number
                 if state.created_at:
@@ -1593,7 +1908,11 @@ class OrchestrationEngine:
                 self._emit_event(
                     EventType.ROUND_COMPLETED,
                     state.run_id,
-                    {"round_number": state.round_number - 1},
+                    {
+                        "round_number": state.round_number - 1,
+                        "budget": state.budget.to_dict(),
+                        "budget_usage": state.budget_usage.to_dict(),
+                    },
                 )
 
                 # Persist coordinator tracking info
@@ -1928,7 +2247,11 @@ class OrchestrationEngine:
                     self._emit_event(
                         EventType.ROUND_STARTED,
                         state.run_id,
-                        {"round_number": state.round_number},
+                        {
+                            "round_number": state.round_number,
+                            "budget": state.budget.to_dict(),
+                            "budget_usage": state.budget_usage.to_dict(),
+                        },
                     )
                     raw_action = coord.decide_action(observation, conversation_id=state.coordinator_conversation_id)
                     if isinstance(raw_action, CoordinatorAction):
@@ -1976,6 +2299,8 @@ class OrchestrationEngine:
                         action = None
                         continue
 
+                self._apply_quality_update(state, action)
+                self.store.save_run(state)
                 self._emit_event(
                     EventType.ACTION_REQUESTED,
                     state.run_id,
@@ -1983,19 +2308,55 @@ class OrchestrationEngine:
                 )
 
                 if action.kind == ActionKind.FINALIZE:
-                    self._check_finalization(state)
+                    missing = self._check_finalization(state)
+                    if missing:
+                        consecutive_rejections += 1
+                        reason = "FINALIZE rejected:\n- " + "\n- ".join(missing)
+                        self._emit_event(
+                            EventType.ACTION_REJECTED,
+                            state.run_id,
+                            {"action_id": str(action.action_id), "reason": reason},
+                        )
+                        if consecutive_rejections >= state.budget.max_consecutive_rejections:
+                            raise ActionRejectedError(
+                                f"Coordinator exceeded maximum consecutive rejected actions limit "
+                                f"({state.budget.max_consecutive_rejections}): {reason}"
+                            )
+                        observation = self._build_observation(
+                            state, completed=[], failed=[], rejected=[]
+                        )
+                        observation.finalization_rejection = list(missing)
+                        action = None
+                        continue
+
+                    consecutive_rejections = 0
                     self._emit_event(EventType.ACTION_ACCEPTED, state.run_id, {"action_id": str(action.action_id)})
                     state.status = RunStatus.COMPLETED
                     state.final_result = action.final_response
                     state.updated_at = datetime.now(timezone.utc).isoformat()
                     if hasattr(self.store, "finalize_run") and callable(self.store.finalize_run):
-                        self.store.finalize_run(state.run_id, state.final_result or "", status=RunStatus.COMPLETED)
+                        finalized = self.store.finalize_run(
+                            state.run_id, state.final_result or "", status=RunStatus.COMPLETED
+                        )
+                        state = finalized
                     else:
+                        try:
+                            final_path = self.artifact_writer._write(
+                                state.run_id,
+                                Path("deliverables") / "final.md",
+                                (state.final_result or "").rstrip() + "\n",
+                            )
+                            state.final_artifact_path = str(final_path)
+                        except Exception:
+                            pass
                         self.store.save_run(state)
                         self._emit_event(
                             EventType.RUN_COMPLETED,
                             state.run_id,
-                            {"final_result": state.final_result},
+                            {
+                                "summary": (state.final_result or "")[:200],
+                                "final_artifact_path": state.final_artifact_path,
+                            },
                         )
                     self._cleanup_leases(state.run_id)
                     return state
@@ -2053,13 +2414,19 @@ class OrchestrationEngine:
                 for r in f_wave:
                     known_worker_ids.add(r.worker_id)
 
+                self._write_action_artifacts(action, state, c_wave)
+                self._record_quality_evidence(state, action, c_wave)
                 state.round_number += 1
                 state.budget_usage.rounds = state.round_number
                 self.store.save_run(state)
                 self._emit_event(
                     EventType.ROUND_COMPLETED,
                     state.run_id,
-                    {"round_number": state.round_number - 1},
+                    {
+                        "round_number": state.round_number - 1,
+                        "budget": state.budget.to_dict(),
+                        "budget_usage": state.budget_usage.to_dict(),
+                    },
                 )
 
                 observation = self._build_observation(state, completed=c_wave, failed=f_wave, rejected=r_wave)

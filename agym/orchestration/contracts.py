@@ -42,6 +42,8 @@ __all__ = [
     "AuditResult",
     "CoordinatorAction",
     "CoordinatorObservation",
+    "CoordinatorQualityUpdate",
+    "QualityState",
     # Fleet & Lease Dataclasses
     "FleetView",
     "ProfileCapacity",
@@ -233,6 +235,8 @@ class EventType(_CaseInsensitiveStrEnum):
     INVOCATION_STARTED = "INVOCATION_STARTED"
     INVOCATION_COMPLETED = "INVOCATION_COMPLETED"
     INVOCATION_FAILED = "INVOCATION_FAILED"
+    INVOCATION_ACTIVITY = "INVOCATION_ACTIVITY"
+    ARTIFACT_WRITTEN = "ARTIFACT_WRITTEN"
 
     ROUND_STARTED = "ROUND_STARTED"
     ROUND_COMPLETED = "ROUND_COMPLETED"
@@ -587,8 +591,161 @@ class AuditResult:
 
 
 # ============================================================================
-# 5. Coordinator Action & Observation Contracts
+# 5. Coordinator Action & Quality Contracts
 # ============================================================================
+
+
+@dataclass
+class CoordinatorQualityUpdate:
+    """Coordinator-reported reasoning quality state.
+
+    Only reasoning-derived fields live here. Mechanical evidence such as audits,
+    synthesis, verification, and independent perspective counts is derived by
+    the engine and cannot be asserted by the coordinator.
+    """
+
+    open_questions: list[str] | None = None
+    disagreements: list[str] | None = None
+    open_critical_findings: list[str] | None = None
+    confidence: float | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("open_questions", "disagreements", "open_critical_findings"):
+            value = getattr(self, name)
+            if value is not None:
+                if isinstance(value, str):
+                    value = [value]
+                setattr(self, name, [str(item) for item in value])
+        if self.confidence is not None:
+            self.confidence = float(self.confidence)
+            if not 0.0 <= self.confidence <= 1.0:
+                raise ValueError("quality confidence must be between 0.0 and 1.0")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "open_questions": self.open_questions,
+            "disagreements": self.disagreements,
+            "open_critical_findings": self.open_critical_findings,
+            "confidence": self.confidence,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CoordinatorQualityUpdate:
+        if not isinstance(data, dict):
+            raise ValueError(f"Expected dict for CoordinatorQualityUpdate, got {type(data).__name__}")
+        return cls(
+            open_questions=data.get("open_questions"),
+            disagreements=data.get("disagreements"),
+            open_critical_findings=data.get("open_critical_findings"),
+            confidence=data.get("confidence"),
+        )
+
+
+@dataclass
+class QualityState:
+    """Persisted orchestration quality evidence and unresolved reasoning state."""
+
+    independent_perspectives: int = 0
+    audits_completed: int = 0
+    synthesis_completed: int = 0
+    final_critique_completed: int = 0
+    open_critical_findings: list[str] = field(default_factory=list)
+    open_questions: list[str] = field(default_factory=list)
+    disagreements: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+
+    # Mechanical provenance used to make counters deterministic/idempotent.
+    independent_worker_ids: list[str] = field(default_factory=list)
+    audit_worker_ids: list[str] = field(default_factory=list)
+    synthesis_worker_ids: list[str] = field(default_factory=list)
+    synthesis_critique_worker_ids: list[str] = field(default_factory=list)
+
+    # IMPLEMENT-mode evidence is tracked against the latest successful mutation.
+    executor_completed: bool = False
+    last_executor_worker_id: str | None = None
+    post_implementation_verifications: int = 0
+    verification_worker_ids: list[str] = field(default_factory=list)
+    implementation_audits_completed: int = 0
+    implementation_audit_worker_ids: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.independent_perspectives = int(self.independent_perspectives)
+        self.audits_completed = int(self.audits_completed)
+        self.synthesis_completed = int(self.synthesis_completed)
+        self.final_critique_completed = int(self.final_critique_completed)
+        self.post_implementation_verifications = int(self.post_implementation_verifications)
+        self.implementation_audits_completed = int(self.implementation_audits_completed)
+        self.open_critical_findings = [str(v) for v in self.open_critical_findings]
+        self.open_questions = [str(v) for v in self.open_questions]
+        self.disagreements = [str(v) for v in self.disagreements]
+        self.independent_worker_ids = [str(v) for v in self.independent_worker_ids]
+        self.audit_worker_ids = [str(v) for v in self.audit_worker_ids]
+        self.synthesis_worker_ids = [str(v) for v in self.synthesis_worker_ids]
+        self.synthesis_critique_worker_ids = [str(v) for v in self.synthesis_critique_worker_ids]
+        self.verification_worker_ids = [str(v) for v in self.verification_worker_ids]
+        self.implementation_audit_worker_ids = [str(v) for v in self.implementation_audit_worker_ids]
+        self.confidence = float(self.confidence)
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("quality confidence must be between 0.0 and 1.0")
+
+    def apply_coordinator_update(self, update: CoordinatorQualityUpdate | None) -> None:
+        if update is None:
+            return
+        if update.open_questions is not None:
+            self.open_questions = list(update.open_questions)
+        if update.disagreements is not None:
+            self.disagreements = list(update.disagreements)
+        if update.open_critical_findings is not None:
+            self.open_critical_findings = list(update.open_critical_findings)
+        if update.confidence is not None:
+            self.confidence = update.confidence
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "independent_perspectives": self.independent_perspectives,
+            "audits_completed": self.audits_completed,
+            "synthesis_completed": self.synthesis_completed,
+            "final_critique_completed": self.final_critique_completed,
+            "open_critical_findings": list(self.open_critical_findings),
+            "open_questions": list(self.open_questions),
+            "disagreements": list(self.disagreements),
+            "confidence": self.confidence,
+            "independent_worker_ids": list(self.independent_worker_ids),
+            "audit_worker_ids": list(self.audit_worker_ids),
+            "synthesis_worker_ids": list(self.synthesis_worker_ids),
+            "synthesis_critique_worker_ids": list(self.synthesis_critique_worker_ids),
+            "executor_completed": self.executor_completed,
+            "last_executor_worker_id": self.last_executor_worker_id,
+            "post_implementation_verifications": self.post_implementation_verifications,
+            "verification_worker_ids": list(self.verification_worker_ids),
+            "implementation_audits_completed": self.implementation_audits_completed,
+            "implementation_audit_worker_ids": list(self.implementation_audit_worker_ids),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> QualityState:
+        if not isinstance(data, dict):
+            raise ValueError(f"Expected dict for QualityState, got {type(data).__name__}")
+        return cls(
+            independent_perspectives=data.get("independent_perspectives", 0),
+            audits_completed=data.get("audits_completed", 0),
+            synthesis_completed=data.get("synthesis_completed", 0),
+            final_critique_completed=data.get("final_critique_completed", 0),
+            open_critical_findings=data.get("open_critical_findings", []),
+            open_questions=data.get("open_questions", []),
+            disagreements=data.get("disagreements", []),
+            confidence=data.get("confidence", 0.0),
+            independent_worker_ids=data.get("independent_worker_ids", []),
+            audit_worker_ids=data.get("audit_worker_ids", []),
+            synthesis_worker_ids=data.get("synthesis_worker_ids", []),
+            synthesis_critique_worker_ids=data.get("synthesis_critique_worker_ids", []),
+            executor_completed=bool(data.get("executor_completed", False)),
+            last_executor_worker_id=data.get("last_executor_worker_id"),
+            post_implementation_verifications=data.get("post_implementation_verifications", 0),
+            verification_worker_ids=data.get("verification_worker_ids", []),
+            implementation_audits_completed=data.get("implementation_audits_completed", 0),
+            implementation_audit_worker_ids=data.get("implementation_audit_worker_ids", []),
+        )
 
 
 @dataclass
@@ -609,6 +766,8 @@ class CoordinatorAction:
     workers: list[WorkerRequest] = field(default_factory=list)
     auditors: list[AuditRequest] = field(default_factory=list)
     reason_summary: str = ""
+    reason: str = ""
+    quality_update: CoordinatorQualityUpdate | None = None
     final_response: str | None = None
 
     def __post_init__(self) -> None:
@@ -623,6 +782,16 @@ class CoordinatorAction:
             AuditRequest.from_dict(a) if isinstance(a, dict) else a
             for a in self.auditors
         ]
+        if isinstance(self.quality_update, dict):
+            self.quality_update = CoordinatorQualityUpdate.from_dict(self.quality_update)
+        self.reason_summary = str(self.reason_summary or "")
+        self.reason = str(self.reason or "")
+        if self.reason and not self.reason_summary:
+            self.reason_summary = self.reason
+        elif self.reason_summary and not self.reason:
+            self.reason = self.reason_summary
+        if len(self.reason) > 500 or len(self.reason_summary) > 500:
+            raise ValueError("Coordinator action reason must be 500 characters or fewer")
         self.validate()
 
     def validate(self) -> None:
@@ -671,6 +840,8 @@ class CoordinatorAction:
                 raise ValueError("RUN_EXECUTOR action cannot contain auditors")
             if self.workers[0].role != WorkerRole.EXECUTOR:
                 raise ValueError("RUN_EXECUTOR worker must have role EXECUTOR")
+            if self.workers[0].workspace_mode != WorkspaceMode.MUTATING:
+                raise ValueError("RUN_EXECUTOR worker must use MUTATING workspace mode")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -679,6 +850,8 @@ class CoordinatorAction:
             "workers": [w.to_dict() for w in self.workers],
             "auditors": [a.to_dict() for a in self.auditors],
             "reason_summary": self.reason_summary,
+            "reason": self.reason,
+            "quality_update": self.quality_update.to_dict() if self.quality_update is not None else None,
             "final_response": self.final_response,
         }
 
@@ -701,6 +874,12 @@ class CoordinatorAction:
                 for a in data.get("auditors", [])
             ],
             reason_summary=str(data.get("reason_summary", "")),
+            reason=str(data.get("reason", "")),
+            quality_update=(
+                CoordinatorQualityUpdate.from_dict(data["quality_update"])
+                if isinstance(data.get("quality_update"), dict)
+                else data.get("quality_update")
+            ),
             final_response=data.get("final_response"),
         )
 
@@ -1014,6 +1193,8 @@ class CoordinatorObservation:
     budget_usage: BudgetUsage = field(default_factory=BudgetUsage)
     fleet_view: FleetView = field(default_factory=FleetView)
     round_number: int = 0
+    quality_state: QualityState = field(default_factory=QualityState)
+    finalization_rejection: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.completed_results = [
@@ -1032,7 +1213,10 @@ class CoordinatorObservation:
             self.budget_usage = BudgetUsage.from_dict(self.budget_usage)
         if isinstance(self.fleet_view, dict):
             self.fleet_view = FleetView.from_dict(self.fleet_view)
+        if isinstance(self.quality_state, dict):
+            self.quality_state = QualityState.from_dict(self.quality_state)
         self.round_number = int(self.round_number)
+        self.finalization_rejection = [str(item) for item in self.finalization_rejection]
 
     @staticmethod
     def _deserialize_result(data: dict[str, Any]) -> WorkerResult | AuditResult:
@@ -1054,6 +1238,8 @@ class CoordinatorObservation:
             "budget_usage": self.budget_usage.to_dict(),
             "fleet_view": self.fleet_view.to_dict(),
             "round_number": self.round_number,
+            "quality_state": self.quality_state.to_dict(),
+            "finalization_rejection": list(self.finalization_rejection),
         }
 
     def to_json(self, indent: int | None = None) -> str:
@@ -1087,6 +1273,12 @@ class CoordinatorObservation:
                 else FleetView()
             ),
             round_number=int(data.get("round_number", 0)),
+            quality_state=(
+                QualityState.from_dict(data["quality_state"])
+                if isinstance(data.get("quality_state"), dict)
+                else QualityState()
+            ),
+            finalization_rejection=list(data.get("finalization_rejection", [])),
         )
 
     @classmethod
@@ -1260,10 +1452,12 @@ class RunState:
     round_number: int = 0
     budget: OrchestrationBudget = field(default_factory=OrchestrationBudget)
     budget_usage: BudgetUsage = field(default_factory=BudgetUsage)
+    quality_state: QualityState = field(default_factory=QualityState)
     invocation_ids: list[InvocationId] = field(default_factory=list)
     created_at: str = ""
     updated_at: str = ""
     final_result: str | None = None
+    final_artifact_path: str | None = None
 
     def __post_init__(self) -> None:
         self.run_id = RunId(self.run_id)
@@ -1280,6 +1474,8 @@ class RunState:
             self.budget = OrchestrationBudget.from_dict(self.budget)
         if isinstance(self.budget_usage, dict):
             self.budget_usage = BudgetUsage.from_dict(self.budget_usage)
+        if isinstance(self.quality_state, dict):
+            self.quality_state = QualityState.from_dict(self.quality_state)
         self.invocation_ids = [InvocationId(i) for i in self.invocation_ids]
 
     def to_dict(self) -> dict[str, Any]:
@@ -1297,10 +1493,12 @@ class RunState:
             "round_number": self.round_number,
             "budget": self.budget.to_dict(),
             "budget_usage": self.budget_usage.to_dict(),
+            "quality_state": self.quality_state.to_dict(),
             "invocation_ids": [str(i) for i in self.invocation_ids],
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "final_result": self.final_result,
+            "final_artifact_path": self.final_artifact_path,
         }
 
     def to_json(self, indent: int | None = None) -> str:
@@ -1336,10 +1534,16 @@ class RunState:
                 if isinstance(data.get("budget_usage"), dict)
                 else BudgetUsage()
             ),
+            quality_state=(
+                QualityState.from_dict(data["quality_state"])
+                if isinstance(data.get("quality_state"), dict)
+                else QualityState()
+            ),
             invocation_ids=[InvocationId(i) for i in data.get("invocation_ids", [])],
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
             final_result=data.get("final_result"),
+            final_artifact_path=data.get("final_artifact_path"),
         )
 
     @classmethod
