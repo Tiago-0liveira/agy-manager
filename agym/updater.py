@@ -56,6 +56,30 @@ def is_newer_version(candidate: str, current: str) -> bool:
         return False
 
 
+def is_running_in_repo() -> bool:
+    """Returns True if agym is running from within its source repository or worktree."""
+    try:
+        # Check 1: Is the loaded agym package directly inside its git repository?
+        # (e.g. python3 -m agym.cli, or running from local source tree)
+        pkg_dir = Path(__file__).resolve().parent
+        repo_root = pkg_dir.parent
+        if (repo_root / ".git").exists() and (repo_root / "agym" / "cli.py").is_file():
+            return True
+    except Exception:
+        pass
+
+    try:
+        # Check 2: Is the current working directory inside the agym source repository?
+        cwd = Path.cwd().resolve()
+        for p in (cwd, *cwd.parents):
+            if (p / ".git").exists() and (p / "agym" / "cli.py").is_file():
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
 def get_update_cache_file() -> Path:
     return _default_data_root() / "cache" / "updater.json"
 
@@ -505,9 +529,13 @@ def do_update(release_info: dict[str, Any] | None = None) -> int:
 def maybe_prompt_startup_update(argv: list[str]) -> None:
     """Hook invoked at startup of agym CLI.
 
-    Bypasses non-interactive sessions, fast statusline calls, and 24h dismissed updates.
+    Bypasses non-interactive sessions, repository checkouts, fast statusline calls, and 24h dismissed updates.
     """
     if os.environ.get("AGYM_NO_UPDATE_CHECK") == "1":
+        return
+
+    # Skip when running inside the source repository (e.g. python3 -m agym.cli)
+    if is_running_in_repo():
         return
 
     # Skip if non-interactive
