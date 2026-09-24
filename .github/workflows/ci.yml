@@ -2,7 +2,7 @@ name: CI Test Suite
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, feat/coordination]
   workflow_dispatch:
 
 permissions:
