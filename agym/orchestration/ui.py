@@ -12,6 +12,8 @@ from __future__ import annotations
 import io
 import math
 import os
+import re
+import shutil
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -48,6 +50,7 @@ __all__ = [
     "TerminalEventSink",
     "OrchestrationUI",
     "PresentationState",
+    "ActivityPresentation",
     "WorkerPresentation",
     "WavePresentation",
     "WorkerStatus",
@@ -67,6 +70,10 @@ BLUE = "\033[34m"
 MAGENTA = "\033[35m"
 CYAN = "\033[36m"
 GRAY = "\033[90m"
+
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+LIVE_ACTIVITY_LIMIT = 20
+DEFAULT_REFRESH_INTERVAL = 0.25
 
 # Spinner sequence starting with default braille frame
 SPINNER_FRAMES = ["⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "⠋", "⠙"]
@@ -144,6 +151,16 @@ class WorkerStatus(str, Enum):
 
 
 @dataclass
+class ActivityPresentation:
+    """One normalized provider activity item shown in the live dashboard."""
+
+    worker_id: str
+    text: str
+    timestamp: str | None = None
+    invocation_id: str | None = None
+
+
+@dataclass
 class WorkerPresentation:
     """Visual representation of a worker task within a wave."""
 
@@ -159,6 +176,8 @@ class WorkerPresentation:
     objective: str = ""
     strategy: str = ""
     current_activity: str = ""
+    recent_activity: list[str] = field(default_factory=list)
+    invocation_id: str | None = None
     artifact_path: str | None = None
     wave_number: int = 1
 
@@ -201,6 +220,7 @@ class PresentationState:
     current_action_kind: str = ""
     action_reason: str = ""
     artifact_paths: list[str] = field(default_factory=list)
+    activity_feed: list[ActivityPresentation] = field(default_factory=list)
 
 
 def render_dry_run(
@@ -325,6 +345,7 @@ class TerminalEventSink(EventSink):
         is_tty: bool | None = None,
         use_color: bool | None = None,
         run_id: RunId | str | None = None,
+        refresh_interval: float = DEFAULT_REFRESH_INTERVAL,
     ) -> None:
         self._stream = stream if stream is not None else sys.stdout
         if is_tty is not None:
@@ -346,6 +367,10 @@ class TerminalEventSink(EventSink):
         self._lock = threading.Lock()
         self._last_rendered_line_count = 0
         self._spinner_idx = 0
+        self._refresh_interval = max(0.05, float(refresh_interval))
+        self._refresh_stop = threading.Event()
+        self._refresh_thread: threading.Thread | None = None
+        self._closed = False
 
     @property
     def is_tty(self) -> bool:
@@ -363,8 +388,56 @@ class TerminalEventSink(EventSink):
 
             if self._is_tty:
                 self._render_tty_update()
+                if self._is_terminal_state():
+                    self._refresh_stop.set()
+                else:
+                    self._ensure_refresh_thread()
             else:
                 self._log_non_tty(event)
+
+    def close(self) -> None:
+        """Stop periodic live redraws without affecting the orchestration run."""
+        self._closed = True
+        self._refresh_stop.set()
+        thread = self._refresh_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=max(0.1, self._refresh_interval * 2))
+
+    def _is_terminal_state(self) -> bool:
+        return self.state.run_status in {
+            RunStatus.COMPLETED.value,
+            RunStatus.FAILED.value,
+            RunStatus.INTERRUPTED.value,
+        }
+
+    def _can_auto_refresh(self) -> bool:
+        if not self._is_tty:
+            return False
+        try:
+            return os.isatty(self._stream.fileno())
+        except (AttributeError, OSError, io.UnsupportedOperation, ValueError):
+            return False
+
+    def _ensure_refresh_thread(self) -> None:
+        """Redraw elapsed time/spinners while models are busy and emit no events."""
+        if self._closed or self._is_terminal_state() or not self._can_auto_refresh():
+            return
+        if self._refresh_thread is not None and self._refresh_thread.is_alive():
+            return
+        self._refresh_stop.clear()
+        self._refresh_thread = threading.Thread(
+            target=self._refresh_loop,
+            name="agym-orchestration-ui",
+            daemon=True,
+        )
+        self._refresh_thread.start()
+
+    def _refresh_loop(self) -> None:
+        while not self._refresh_stop.wait(self._refresh_interval):
+            with self._lock:
+                if self._closed or self._is_terminal_state():
+                    return
+                self._render_tty_update()
 
     def get_events(self, run_id: RunId | str) -> list[OrchestrationEvent]:
         """Returns all events recorded for a given run."""
@@ -644,6 +717,9 @@ class TerminalEventSink(EventSink):
                 wp = self._ensure_worker(str(wid), role)
                 wp.status = WorkerStatus.RUNNING
                 wp.started_at = payload.get("started_at") or event.timestamp
+                invocation_id = payload.get("invocation_id") or (getattr(inv, "invocation_id", None) if inv else None)
+                if invocation_id:
+                    wp.invocation_id = str(invocation_id)
                 if "profile_name" in payload and payload["profile_name"]:
                     wp.profile_name = str(payload["profile_name"])
                 if payload.get("strategy"):
@@ -721,7 +797,29 @@ class TerminalEventSink(EventSink):
             wid = payload.get("worker_id")
             if wid:
                 wp = self._ensure_worker(str(wid))
-                wp.current_activity = str(payload.get("activity", ""))[:120]
+                activity = " ".join(str(payload.get("activity", "")).split())[:120]
+                invocation_id = payload.get("invocation_id")
+                if invocation_id:
+                    wp.invocation_id = str(invocation_id)
+                if activity:
+                    wp.current_activity = activity
+                    if not wp.recent_activity or wp.recent_activity[-1] != activity:
+                        wp.recent_activity.append(activity)
+                        del wp.recent_activity[:-LIVE_ACTIVITY_LIMIT]
+
+                    entry = ActivityPresentation(
+                        worker_id=str(wid),
+                        text=activity,
+                        timestamp=event.timestamp,
+                        invocation_id=str(invocation_id) if invocation_id else wp.invocation_id,
+                    )
+                    if (
+                        not self.state.activity_feed
+                        or self.state.activity_feed[-1].worker_id != entry.worker_id
+                        or self.state.activity_feed[-1].text != entry.text
+                    ):
+                        self.state.activity_feed.append(entry)
+                        del self.state.activity_feed[:-LIVE_ACTIVITY_LIMIT]
 
         elif etype == EventType.ARTIFACT_WRITTEN:
             artifact_path = str(payload.get("artifact_path", ""))
@@ -888,6 +986,19 @@ class TerminalEventSink(EventSink):
 
             lines.append("")
 
+        if self.state.activity_feed:
+            lines.append(colorize(f"Live activity · last {LIVE_ACTIVITY_LIMIT}", BOLD, use_color))
+            for entry in self.state.activity_feed[-LIVE_ACTIVITY_LIMIT:]:
+                worker = self.state.workers.get(entry.worker_id)
+                label = worker.display_name if worker is not None else entry.worker_id
+                clock = ""
+                timestamp = _parse_timestamp(entry.timestamp)
+                if timestamp is not None:
+                    clock = timestamp.astimezone().strftime("%H:%M:%S")
+                prefix = f"{clock} " if clock else ""
+                lines.append(f"  {prefix}{label.ljust(14)} {entry.text}".rstrip())
+            lines.append("")
+
         if self.state.artifact_paths:
             lines.append(colorize("Artifacts", BOLD, use_color))
             for artifact_path in self.state.artifact_paths[-8:]:
@@ -943,10 +1054,24 @@ class TerminalEventSink(EventSink):
 
         return "\n".join(lines).rstrip() + "\n"
 
+    def _terminal_width(self) -> int:
+        try:
+            return max(40, shutil.get_terminal_size(fallback=(120, 30)).columns)
+        except OSError:
+            return 120
+
+    def _fit_terminal_line(self, line: str) -> str:
+        """Prevent physical terminal wrapping from corrupting in-place redraws."""
+        width = max(20, self._terminal_width() - 1)
+        plain = ANSI_ESCAPE_RE.sub("", line)
+        if len(plain) <= width:
+            return line
+        return plain[: max(1, width - 1)] + "…"
+
     def _render_tty_update(self) -> None:
         """Rerenders TTY view in-place in active terminal."""
         rendered = self._format_tty_view(use_color=self._use_color)
-        lines = rendered.splitlines()
+        lines = [self._fit_terminal_line(line) for line in rendered.splitlines()]
 
         # In-place repositioning if previously rendered
         if self._last_rendered_line_count > 0:
