@@ -828,6 +828,7 @@ class FileRunStore:
             strategy = invocation.strategy
             ws_mode = invocation.workspace_mode
             prompt = invocation.prompt
+            objective = ""
             conv_id = invocation.conversation_id
         elif isinstance(invocation, WorkerRequest):
             iid = InvocationId(invocation_id or f"inv-{invocation.worker_id}-{uuid.uuid4().hex[:6]}")
@@ -836,6 +837,7 @@ class FileRunStore:
             strategy = invocation.strategy
             ws_mode = invocation.workspace_mode
             prompt = invocation.objective
+            objective = invocation.objective
             conv_id = None
         elif isinstance(invocation, dict):
             iid = InvocationId(invocation_id or invocation.get("invocation_id") or f"inv-{uuid.uuid4().hex[:8]}")
@@ -844,6 +846,7 @@ class FileRunStore:
             strategy = ExecutionStrategy(invocation.get("strategy", ExecutionStrategy.STANDARD))
             ws_mode = WorkspaceMode(invocation.get("workspace_mode", WorkspaceMode.READ_ONLY))
             prompt = str(invocation.get("prompt", invocation.get("objective", "")))
+            objective = str(invocation.get("objective", ""))
             conv_id = (
                 ConversationId(invocation["conversation_id"])
                 if invocation.get("conversation_id") is not None
@@ -881,7 +884,7 @@ class FileRunStore:
                 "worker_id": str(wid),
                 "role": role.value,
                 "strategy": strategy.value,
-                "objective": prompt[:300],
+                "objective": objective[:300],
             },
         )
         self.emit(event)
