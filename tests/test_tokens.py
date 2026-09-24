@@ -38,7 +38,7 @@ SAMPLE_RESPONSE_WITH_TOKENS = json.dumps(
             "output_tokens": 420,
             "thinking_tokens": 180,
             "cache_read_tokens": 650,
-            "total_tokens": 2500,
+            "total_tokens": 1670,
         },
         "command": {
             "name": "usage",
@@ -61,15 +61,14 @@ class TokenUsageModelTests(unittest.TestCase):
             output_tokens=300,
             thinking_tokens=100,
             cache_read_tokens=500,
-            total_tokens=2400,
         )
-        self.assertEqual(usage.total_tokens, 2400)
-        # prompt = 1500 + 500 = 2000; cache_read / 2000 = 25.0%
-        self.assertAlmostEqual(usage.cache_efficiency, 25.0)
+        self.assertEqual(usage.total_tokens, 1800)
+        # cache_read / input = 500 / 1500 = 33.33%
+        self.assertAlmostEqual(usage.cache_efficiency, 100.0 / 3.0)
 
         as_dict = usage.to_dict()
         self.assertEqual(as_dict["input_tokens"], 1500)
-        self.assertEqual(as_dict["cache_efficiency"], 25.0)
+        self.assertEqual(as_dict["cache_efficiency"], 33.33)
 
         reloaded = TokenUsage.from_dict(as_dict)
         self.assertEqual(reloaded, usage)
@@ -113,7 +112,7 @@ class LogScannerTests(unittest.TestCase):
         self.assertEqual(tu.output_tokens, 420)
         self.assertEqual(tu.thinking_tokens, 180)
         self.assertEqual(tu.cache_read_tokens, 650)
-        self.assertEqual(tu.total_tokens, 2500)
+        self.assertEqual(tu.total_tokens, 1670)
 
         # Empty or missing usage
         self.assertEqual(parse_token_usage_payload({}).total_tokens, 0)
@@ -139,7 +138,7 @@ class LogScannerTests(unittest.TestCase):
                         "output_tokens": 100,
                         "thinking_tokens": 50,
                         "cache_read_tokens": 50,
-                        "total_tokens": 400,
+                        "total_tokens": 300,
                     },
                 }),
                 json.dumps({
@@ -150,7 +149,7 @@ class LogScannerTests(unittest.TestCase):
                         "output_tokens": 150,
                         "thinking_tokens": 50,
                         "cache_read_tokens": 100,
-                        "total_tokens": 600,
+                        "total_tokens": 450,
                     },
                 }),
             ]
@@ -161,7 +160,7 @@ class LogScannerTests(unittest.TestCase):
             self.assertEqual(scanned.output_tokens, 250)
             self.assertEqual(scanned.thinking_tokens, 100)
             self.assertEqual(scanned.cache_read_tokens, 150)
-            self.assertEqual(scanned.total_tokens, 1000)
+            self.assertEqual(scanned.total_tokens, 750)
 
     def test_scan_profile_conversations_sqlite(self) -> None:
         def make_varint(fn: int, val: int) -> bytes:
@@ -213,17 +212,17 @@ class LogScannerTests(unittest.TestCase):
             usage, turns, latest = scan_profile_conversations(home)
             self.assertEqual(turns, 2)
             self.assertEqual(usage.input_tokens, 2000)
-            self.assertEqual(usage.output_tokens, 300)  # 200 + 100
+            self.assertEqual(usage.output_tokens, 450)  # 300 + 150
             self.assertEqual(usage.thinking_tokens, 150)  # 100 + 50
             self.assertEqual(usage.cache_read_tokens, 800)  # 500 + 300
-            self.assertEqual(usage.total_tokens, 3250)  # 2000 + 300 + 150 + 800
+            self.assertEqual(usage.total_tokens, 2450)  # 2000 + 450
 
             self.assertIsNotNone(latest)
             self.assertEqual(latest.input_tokens, 800)
-            self.assertEqual(latest.output_tokens, 100)
+            self.assertEqual(latest.output_tokens, 150)
             self.assertEqual(latest.thinking_tokens, 50)
             self.assertEqual(latest.cache_read_tokens, 300)
-            self.assertEqual(latest.total_tokens, 1250)
+            self.assertEqual(latest.total_tokens, 950)
 
             # Also check scan_profile_session_tokens backwards compatibility
             compat = scan_profile_session_tokens(home)
@@ -258,7 +257,7 @@ class FetchAccountTokensAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(calls, 1)
             self.assertEqual(res1.status, "success")
             self.assertFalse(res1.cached)
-            self.assertEqual(res1.usage.total_tokens, 2500)
+            self.assertEqual(res1.usage.total_tokens, 1670)
             self.assertEqual(res1.snapshot_count, 1)
 
             # 2. Second fetch: should hit cache and NOT invoke mock_runner!
@@ -272,7 +271,7 @@ class FetchAccountTokensAsyncTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(calls, 1)  # unchanged!
             self.assertTrue(res2.cached)
-            self.assertEqual(res2.usage.total_tokens, 2500)
+            self.assertEqual(res2.usage.total_tokens, 1670)
 
             # 3. Third fetch: force_refresh=True should bypass cache and invoke runner
             res3 = await fetch_account_tokens_async(
@@ -285,9 +284,9 @@ class FetchAccountTokensAsyncTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(calls, 2)  # called runner again!
             self.assertFalse(res3.cached)
-            # Cumulative total should now have accumulated
-            self.assertEqual(res3.usage.total_tokens, 5000)
-            self.assertEqual(res3.snapshot_count, 2)
+            # Re-running force refresh does not duplicate identical snapshots
+            self.assertEqual(res3.usage.total_tokens, 1670)
+            self.assertEqual(res3.snapshot_count, 1)
 
     async def test_fetch_error_handling(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -368,10 +367,10 @@ class FetchAccountTokensAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(res1.status, "success")
             self.assertFalse(res1.cached)
             self.assertEqual(res1.usage.input_tokens, 5000)
-            self.assertEqual(res1.usage.output_tokens, 250)
+            self.assertEqual(res1.usage.output_tokens, 400)
             self.assertEqual(res1.usage.thinking_tokens, 150)
             self.assertEqual(res1.usage.cache_read_tokens, 20000)
-            self.assertEqual(res1.usage.total_tokens, 25400)
+            self.assertEqual(res1.usage.total_tokens, 5400)
             self.assertEqual(res1.snapshot_count, 1)
 
             # 2. Second fetch serves from cache (< 10 min)
@@ -383,7 +382,7 @@ class FetchAccountTokensAsyncTests(unittest.IsolatedAsyncioTestCase):
                 force_refresh=False,
             )
             self.assertTrue(res2.cached)
-            self.assertEqual(res2.usage.total_tokens, 25400)
+            self.assertEqual(res2.usage.total_tokens, 5400)
 
             # 3. Force refresh re-scans sqlite db without duplicating counts
             res3 = await fetch_account_tokens_async(
@@ -394,7 +393,7 @@ class FetchAccountTokensAsyncTests(unittest.IsolatedAsyncioTestCase):
                 force_refresh=True,
             )
             self.assertFalse(res3.cached)
-            self.assertEqual(res3.usage.total_tokens, 25400)
+            self.assertEqual(res3.usage.total_tokens, 5400)
             self.assertEqual(res3.snapshot_count, 1)
 
 
@@ -485,8 +484,8 @@ class TerminalVisualizationTests(unittest.TestCase):
             account="personal",
             status="success",
             usage=TokenUsage(
-                input_tokens=1000,
-                output_tokens=400,
+                input_tokens=3500,
+                output_tokens=500,
                 thinking_tokens=100,
                 cache_read_tokens=2500,
                 total_tokens=4000,
@@ -503,8 +502,8 @@ class TerminalVisualizationTests(unittest.TestCase):
         self.assertIn("Token Composition Breakdown:", text_plain)
         self.assertIn("personal", text_plain)
         self.assertIn("4.0k", text_plain)
-        self.assertIn("1.0k", text_plain)
-        self.assertIn("400", text_plain)
+        self.assertIn("3.5k", text_plain)
+        self.assertIn("500", text_plain)
         self.assertIn("100", text_plain)
         self.assertIn("2.5k", text_plain)
         self.assertIn("71.4%", text_plain)
@@ -546,7 +545,7 @@ class CLITokensIntegrationTests(unittest.IsolatedAsyncioTestCase):
             parsed = json.loads(raw_json)
             self.assertIn("summary", parsed)
             self.assertIn("accounts", parsed)
-            self.assertEqual(parsed["summary"]["total_tokens"], 2500)
+            self.assertEqual(parsed["summary"]["total_tokens"], 1670)
             self.assertEqual(parsed["summary"]["top_consumer"], "p1")
             self.assertEqual(len(parsed["accounts"]), 1)
             self.assertEqual(parsed["accounts"][0]["account"], "p1")
@@ -656,6 +655,13 @@ class TokenViewsTests(unittest.TestCase):
         # Verify exactly 1 line for account alpha in the table rows
         alpha_rows = [l for l in lines if l.startswith("alpha")]
         self.assertEqual(len(alpha_rows), 1)
+        # Volume % is profile_volume / total_accounts_volume (100k/150k = 67%)
+        self.assertIn(" 67%", alpha_rows[0])
+
+        beta_rows = [l for l in lines if l.startswith("beta")]
+        self.assertEqual(len(beta_rows), 1)
+        # Volume % is profile_volume / total_accounts_volume (50k/150k = 33%)
+        self.assertIn(" 33%", beta_rows[0])
 
         # Breakdown table appended when breakdown=True
         lines_b = render_tokens_table_view([self.u1, self.u2], breakdown=True, use_color=False)

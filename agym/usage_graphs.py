@@ -147,6 +147,8 @@ def compute_fleet_telemetry(
     now = datetime.now(timezone.utc)
 
     for acc, usage in completed_map.items():
+        if usage.status == "unknown":
+            continue
         if usage.status != "success" and not (usage.status == "quiescent" and usage.groups):
             depleted += 1
             continue
@@ -154,15 +156,23 @@ def compute_fleet_telemetry(
         b_g = extract_bucket_fn(usage, "gemini", "5h")
         b_c = extract_bucket_fn(usage, "claude", "5h")
 
-        g_pct = b_g.percentage if b_g else 100.0
-        c_pct = b_c.percentage if b_c else 100.0
-        g_pcts.append(g_pct)
-        c_pcts.append(c_pct)
+        if b_g is None:
+            # Unknown quota: does NOT participate in averages or capacity classification
+            continue
 
-        min_pct = min(g_pct, c_pct)
-        if min_pct >= 70.0:
+        g_pct = float(b_g.percentage)
+        g_pcts.append(g_pct)
+
+        if b_c is not None:
+            c_pct = float(b_c.percentage)
+            c_pcts.append(c_pct)
+            eff_pct = min(g_pct, c_pct)
+        else:
+            eff_pct = g_pct
+
+        if eff_pct >= 70.0:
             ready += 1
-        elif min_pct >= 20.0:
+        elif eff_pct >= 20.0:
             consuming += 1
         else:
             depleted += 1
@@ -493,23 +503,30 @@ def render_usage_matrix_lines(
             continue
 
         usage = completed_map[p.name]
-        if usage.status != "success" and not (usage.status == "quiescent" and usage.groups):
+        if usage.status != "success" and usage.status != "unknown" and not (usage.status == "quiescent" and usage.groups):
             cells.append(f"{acc_name:<10} \033[91m[Error/Failed]\033[0m" if use_color else f"{acc_name:<10} [Error/Failed]")
             continue
 
         b_g = extract_bucket_fn(usage, "gemini", "5h")
         b_c = extract_bucket_fn(usage, "claude", "5h")
 
-        g_pct = b_g.percentage if b_g else 100
-        c_pct = b_c.percentage if b_c else 100
+        if b_g is not None:
+            g_pct = b_g.percentage
+            g_glyph = format_sparkline_glyph(g_pct / 100.0, use_color=use_color)
+            color_g = get_color_for_percentage(float(g_pct)) if use_color else ""
+            g_str = f"G:{color_g}{g_pct:3d}%{reset}{g_glyph}"
+        else:
+            g_str = f"G:{dim}  ?% -{reset}" if use_color else "G:  ?% -"
 
-        g_glyph = format_sparkline_glyph(g_pct / 100.0, use_color=use_color)
-        c_glyph = format_sparkline_glyph(c_pct / 100.0, use_color=use_color)
+        if b_c is not None:
+            c_pct = b_c.percentage
+            c_glyph = format_sparkline_glyph(c_pct / 100.0, use_color=use_color)
+            color_c = get_color_for_percentage(float(c_pct)) if use_color else ""
+            c_str = f"C:{color_c}{c_pct:3d}%{reset}{c_glyph}"
+        else:
+            c_str = f"C:{dim}  ?% -{reset}" if use_color else "C:  ?% -"
 
-        color_g = get_color_for_percentage(float(g_pct)) if use_color else ""
-        color_c = get_color_for_percentage(float(c_pct)) if use_color else ""
-
-        cell_str = f"{acc_name:<10} {dim}[{reset}G:{color_g}{g_pct:3d}%{reset}{g_glyph} {dim}│{reset} C:{color_c}{c_pct:3d}%{reset}{c_glyph}{dim}]{reset}"
+        cell_str = f"{acc_name:<10} {dim}[{reset}{g_str} {dim}│{reset} {c_str}{dim}]{reset}"
         cells.append(cell_str)
 
     # Box wrapping the matrix
@@ -560,18 +577,27 @@ def render_usage_telemetry_lines(
     # 🟢 Ready (>70%)
     # 🟡 Consuming (20% - 69%)
     # 🔴 Cooling / Depleted (<20% or error)
+    # ⚪ Unknown / Pending Quota
     ready_list: list[tuple[Profile, Any]] = []
     consuming_list: list[tuple[Profile, Any]] = []
     cooling_list: list[tuple[Profile, Any]] = []
+    unknown_list: list[tuple[Profile, Any]] = []
 
     for p in profiles:
         usage = completed_map.get(p.name)
-        if not usage or (usage.status != "success" and not (usage.status == "quiescent" and usage.groups)):
+        if not usage or usage.status == "unknown":
+            unknown_list.append((p, usage))
+            continue
+        if usage.status != "success" and not (usage.status == "quiescent" and usage.groups):
             cooling_list.append((p, usage))
             continue
 
         b_g = extract_bucket_fn(usage, "gemini", "5h")
-        pct = b_g.percentage if b_g else 100
+        if b_g is None:
+            unknown_list.append((p, usage))
+            continue
+
+        pct = b_g.percentage
         if pct >= 70:
             ready_list.append((p, usage))
         elif pct >= 20:
@@ -585,7 +611,7 @@ def render_usage_telemetry_lines(
         acc_name = f"{p.name:<12}"
         if not usage:
             return f"   {acc_name} {dim}Loading...{reset}"
-        if usage.status != "success" and not (usage.status == "quiescent" and usage.groups):
+        if usage.status != "success" and usage.status != "unknown" and not (usage.status == "quiescent" and usage.groups):
             err = usage.error or "failed"
             return f"   {acc_name} {red}✗ Failed: {err}{reset}"
 
@@ -593,15 +619,32 @@ def render_usage_telemetry_lines(
         b_gw = extract_bucket_fn(usage, "gemini", "week")
         b_c5 = extract_bucket_fn(usage, "claude", "5h")
 
-        g5_pct = b_g5.percentage if b_g5 else 100
-        gw_pct = b_gw.percentage if b_gw else 100
-        c5_pct = b_c5.percentage if b_c5 else 100
+        if b_g5 is not None:
+            g5_pct = b_g5.percentage
+            g5_bar = format_smooth_bar(g5_pct / 100.0, width=8, use_color=use_color)
+            color_g = get_color_for_percentage(float(g5_pct)) if use_color else ""
+            g5_disp = f"Gemini {g5_bar} {color_g}{g5_pct:3d}%{reset}"
+            rst_g5 = format_short_reset_fn(b_g5.reset_time) if format_short_reset_fn else ""
+            reset_tag = f" {cyan}(resets {rst_g5}){reset}" if rst_g5 and rst_g5 != "-" and g5_pct < 50 else ""
+        else:
+            g5_bar = f"{dim}[{'-' * 8}]{reset}" if use_color else f"[{'-' * 8}]"
+            g5_disp = f"Gemini {g5_bar} {dim}  ?%{reset}" if use_color else f"Gemini {g5_bar}   ?%"
+            reset_tag = ""
 
-        g5_bar = format_smooth_bar(g5_pct / 100.0, width=8, use_color=use_color)
-        c5_bar = format_smooth_bar(c5_pct / 100.0, width=8, use_color=use_color)
+        if b_c5 is not None:
+            c5_pct = b_c5.percentage
+            c5_bar = format_smooth_bar(c5_pct / 100.0, width=8, use_color=use_color)
+            color_c = get_color_for_percentage(float(c5_pct)) if use_color else ""
+            c5_disp = f"Claude {c5_bar} {color_c}{c5_pct:3d}%{reset}"
+        else:
+            c5_bar = f"{dim}[{'-' * 8}]{reset}" if use_color else f"[{'-' * 8}]"
+            c5_disp = f"Claude {c5_bar} {dim}  ?%{reset}" if use_color else f"Claude {c5_bar}   ?%"
 
-        rst_g5 = format_short_reset_fn(b_g5.reset_time) if b_g5 else ""
-        reset_tag = f" {cyan}(resets {rst_g5}){reset}" if rst_g5 and rst_g5 != "-" and g5_pct < 50 else ""
+        if b_gw is not None:
+            gw_pct = b_gw.percentage
+            gw_disp = f"{dim}Wk:{reset} {gw_pct:3d}%"
+        else:
+            gw_disp = f"{dim}Wk:{reset}   -"
 
         sub_health = calculate_subscription_health(p.subscription_date)
         sub_plain = format_compact_sub(sub_health)
@@ -612,14 +655,11 @@ def render_usage_telemetry_lines(
         if getattr(usage, "quiescent", False) or usage.status == "quiescent":
             status_tag = f" {dim}[Idle]{reset}"
 
-        color_g = get_color_for_percentage(float(g5_pct)) if use_color else ""
-        color_c = get_color_for_percentage(float(c5_pct)) if use_color else ""
-
         return (
             f"   {bold}{acc_name}{reset} "
-            f"Gemini {g5_bar} {color_g}{g5_pct:3d}%{reset}  "
-            f"Claude {c5_bar} {color_c}{c5_pct:3d}%{reset}  "
-            f"{dim}Wk:{reset} {gw_pct:3d}%  "
+            f"{g5_disp}  "
+            f"{c5_disp}  "
+            f"{gw_disp}  "
             f"{dim}Sub:{reset} {sub_colored}{sub_pad}"
             f"{reset_tag}{status_tag}"
         )
@@ -645,17 +685,25 @@ def render_usage_telemetry_lines(
             lines.append(format_account_telemetry_row(p, u))
         lines.append("")
 
-    # Smart recommendation
+    # ⚪ Unknown / Pending Quota Tier
+    if unknown_list:
+        lines.append(f"{dim}⚪ UNKNOWN / PENDING QUOTA{reset} {dim}(Pending valid 5h quota · {len(unknown_list)} profiles){reset}")
+        for p, u in unknown_list:
+            lines.append(format_account_telemetry_row(p, u))
+        lines.append("")
+
+    # Smart recommendation: prefer account with highest valid 5h remaining_fraction
     best_candidate = None
-    if ready_list:
-        # Pick highest gemini capacity
-        best_p = max(
-            ready_list,
-            key=lambda item: (
-                extract_bucket_fn(item[1], "gemini", "5h").percentage if (item[1] and extract_bucket_fn(item[1], "gemini", "5h")) else 0
-            ),
-        )[0]
-        best_candidate = best_p.name
+    candidate_pool = ready_list or consuming_list
+    if candidate_pool:
+        def _get_candidate_fraction(item: tuple[Profile, Any]) -> float:
+            b = extract_bucket_fn(item[1], "gemini", "5h") if item[1] else None
+            return b.remaining_fraction if b is not None else -1.0
+
+        valid_candidates = [item for item in candidate_pool if _get_candidate_fraction(item) >= 0.0]
+        if valid_candidates:
+            best_p = max(valid_candidates, key=_get_candidate_fraction)[0]
+            best_candidate = best_p.name
 
     if best_candidate:
         lines.append(f"💡 {bold}Recommendation:{reset} Profile '{cyan}{best_candidate}{reset}' has prime capacity ready for active work.")

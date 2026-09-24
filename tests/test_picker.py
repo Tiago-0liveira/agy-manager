@@ -51,7 +51,7 @@ SAMPLE_REAL_RESPONSE = json.dumps(
                                 "name": "Five Hour Limit Remaining",
                                 "window": "5h",
                                 "remaining_fraction": 0.84,
-                                "reset_time": "2026-09-21T03:17:44Z",
+                                "reset_time": "2026-09-27T03:17:44Z",
                             },
                         ],
                     },

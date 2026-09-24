@@ -33,9 +33,9 @@ SAMPLE_REAL_RESPONSE = json.dumps(
         "status": "SUCCESS",
         "response": (
             "Gemini Models\tWeekly Limit Remaining\t99%\t2026-09-27T22:17:44Z\n"
-            "Gemini Models\tFive Hour Limit Remaining\t96%\t2026-09-21T03:17:44Z\n"
+            "Gemini Models\tFive Hour Limit Remaining\t96%\t2026-09-27T03:17:44Z\n"
             "Claude and GPT models\tWeekly Limit Remaining\t100%\t2026-09-27T23:00:20Z\n"
-            "Claude and GPT models\tFive Hour Limit Remaining\t100%\t2026-09-21T04:00:20Z\n"
+            "Claude and GPT models\tFive Hour Limit Remaining\t100%\t2026-09-27T04:00:20Z\n"
         ),
         "duration_seconds": 0,
         "num_turns": 0,
@@ -72,7 +72,7 @@ SAMPLE_REAL_RESPONSE = json.dumps(
                                 "description": "You have used some of your 5-hour limit.",
                                 "window": "5h",
                                 "remaining_fraction": 0.8399444818496704,
-                                "reset_time": "2026-09-21T03:17:44Z",
+                                "reset_time": "2026-09-27T03:17:44Z",
                             },
                         ],
                     },
@@ -92,7 +92,7 @@ SAMPLE_REAL_RESPONSE = json.dumps(
                                 "name": "Five Hour Limit Remaining",
                                 "window": "5h",
                                 "remaining_fraction": 1,
-                                "reset_time": "2026-09-21T04:00:20Z",
+                                "reset_time": "2026-09-27T04:00:20Z",
                             },
                         ],
                     },
