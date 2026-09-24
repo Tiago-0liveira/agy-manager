@@ -57,8 +57,6 @@ Usage:
   agym orchestrate "<task>" [--mode plan|implement] [--dry-run]
   agym orchestrate status <run-id>
   agym orchestrate resume <run-id>
-  agym orchestrate inspect <run-id> [--worker <id>] [--attempt <id>] [--timeline] [--json]
-  agym orchestrate logs <run-id> [--follow] [--worker <id>] [--attempt <id>] [--stream stdout|stderr|all] [--json]
   agym select [-f|--fresh] [-- [agy args...]]
   agym rotate [--file <file>] [--status] [--reset] [--simulate [N]] [-- [agy args...]]
   agym config <profile> [--model <model>|default] [-y|--dsp|--skip-perms|--[no-]dangerously-skip-permissions]
@@ -1039,8 +1037,6 @@ Usage:
   agym orchestrate "<task>" [--mode plan|implement] [--dry-run]
   agym orchestrate status <run-id>
   agym orchestrate resume <run-id>
-  agym orchestrate inspect <run-id> [--worker <id>] [--attempt <id>] [--timeline] [--json]
-  agym orchestrate logs <run-id> [--follow] [--worker <id>] [--attempt <id>] [--stream stdout|stderr|all] [--json]
 
 Options:
   --mode {plan,implement}   Operating mode: plan (default) or implement
@@ -1050,8 +1046,6 @@ Options:
 Commands:
   status <run-id>           Display status of a run from persisted state
   resume <run-id>           Resume an interrupted or failed run
-  inspect <run-id>          Inspect run failure details, workers, attempts, and stored response
-  logs <run-id>             View or follow execution logs and milestones
 """
 
 
@@ -1095,13 +1089,13 @@ def _orchestrate(
     *,
     deps: OrchestrationDependencies | None = None,
 ) -> int:
-    if not argv:
-        _print_err("orchestrate requires a task or subcommand (status, resume, inspect, logs)")
-        return 2
-
-    if argv[0] not in {"inspect", "logs"} and any(arg in {"-h", "--help", "help"} for arg in argv):
+    if any(arg in {"-h", "--help", "help"} for arg in argv):
         print(ORCHESTRATE_USAGE.rstrip())
         return 0
+
+    if not argv:
+        _print_err("orchestrate requires a task or subcommand (status, resume)")
+        return 2
 
     subcommand = argv[0]
 
@@ -1139,14 +1133,6 @@ def _orchestrate(
         d = deps or build_orchestration_dependencies(profile_store=store)
         try:
             state = d.engine.resume(RunId(run_id))
-            run_dir = (
-                d.run_store.run_dir(state.run_id)
-                if hasattr(d.run_store, "run_dir") and callable(d.run_store.run_dir)
-                else None
-            )
-            if run_dir:
-                print(f"\nRun artifacts: {run_dir}")
-                print(f"Inspect with: agym orchestrate inspect {state.run_id}")
             if state.status == RunStatus.COMPLETED:
                 return 0
             if state.status == RunStatus.INTERRUPTED:
@@ -1154,60 +1140,19 @@ def _orchestrate(
                 return 130
             return 1
         except KeyboardInterrupt:
-            run_dir = (
-                d.run_store.run_dir(RunId(run_id))
-                if hasattr(d.run_store, "run_dir") and callable(d.run_store.run_dir)
-                else None
-            )
-            if run_dir and Path(run_dir).exists():
-                print(f"\nRun artifacts: {run_dir}")
-                print(f"Inspect with: agym orchestrate inspect {run_id}")
             _print_err("interrupted")
             return 130
         except Exception as exc:
-            run_dir = (
-                d.run_store.run_dir(RunId(run_id))
-                if hasattr(d.run_store, "run_dir") and callable(d.run_store.run_dir)
-                else None
-            )
-            if run_dir and Path(run_dir).exists():
-                print(f"\nRun artifacts: {run_dir}")
-                print(f"Inspect with: agym orchestrate inspect {run_id}")
             _print_err(str(exc))
             return 1
 
-    # Subcommand: inspect
-    if subcommand == "inspect":
-        if len(argv) >= 2 and argv[1] in ("-h", "--help"):
-            d = deps or build_orchestration_dependencies(profile_store=store)
-            from agym.orchestration.inspection import run_inspect_cli
-            return run_inspect_cli(argv[1:], d.run_store)
-        if len(argv) < 2 or not argv[1].strip() or argv[1].startswith("-"):
-            _print_err("missing run ID for inspect")
-            return 2
-        d = deps or build_orchestration_dependencies(profile_store=store)
-        from agym.orchestration.inspection import run_inspect_cli
-        return run_inspect_cli(argv[1:], d.run_store)
-
-    # Subcommand: logs
-    if subcommand == "logs":
-        if len(argv) >= 2 and argv[1] in ("-h", "--help"):
-            d = deps or build_orchestration_dependencies(profile_store=store)
-            from agym.orchestration.inspection import run_logs_cli
-            return run_logs_cli(argv[1:], d.run_store)
-        if len(argv) < 2 or not argv[1].strip() or argv[1].startswith("-"):
-            _print_err("missing run ID for logs")
-            return 2
-        d = deps or build_orchestration_dependencies(profile_store=store)
-        from agym.orchestration.inspection import run_logs_cli
-        return run_logs_cli(argv[1:], d.run_store)
-
     # Check for unrecognized subcommand
-    KNOWN_SUBCOMMANDS = {"status", "resume", "run", "inspect", "logs"}
+    KNOWN_SUBCOMMANDS = {"status", "resume", "run"}
     UNKNOWN_SUBCOMMANDS = {
         "cancel",
         "stop",
         "kill",
+        "inspect",
         "info",
         "show",
         "list",
@@ -1273,14 +1218,6 @@ def _orchestrate(
 
     try:
         state = d.engine.run(task, mode=run_mode)
-        run_dir = (
-            d.run_store.run_dir(state.run_id)
-            if hasattr(d.run_store, "run_dir") and callable(d.run_store.run_dir)
-            else None
-        )
-        if run_dir:
-            print(f"\nRun artifacts: {run_dir}")
-            print(f"Inspect with: agym orchestrate inspect {state.run_id}")
         if state.status == RunStatus.COMPLETED:
             return 0
         if state.status == RunStatus.INTERRUPTED:
@@ -1291,15 +1228,6 @@ def _orchestrate(
         _print_err("interrupted")
         return 130
     except Exception as exc:
-        failed_rid = getattr(exc, "run_id", None)
-        if failed_rid and hasattr(d.run_store, "run_dir"):
-            try:
-                run_dir = d.run_store.run_dir(failed_rid)
-                if run_dir and Path(run_dir).exists():
-                    print(f"\nRun artifacts: {run_dir}")
-                    print(f"Inspect with: agym orchestrate inspect {failed_rid}")
-            except Exception:
-                pass
         _print_err(str(exc))
         return 1
 
