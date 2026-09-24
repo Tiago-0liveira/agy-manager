@@ -119,25 +119,19 @@ def prepare_accounts_for_picker(
         sess_num = sess_counts.get(name, 0)
         sess_cell = f"{sess_num:<7}"
 
-        if status == "success":
-            b_g5 = extract_quota_bucket(u, "gemini", "5h")
-            b_gw = extract_quota_bucket(u, "gemini", "week")
+        b_g5 = extract_quota_bucket(u, "gemini", "5h") if status == "success" else None
+        b_gw = extract_quota_bucket(u, "gemini", "week") if status == "success" else None
 
-            if b_g5 is not None:
-                g5_frac = max(0.0, min(1.0, float(b_g5.remaining_fraction)))
-                reset_dt = b_g5.reset_time
-                if g5_frac >= 1.0 or reset_dt is None:
-                    reset_time_str = "Ready"
-                    raw_reset_timestamp = None
-                else:
-                    raw_reset_timestamp = reset_dt.timestamp()
-                    reset_time_str = reset_fn(reset_dt)
-                limit_5h_text = f"{b_g5.percentage:3d}%"
+        if status == "success" and b_g5 is not None:
+            g5_frac = max(0.0, min(1.0, float(b_g5.remaining_fraction)))
+            reset_dt = b_g5.reset_time
+            if g5_frac >= 1.0 or reset_dt is None:
+                reset_time_str = "Ready"
+                raw_reset_timestamp = None
             else:
-                g5_frac = -1.0
-                reset_time_str = "-"
-                raw_reset_timestamp = float("inf")
-                limit_5h_text = "Unknown"
+                raw_reset_timestamp = reset_dt.timestamp()
+                reset_time_str = reset_fn(reset_dt)
+            limit_5h_text = f"{b_g5.percentage:3d}%"
 
             if b_gw is not None:
                 gw_frac = max(0.0, min(1.0, float(b_gw.remaining_fraction)))
@@ -152,7 +146,21 @@ def prepare_accounts_for_picker(
 
             line_colored = f"{name:<{acc_width}}{sess_cell}{g5_colored}  {gw_colored}"
             line_plain = f"{name:<{acc_width}}{sess_cell}{g5_plain}  {gw_plain}"
+        elif status == "unknown" or (status == "success" and b_g5 is None):
+            status = "unknown"
+            g5_frac = -1.0
+            gw_frac = -1.0
+            reset_time_str = "-"
+            raw_reset_timestamp = float("inf")
+            limit_5h_text = "Unknown"
+            g5_colored = format_quota_cell_simple(None, prefix="5h: ", use_color=True)
+            g5_plain = format_quota_cell_simple(None, prefix="5h: ", use_color=False)
+            gw_colored = format_quota_cell_simple(None, prefix="Wk: ", use_color=True)
+            gw_plain = format_quota_cell_simple(None, prefix="Wk: ", use_color=False)
+            line_colored = f"{name:<{acc_width}}{sess_cell}{g5_colored}  {gw_colored}"
+            line_plain = f"{name:<{acc_width}}{sess_cell}{g5_plain}  {gw_plain}"
         else:
+            status = "error"
             g5_frac = -2.0
             gw_frac = -2.0
             reset_time_str = "-"
