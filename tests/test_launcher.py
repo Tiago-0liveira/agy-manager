@@ -504,3 +504,61 @@ class LauncherTests(unittest.TestCase):
             timeout=5,
             check=False,
         )
+
+    def test_run_agy_tracked_session_lifecycle(self) -> None:
+        from agym.sessions import get_session_counts, list_active_sessions
+
+        profile = Profile("personal", self.home_a, "now")
+        observed_counts: list[int] = []
+
+        def fake_exec(agy_path, env, args, replace_process=False):
+            # Inspect session count during execution
+            counts = get_session_counts(data_root=self.root)
+            observed_counts.append(counts.get("personal", 0))
+            return 0
+
+        with mock.patch("agym.launcher.exec_agy_interactive", side_effect=fake_exec):
+            code = run_agy(Path("/bin/agy"), profile, data_root=self.root)
+            self.assertEqual(code, 0)
+
+        # During execution, 1 session was registered
+        self.assertEqual(observed_counts, [1])
+        # After execution completes, session was unregistered
+        final_counts = get_session_counts(data_root=self.root)
+        self.assertEqual(final_counts.get("personal", 0), 0)
+        self.assertEqual(list_active_sessions(data_root=self.root), [])
+
+    def test_run_agy_failed_launch_leaves_no_active_session(self) -> None:
+        from agym.sessions import get_session_counts, list_active_sessions
+
+        profile = Profile("personal", self.home_a, "now")
+
+        def crashing_exec(agy_path, env, args, replace_process=False):
+            counts = get_session_counts(data_root=self.root)
+            self.assertEqual(counts.get("personal", 0), 1)
+            raise RuntimeError("simulated launch crash")
+
+        with mock.patch("agym.launcher.exec_agy_interactive", side_effect=crashing_exec):
+            with self.assertRaises(RuntimeError):
+                run_agy(Path("/bin/agy"), profile, data_root=self.root)
+
+        # After crash, session was cleanly unregistered in finally
+        final_counts = get_session_counts(data_root=self.root)
+        self.assertEqual(final_counts.get("personal", 0), 0)
+        self.assertEqual(list_active_sessions(data_root=self.root), [])
+
+    @mock.patch("agym.launcher.run_agy_capture")
+    def test_auto_prompt_stage1_does_not_track_session(self, mock_capture: mock.Mock) -> None:
+        from agym.sessions import get_session_counts
+
+        mock_capture.return_value = mock.Mock(
+            returncode=1, stdout="", stderr="failed"
+        )
+        profile = Profile("personal", self.home_a, "now")
+        code = run_auto_prompt(Path("/usr/bin/agy"), profile, "my prompt", data_root=self.root)
+        self.assertNotEqual(code, 0)
+
+        # Stage 1 failure should have created 0 sessions
+        counts = get_session_counts(data_root=self.root)
+        self.assertEqual(counts.get("personal", 0), 0)
+

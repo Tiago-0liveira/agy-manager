@@ -330,6 +330,35 @@ def exec_agy_interactive(
     return completed.returncode
 
 
+def exec_agy_interactive_tracked(
+    agy_path: Path,
+    env: Mapping[str, str],
+    args: Sequence[str],
+    profile_name: str,
+    *,
+    replace_process: bool = True,
+    data_root: Path | None = None,
+) -> int:
+    """Wraps exec_agy_interactive with central session registration and cleanup.
+
+    Registers an active session record before launching.
+    Normal exits and failed launches unregister directly via finally.
+    POSIX execve() sessions remain registered until PID cleanup prunes them.
+    """
+    from .sessions import register_session, unregister_session
+
+    session_id = register_session(profile_name, data_root=data_root)
+    try:
+        return exec_agy_interactive(
+            agy_path=agy_path,
+            env=env,
+            args=args,
+            replace_process=replace_process,
+        )
+    finally:
+        unregister_session(session_id, data_root=data_root)
+
+
 def run_agy(
     agy_path: Path,
     profile: Profile,
@@ -337,6 +366,7 @@ def run_agy(
     *,
     replace_process: bool = False,
     is_setup: bool = False,
+    data_root: Path | None = None,
 ) -> int:
     if profile.settings.validation_errors:
         raise ProfileError(
@@ -346,11 +376,13 @@ def run_agy(
     env = build_profile_env(profile.home, profile_name=profile.name)
     cmd_args = build_agy_args(profile, passthrough_args=args, env=env)
     with profile_credential_context(profile.home, is_setup=is_setup):
-        return exec_agy_interactive(
+        return exec_agy_interactive_tracked(
             agy_path=agy_path,
             env=env,
             args=cmd_args,
+            profile_name=profile.name,
             replace_process=replace_process,
+            data_root=data_root,
         )
 
 
@@ -431,6 +463,7 @@ def run_auto_prompt(
     *,
     replace_process: bool = True,
     extra_args: Sequence[str] = (),
+    data_root: Path | None = None,
 ) -> int:
     if profile.settings.validation_errors:
         raise ProfileError(
@@ -490,11 +523,13 @@ def run_auto_prompt(
         env=env,
     )
     with profile_credential_context(profile.home):
-        return exec_agy_interactive(
+        return exec_agy_interactive_tracked(
             agy_path=agy_path,
             env=env,
             args=stage2_args,
+            profile_name=profile.name,
             replace_process=replace_process,
+            data_root=data_root,
         )
 
 
