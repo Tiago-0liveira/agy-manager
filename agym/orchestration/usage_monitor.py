@@ -180,6 +180,8 @@ class UsagePollingEventSink(EventSink):
         *,
         error: str,
     ) -> None:
+        if self._stop.is_set():
+            return
         self._sink.emit(
             OrchestrationEvent(
                 event_id=f"usage-{datetime.now(timezone.utc).timestamp()}",
