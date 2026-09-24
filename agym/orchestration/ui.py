@@ -1021,7 +1021,10 @@ class TerminalEventSink(EventSink):
 
         if etype == EventType.RUN_COMPLETED:
             final_path = payload.get("final_artifact_path") or ""
-            return f"[run] completed" + (f" - final: {final_path}" if final_path else "")
+            if final_path:
+                return f"[run] completed - final: {final_path}"
+            summary = payload.get("summary") or ""
+            return f"[run] completed" + (f": {str(summary)[:80]}" if summary else "")
 
         if etype == EventType.RUN_FAILED:
             err = payload.get("error") or payload.get("reason") or ""
