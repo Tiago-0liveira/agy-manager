@@ -1417,6 +1417,7 @@ class FileRunStore:
             json.dumps(final_result) if isinstance(final_result, dict) else str(final_result)
         )
         state.updated_at = now
+        state.final_artifact_path = str(final_md)
         self.save_run(state)
 
         # Emit RUN_COMPLETED event
