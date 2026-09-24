@@ -518,10 +518,11 @@ class TerminalEventSink(EventSink):
                     self.state.task_type = ass.task_type.value if hasattr(ass.task_type, "value") else str(ass.task_type).upper()
                 elif isinstance(ass, dict) and "task_type" in ass:
                     self.state.task_type = str(ass["task_type"]).upper()
-                if hasattr(ass, "summary") and ass.summary:
-                    self.state.task = str(ass.summary)
-                elif isinstance(ass, dict) and ass.get("summary"):
-                    self.state.task = str(ass["summary"])
+                if not self.state.task:
+                    if hasattr(ass, "summary") and ass.summary:
+                        self.state.task = str(ass.summary)
+                    elif isinstance(ass, dict) and ass.get("summary"):
+                        self.state.task = str(ass["summary"])
             if "complexity" in payload:
                 self.state.complexity = str(payload["complexity"]).upper()
             if "task_type" in payload:
@@ -882,6 +883,12 @@ class TerminalEventSink(EventSink):
                         if eline:
                             lines.append(f"    Error: {eline}")
 
+            lines.append("")
+
+        if self.state.artifact_paths:
+            lines.append(colorize("Artifacts", BOLD, use_color))
+            for artifact_path in self.state.artifact_paths[-8:]:
+                lines.append(f"  {ICON_SUCCESS} {artifact_path}")
             lines.append("")
 
         if self.state.run_status not in {

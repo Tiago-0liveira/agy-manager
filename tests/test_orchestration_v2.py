@@ -429,7 +429,9 @@ class TestV2Presentation(unittest.TestCase):
         self.assertIn("RUN_WORKERS", rendered)
         self.assertIn("Workers disagree about shutdown ownership.", rendered)
         self.assertIn("Inspecting lifecycle tests", rendered)
+        self.assertIn("Artifacts", rendered)
         self.assertIn("artifacts/wave-01/debugging-failure-analysis.md", rendered)
+        self.assertIn("Task           Fix lifecycle", rendered)
 
     def test_non_tty_action_and_activity_are_safe_summaries(self) -> None:
         stream = io.StringIO()
