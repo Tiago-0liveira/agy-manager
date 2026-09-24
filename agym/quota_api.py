@@ -585,7 +585,31 @@ async def fetch_quota_direct_async(
             account=profile.name,
             subscription_date=profile.subscription_date,
         )
-        return usage, synthetic_out
+
+        from .usage import extract_quota_bucket
+
+        b_5h = extract_quota_bucket(usage, "gemini", "5h")
+        if b_5h is not None:
+            return usage, synthetic_out
+
+        # Gemini 5h bucket missing: retry direct request once
+        logger.debug("Direct quota response for profile '%s' is missing Gemini 5h bucket; retrying once", profile.name)
+        try:
+            raw_api_data_retry = await query_quota_api_async(access_token, timeout=timeout)
+            usage_retry, synthetic_out_retry = normalize_api_quota_response(
+                raw_api_data_retry,
+                account=profile.name,
+                subscription_date=profile.subscription_date,
+            )
+            b_5h_retry = extract_quota_bucket(usage_retry, "gemini", "5h")
+            if b_5h_retry is not None:
+                return usage_retry, synthetic_out_retry
+        except Exception as retry_exc:
+            logger.debug("Retry direct quota query failed for profile '%s': %s", profile.name, retry_exc)
+
+        # Still missing: return None to fall back to /usage
+        logger.debug("Direct quota response for profile '%s' still missing Gemini 5h after retry; falling back to /usage", profile.name)
+        return None
     except Exception as exc:
         logger.debug(
             "Direct Cloud Code API query failed for profile '%s': %s",
