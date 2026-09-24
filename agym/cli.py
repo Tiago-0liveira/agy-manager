@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import json
 import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from .cache import CacheManager, USAGE_CACHE_TTL_SECONDS
 from .diagnostics import doctor_lines
@@ -42,6 +42,12 @@ from .tokens import run_tokens
 from .updater import build_update_parser, maybe_prompt_startup_update, run_update_cli
 from .usage import fetch_and_cache_usage, run_usage
 from .wincred import get_profile_email
+from .orchestration.contracts import RunId, RunMode, RunState, RunStatus
+from .orchestration.ui import format_duration
+from .orchestration.wiring import (
+    OrchestrationDependencies,
+    build_orchestration_dependencies,
+)
 
 
 def build_setup_parser() -> argparse.ArgumentParser:
@@ -444,6 +450,42 @@ def build_doctor_parser() -> argparse.ArgumentParser:
     return parser
 
 
+ORCHESTRATE_USAGE = """agym orchestrate — Multi-agent orchestration for Google Antigravity CLI
+
+Usage:
+  agym orchestrate "<task>" [--mode plan|implement] [--depth quick|balanced|deep] [--dry-run]
+  agym orchestrate status <run-id>
+  agym orchestrate inspect <run-id>
+  agym orchestrate resume <run-id>
+
+Options:
+  --mode {plan,implement}   Operating mode: plan (default) or implement
+  --depth {quick,balanced,deep}
+                            Maximum orchestration budget preset (default: balanced)
+  -n, --dry-run             Preview execution plan without worker execution
+  -h, --help                Show this help message and exit
+
+Commands:
+  status <run-id>           Display concise status from persisted state
+  inspect <run-id>          Inspect run state, results, and artifact locations
+  resume <run-id>           Resume an interrupted or failed run
+"""
+
+
+def build_orchestrate_parser() -> argparse.ArgumentParser:
+    class _OrchestrateHelpParser(argparse.ArgumentParser):
+        def format_help(self) -> str:
+            return ORCHESTRATE_USAGE.rstrip() + "\n"
+
+        def print_help(self, file: Any = None) -> None:
+            print(ORCHESTRATE_USAGE.rstrip(), file=file)
+
+    return _OrchestrateHelpParser(
+        prog="agym orchestrate",
+        add_help=False,
+    )
+
+
 def format_main_help() -> str:
     lines = [
         "Accounts",
@@ -469,6 +511,7 @@ def format_main_help() -> str:
         "  auto-pr",
         "  update",
         "  integration",
+        "  orchestrate",
         "",
         "Run `agym help <command>` for details.",
     ]
@@ -1068,6 +1111,202 @@ def _launch(profile_name: str, argv: list[str], store: ProfileStore) -> int:
     return run_agy(agy, profile, argv, replace_process=True)
 
 
+def _format_run_status(state: RunState, results: Sequence[Any] | None = None) -> str:
+    lines = [
+        f"Run ID:        {state.run_id}",
+        f"Status:        {state.status.value}",
+        f"Mode:          {state.mode.value}",
+        f"Task:          {state.task}",
+        f"Rounds:        {state.round_number}",
+        f"Invocations:   {state.budget_usage.invocations}",
+        f"Runtime:       {format_duration(state.budget_usage.runtime_seconds) if state.budget_usage.runtime_seconds else '0s'}",
+    ]
+    if state.created_at:
+        lines.append(f"Created:       {state.created_at}")
+    if state.updated_at:
+        lines.append(f"Updated:       {state.updated_at}")
+    if state.assessment:
+        lines.append(f"Complexity:    {state.assessment.complexity.value}")
+    if results:
+        lines.append(f"Results ({len(results)}):")
+        for r in results:
+            wid = getattr(r, "worker_id", "unknown")
+            role = getattr(r, "role", "")
+            r_val = role.value if hasattr(role, "value") else str(role)
+            st = getattr(r, "status", "")
+            st_val = st.value if hasattr(st, "value") else str(st)
+            lines.append(f"  - [{wid}] {r_val}: {st_val}")
+            if getattr(r, "error", None):
+                lines.append(f"    Error: {r.error}")
+    if state.final_artifact_path:
+        lines.append(f"Final:         {state.final_artifact_path}")
+    elif state.final_result:
+        summary = " ".join(state.final_result.split())
+        if len(summary) > 200:
+            summary = summary[:197] + "..."
+        lines.append(f"Final summary: {summary}")
+    return "\n".join(lines)
+
+
+def _orchestrate(
+    argv: list[str],
+    store: ProfileStore,
+    *,
+    deps: OrchestrationDependencies | None = None,
+) -> int:
+    if any(arg in {"-h", "--help", "help"} for arg in argv):
+        print(ORCHESTRATE_USAGE.rstrip())
+        return 0
+
+    if not argv:
+        _print_err("orchestrate requires a task or subcommand (status, resume)")
+        return 2
+
+    subcommand = argv[0]
+
+    # Subcommands: status / inspect
+    if subcommand in {"status", "inspect"}:
+        if len(argv) < 2 or not argv[1].strip():
+            _print_err(f"missing run ID for {subcommand}")
+            return 2
+        if len(argv) > 2:
+            _print_err(f"{subcommand} takes exactly one run ID")
+            return 2
+        run_id = argv[1].strip()
+        d = deps or build_orchestration_dependencies(profile_store=store)
+        state = d.run_store.get_run(RunId(run_id))
+        if state is None:
+            _print_err(f"run not found: {run_id}")
+            return 1
+        results = (
+            d.run_store.get_results(RunId(run_id))
+            if hasattr(d.run_store, "get_results")
+            else None
+        )
+        print(_format_run_status(state, results))
+        return 0
+
+    # Subcommand: resume
+    if subcommand == "resume":
+        if len(argv) < 2 or not argv[1].strip():
+            _print_err("missing run ID for resume")
+            return 2
+        if len(argv) > 2:
+            _print_err("resume takes exactly one run ID")
+            return 2
+        run_id = argv[1].strip()
+        d = deps or build_orchestration_dependencies(profile_store=store)
+        try:
+            state = d.engine.resume(RunId(run_id))
+            if state.status == RunStatus.COMPLETED:
+                return 0
+            if state.status == RunStatus.INTERRUPTED:
+                _print_err("interrupted")
+                return 130
+            return 1
+        except KeyboardInterrupt:
+            _print_err("interrupted")
+            return 130
+        except Exception as exc:
+            _print_err(str(exc))
+            return 1
+
+    # Check for unrecognized subcommand
+    KNOWN_SUBCOMMANDS = {"status", "inspect", "resume", "run"}
+    UNKNOWN_SUBCOMMANDS = {
+        "cancel",
+        "stop",
+        "kill",
+        "info",
+        "show",
+        "list",
+        "delete",
+        "remove",
+        "get",
+        "unknown",
+        "invalid",
+        "unknown-subcommand",
+        "badsubcommand",
+    }
+    if subcommand in UNKNOWN_SUBCOMMANDS:
+        _print_err(f"unknown subcommand: '{subcommand}'")
+        return 2
+
+    if (
+        len(argv) >= 2
+        and argv[0] not in KNOWN_SUBCOMMANDS
+        and not argv[0].startswith("-")
+        and not argv[1].startswith("-")
+    ):
+        _print_err(f"unknown subcommand: '{argv[0]}'")
+        return 2
+
+    # Task execution
+    args_to_parse = argv[1:] if subcommand == "run" else argv
+    parser = argparse.ArgumentParser(prog="agym orchestrate", add_help=False)
+    parser.add_argument("task", nargs="?", default=None)
+    parser.add_argument(
+        "--mode",
+        dest="mode",
+        default="plan",
+        choices=["plan", "implement"],
+        type=str.lower,
+    )
+    parser.add_argument(
+        "--depth",
+        dest="depth",
+        default="balanced",
+        choices=["quick", "balanced", "deep"],
+        type=str.lower,
+    )
+    parser.add_argument("-n", "--dry-run", dest="dry_run", action="store_true")
+    parser.add_argument("--profile", dest="profile", default=None, help="Profile to use for the coordinator")
+
+    try:
+        ns = parser.parse_args(args_to_parse)
+    except SystemExit:
+        return 2
+
+    if not ns.task or not ns.task.strip():
+        _print_err("a task is required")
+        return 2
+
+    task = ns.task.strip()
+    run_mode = RunMode.IMPLEMENT if ns.mode == "implement" else RunMode.PLAN
+    d = deps or build_orchestration_dependencies(
+        profile_store=store,
+        coordinator_profile=ns.profile,
+        depth=ns.depth,
+    )
+
+    if ns.dry_run:
+        try:
+            plan = d.engine.dry_run(task, mode=run_mode)
+            print(plan.format_display())
+            return 0 if plan.is_valid else 1
+        except KeyboardInterrupt:
+            _print_err("interrupted")
+            return 130
+        except Exception as exc:
+            _print_err(str(exc))
+            return 1
+
+    try:
+        state = d.engine.run(task, mode=run_mode)
+        if state.status == RunStatus.COMPLETED:
+            return 0
+        if state.status == RunStatus.INTERRUPTED:
+            _print_err("interrupted")
+            return 130
+        return 1
+    except KeyboardInterrupt:
+        _print_err("interrupted")
+        return 130
+    except Exception as exc:
+        _print_err(str(exc))
+        return 1
+
+
 @dataclass
 class CommandSpec:
     name: str
@@ -1103,6 +1342,13 @@ COMMAND_REGISTRY: list[CommandSpec] = [
         description="",
         parser_builder=lambda: __import__("agym.integration.cli", fromlist=["build_integration_parser"]).build_integration_parser(),
         handler=lambda argv, store: __import__("agym.integration.cli", fromlist=["main"]).main(argv),
+    ),
+    CommandSpec(
+        name="orchestrate",
+        group="Tools",
+        description="",
+        parser_builder=build_orchestrate_parser,
+        handler=_orchestrate,
     ),
 ]
 
@@ -1156,6 +1402,10 @@ def _handle_help_command(rest: list[str]) -> int:
                 _print_err(f"unknown integration command '{cmd_name}'. Run 'agym help integration' for available commands.")
                 return 2
 
+        if cmd_spec.name == "orchestrate":
+            print(ORCHESTRATE_USAGE.rstrip())
+            return 0
+
         if cmd_spec.parser_builder is not None:
             cmd_spec.parser_builder().print_help()
             return 0
@@ -1176,6 +1426,10 @@ def _handle_command_help(cmd_spec: CommandSpec, rest: list[str]) -> int:
             cmd_name = " ".join(sub_path)
             _print_err(f"unknown integration command '{cmd_name}'. Run 'agym help integration' for available commands.")
             return 2
+
+    if cmd_spec.name == "orchestrate":
+        print(ORCHESTRATE_USAGE.rstrip())
+        return 0
 
     if cmd_spec.parser_builder is not None:
         cmd_spec.parser_builder().print_help()

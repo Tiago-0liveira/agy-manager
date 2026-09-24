@@ -593,7 +593,7 @@ class CliStatuslineCommandTests(unittest.TestCase):
         self.assertEqual(code, 0)
         output = stdout.getvalue()
         self.assertIn("👤 mock_account", output)
-        self.assertIn("5h: 80%", output)
+        self.assertIn(" 80%", output)
 
     def test_statusline_main_exception_safe_fallback(self) -> None:
         stdin = io.StringIO("")

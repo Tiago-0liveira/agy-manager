@@ -2,7 +2,7 @@ name: CI Test Suite
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, feat/coordination]
   workflow_dispatch:
 
 permissions:
@@ -37,6 +37,12 @@ jobs:
           tests.test_host_safety tests.test_launcher tests.test_picker tests.test_profiles
           tests.test_quota_api tests.test_rotator tests.test_statusline tests.test_subscription
           tests.test_tokens tests.test_usage tests.test_updater tests.test_wincred
+          tests.test_orchestration_contracts tests.test_orchestration_coordinator
+          tests.test_orchestration_engine tests.test_orchestration_leases
+          tests.test_orchestration_persistence tests.test_orchestration_protocol
+          tests.test_orchestration_recording tests.test_orchestration_runner
+          tests.test_orchestration_scheduler tests.test_orchestration_ui
+          tests.test_orchestration_v2
           tests.council.test_packaging tests.test_release_version
 
   package:

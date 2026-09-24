@@ -38,6 +38,7 @@ RESERVED_NAMES = {
     "mv",
     "auto-pr",
     "update",
+    "orchestrate",
 }
 
 

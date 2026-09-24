@@ -305,6 +305,13 @@ Changing `HOME` can affect tools launched by Antigravity. `agym` preserves the e
 - The installed `agy` binary is not copied or patched, so profiles naturally use the current host version.
 - Credential file contents are never emitted by `list` or `doctor`.
 
+## Orchestration records
+
+Orchestration runs retain a timestamped trace, separate worker retry attempts,
+coordinator prompts and responses, and streamed subprocess output under the run's
+`attempts/` directory. See [the storage format and inspection command plan](docs/orchestration-observability.md)
+for available evidence, limitations, and the proposed `inspect` and `logs` commands.
+
 ## Tests
 
 ```bash
