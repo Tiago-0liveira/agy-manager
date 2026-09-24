@@ -12,6 +12,8 @@ from __future__ import annotations
 import io
 import math
 import os
+import re
+import shutil
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -48,6 +50,8 @@ __all__ = [
     "TerminalEventSink",
     "OrchestrationUI",
     "PresentationState",
+    "ActivityPresentation",
+    "ProfileUsagePresentation",
     "WorkerPresentation",
     "WavePresentation",
     "WorkerStatus",
@@ -67,6 +71,10 @@ BLUE = "\033[34m"
 MAGENTA = "\033[35m"
 CYAN = "\033[36m"
 GRAY = "\033[90m"
+
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+LIVE_ACTIVITY_LIMIT = 20
+DEFAULT_REFRESH_INTERVAL = 0.25
 
 # Spinner sequence starting with default braille frame
 SPINNER_FRAMES = ["⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "⠋", "⠙"]
@@ -144,6 +152,27 @@ class WorkerStatus(str, Enum):
 
 
 @dataclass
+class ActivityPresentation:
+    """One normalized provider activity item shown in the live dashboard."""
+
+    worker_id: str
+    text: str
+    timestamp: str | None = None
+    invocation_id: str | None = None
+
+
+@dataclass
+class ProfileUsagePresentation:
+    """Compact quota snapshot for one configured AGYM profile."""
+
+    profile_name: str
+    status: str = "unknown"
+    five_hour_remaining: int | None = None
+    week_remaining: int | None = None
+    error: str | None = None
+
+
+@dataclass
 class WorkerPresentation:
     """Visual representation of a worker task within a wave."""
 
@@ -159,6 +188,8 @@ class WorkerPresentation:
     objective: str = ""
     strategy: str = ""
     current_activity: str = ""
+    recent_activity: list[str] = field(default_factory=list)
+    invocation_id: str | None = None
     artifact_path: str | None = None
     wave_number: int = 1
 
@@ -201,6 +232,11 @@ class PresentationState:
     current_action_kind: str = ""
     action_reason: str = ""
     artifact_paths: list[str] = field(default_factory=list)
+    activity_feed: list[ActivityPresentation] = field(default_factory=list)
+    profile_usage: dict[str, ProfileUsagePresentation] = field(default_factory=dict)
+    usage_refreshed_at: str | None = None
+    usage_error: str | None = None
+    usage_loading: bool = False
 
 
 def render_dry_run(
@@ -325,6 +361,7 @@ class TerminalEventSink(EventSink):
         is_tty: bool | None = None,
         use_color: bool | None = None,
         run_id: RunId | str | None = None,
+        refresh_interval: float = DEFAULT_REFRESH_INTERVAL,
     ) -> None:
         self._stream = stream if stream is not None else sys.stdout
         if is_tty is not None:
@@ -346,6 +383,10 @@ class TerminalEventSink(EventSink):
         self._lock = threading.Lock()
         self._last_rendered_line_count = 0
         self._spinner_idx = 0
+        self._refresh_interval = max(0.05, float(refresh_interval))
+        self._refresh_stop = threading.Event()
+        self._refresh_thread: threading.Thread | None = None
+        self._closed = False
 
     @property
     def is_tty(self) -> bool:
@@ -363,8 +404,56 @@ class TerminalEventSink(EventSink):
 
             if self._is_tty:
                 self._render_tty_update()
+                if self._is_terminal_state():
+                    self._refresh_stop.set()
+                else:
+                    self._ensure_refresh_thread()
             else:
                 self._log_non_tty(event)
+
+    def close(self) -> None:
+        """Stop periodic live redraws without affecting the orchestration run."""
+        self._closed = True
+        self._refresh_stop.set()
+        thread = self._refresh_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=max(0.1, self._refresh_interval * 2))
+
+    def _is_terminal_state(self) -> bool:
+        return self.state.run_status in {
+            RunStatus.COMPLETED.value,
+            RunStatus.FAILED.value,
+            RunStatus.INTERRUPTED.value,
+        }
+
+    def _can_auto_refresh(self) -> bool:
+        if not self._is_tty:
+            return False
+        try:
+            return os.isatty(self._stream.fileno())
+        except (AttributeError, OSError, io.UnsupportedOperation, ValueError):
+            return False
+
+    def _ensure_refresh_thread(self) -> None:
+        """Redraw elapsed time/spinners while models are busy and emit no events."""
+        if self._closed or self._is_terminal_state() or not self._can_auto_refresh():
+            return
+        if self._refresh_thread is not None and self._refresh_thread.is_alive():
+            return
+        self._refresh_stop.clear()
+        self._refresh_thread = threading.Thread(
+            target=self._refresh_loop,
+            name="agym-orchestration-ui",
+            daemon=True,
+        )
+        self._refresh_thread.start()
+
+    def _refresh_loop(self) -> None:
+        while not self._refresh_stop.wait(self._refresh_interval):
+            with self._lock:
+                if self._closed or self._is_terminal_state():
+                    return
+                self._render_tty_update()
 
     def get_events(self, run_id: RunId | str) -> list[OrchestrationEvent]:
         """Returns all events recorded for a given run."""
@@ -644,6 +733,9 @@ class TerminalEventSink(EventSink):
                 wp = self._ensure_worker(str(wid), role)
                 wp.status = WorkerStatus.RUNNING
                 wp.started_at = payload.get("started_at") or event.timestamp
+                invocation_id = payload.get("invocation_id") or (getattr(inv, "invocation_id", None) if inv else None)
+                if invocation_id:
+                    wp.invocation_id = str(invocation_id)
                 if "profile_name" in payload and payload["profile_name"]:
                     wp.profile_name = str(payload["profile_name"])
                 if payload.get("strategy"):
@@ -661,6 +753,8 @@ class TerminalEventSink(EventSink):
                 wp.completed_at = payload.get("completed_at") or event.timestamp
                 if "profile_name" in payload and payload["profile_name"]:
                     wp.profile_name = str(payload["profile_name"])
+                if payload.get("strategy"):
+                    wp.strategy = str(payload["strategy"])
                 if "duration" in payload or "duration_seconds" in payload:
                     try:
                         wp.duration_seconds = float(payload.get("duration") or payload.get("duration_seconds"))
@@ -717,11 +811,70 @@ class TerminalEventSink(EventSink):
                     if st and et:
                         wp.duration_seconds = max(0.0, (et - st).total_seconds())
 
+        elif etype == EventType.USAGE_UPDATED:
+            if payload.get("fetching"):
+                self.state.usage_loading = True
+                return
+
+            self.state.usage_loading = False
+            refreshed_at = payload.get("refreshed_at") or event.timestamp
+            self.state.usage_refreshed_at = str(refreshed_at) if refreshed_at else None
+            self.state.usage_error = str(payload.get("error")) if payload.get("error") else None
+            profiles = payload.get("profiles", [])
+            if isinstance(profiles, list):
+                next_usage: dict[str, ProfileUsagePresentation] = {}
+                for item in profiles:
+                    if not isinstance(item, dict):
+                        continue
+                    profile_name = str(item.get("profile_name", "")).strip()
+                    if not profile_name:
+                        continue
+
+                    def _pct(value: Any) -> int | None:
+                        if value is None:
+                            return None
+                        try:
+                            return max(0, min(100, int(round(float(value)))))
+                        except (TypeError, ValueError):
+                            return None
+
+                    next_usage[profile_name] = ProfileUsagePresentation(
+                        profile_name=profile_name,
+                        status=str(item.get("status", "unknown")),
+                        five_hour_remaining=_pct(item.get("five_hour_remaining")),
+                        week_remaining=_pct(item.get("week_remaining")),
+                        error=str(item.get("error")) if item.get("error") else None,
+                    )
+                if next_usage:
+                    self.state.profile_usage = next_usage
+
         elif etype == EventType.INVOCATION_ACTIVITY:
             wid = payload.get("worker_id")
             if wid:
                 wp = self._ensure_worker(str(wid))
-                wp.current_activity = str(payload.get("activity", ""))[:120]
+                activity = " ".join(str(payload.get("activity", "")).split())[:120]
+                invocation_id = payload.get("invocation_id")
+                if invocation_id:
+                    wp.invocation_id = str(invocation_id)
+                if activity:
+                    wp.current_activity = activity
+                    if not wp.recent_activity or wp.recent_activity[-1] != activity:
+                        wp.recent_activity.append(activity)
+                        del wp.recent_activity[:-LIVE_ACTIVITY_LIMIT]
+
+                    entry = ActivityPresentation(
+                        worker_id=str(wid),
+                        text=activity,
+                        timestamp=event.timestamp,
+                        invocation_id=str(invocation_id) if invocation_id else wp.invocation_id,
+                    )
+                    if (
+                        not self.state.activity_feed
+                        or self.state.activity_feed[-1].worker_id != entry.worker_id
+                        or self.state.activity_feed[-1].text != entry.text
+                    ):
+                        self.state.activity_feed.append(entry)
+                        del self.state.activity_feed[:-LIVE_ACTIVITY_LIMIT]
 
         elif etype == EventType.ARTIFACT_WRITTEN:
             artifact_path = str(payload.get("artifact_path", ""))
@@ -812,6 +965,46 @@ class TerminalEventSink(EventSink):
             lines.append(f"{label_fleet}{icon} checking")
 
         lines.append("")
+
+        if self.state.profile_usage or self.state.usage_error or self.state.usage_loading:
+            usage_age = ""
+            refreshed = _parse_timestamp(self.state.usage_refreshed_at)
+            if refreshed is not None:
+                now = datetime.now(refreshed.tzinfo) if refreshed.tzinfo else datetime.now()
+                usage_age = f" · refreshed {format_duration(max(0.0, (now - refreshed).total_seconds()))} ago"
+            refresh_state = " · refreshing…" if self.state.usage_loading else ""
+            lines.append(colorize(f"Quota remaining{usage_age}{refresh_state}", BOLD, use_color))
+
+            active_profiles = {
+                w.profile_name
+                for w in self.state.workers.values()
+                if w.profile_name and w.status in (WorkerStatus.RUNNING, WorkerStatus.RETRYING)
+            }
+            if self.state.coordinator_profile:
+                active_profiles.add(self.state.coordinator_profile)
+
+            if self.state.profile_usage:
+                lines.append("  Profile              5h    Week")
+                for name, usage in sorted(
+                    self.state.profile_usage.items(),
+                    key=lambda item: (
+                        item[0] not in active_profiles,
+                        item[0].lower(),
+                    ),
+                ):
+                    marker = "*" if name in active_profiles else " "
+                    five = f"{usage.five_hour_remaining:>3}%" if usage.five_hour_remaining is not None else "  ? "
+                    week = f"{usage.week_remaining:>3}%" if usage.week_remaining is not None else "  ? "
+                    suffix = ""
+                    if usage.status != "success" and usage.error:
+                        suffix = f"  {usage.error[:50]}"
+                    lines.append(f" {marker} {name[:18].ljust(18)} {five}  {week}{suffix}")
+                if active_profiles:
+                    lines.append("  * active profile")
+            elif self.state.usage_error:
+                lines.append(f"  unavailable: {self.state.usage_error[:80]}")
+            lines.append("")
+
         if self.state.current_action_kind:
             lines.append(colorize("Coordinator", BOLD, use_color))
             lines.append(f"  → {self.state.current_action_kind}")
@@ -837,7 +1030,16 @@ class TerminalEventSink(EventSink):
                     spinner_char = SPINNER_FRAMES[self._spinner_idx % len(SPINNER_FRAMES)]
                     icon = colorize(spinner_char, YELLOW, use_color)
                     p_name = w.profile_name or ""
-                    line = f"  {name_col}{icon} {p_name}".rstrip()
+                    suffix_parts: list[str] = []
+                    if w.current_activity and w.started_at:
+                        started = _parse_timestamp(w.started_at)
+                        if started is not None:
+                            now = datetime.now(started.tzinfo) if started.tzinfo else datetime.now()
+                            suffix_parts.append(format_duration(max(0.0, (now - started).total_seconds())))
+                    if w.strategy:
+                        suffix_parts.append(w.strategy.lower())
+                    suffix = f" · {' · '.join(suffix_parts)}" if suffix_parts else ""
+                    line = f"  {name_col}{icon} {p_name}{suffix}".rstrip()
 
                 elif w.status == WorkerStatus.FAILED:
                     icon = colorize(ICON_FAILED, RED, use_color)
@@ -886,6 +1088,25 @@ class TerminalEventSink(EventSink):
                         if eline:
                             lines.append(f"    Error: {eline}")
 
+            lines.append("")
+
+        if self.state.activity_feed:
+            running_count = sum(w.status == WorkerStatus.RUNNING for w in self.state.workers.values())
+            completed_count = sum(w.status == WorkerStatus.SUCCEEDED for w in self.state.workers.values())
+            activity_title = (
+                f"Live activity · last {LIVE_ACTIVITY_LIMIT} · "
+                f"{running_count} running · {completed_count} done"
+            )
+            lines.append(colorize(activity_title, BOLD, use_color))
+            for entry in self.state.activity_feed[-LIVE_ACTIVITY_LIMIT:]:
+                worker = self.state.workers.get(entry.worker_id)
+                label = worker.display_name if worker is not None else entry.worker_id
+                clock = ""
+                timestamp = _parse_timestamp(entry.timestamp)
+                if timestamp is not None:
+                    clock = timestamp.astimezone().strftime("%H:%M:%S")
+                prefix = f"{clock} " if clock else ""
+                lines.append(f"  {prefix}{label.ljust(14)} {entry.text}".rstrip())
             lines.append("")
 
         if self.state.artifact_paths:
@@ -943,10 +1164,24 @@ class TerminalEventSink(EventSink):
 
         return "\n".join(lines).rstrip() + "\n"
 
+    def _terminal_width(self) -> int:
+        try:
+            return max(40, shutil.get_terminal_size(fallback=(120, 30)).columns)
+        except OSError:
+            return 120
+
+    def _fit_terminal_line(self, line: str) -> str:
+        """Prevent physical terminal wrapping from corrupting in-place redraws."""
+        width = max(20, self._terminal_width() - 1)
+        plain = ANSI_ESCAPE_RE.sub("", line)
+        if len(plain) <= width:
+            return line
+        return plain[: max(1, width - 1)] + "…"
+
     def _render_tty_update(self) -> None:
         """Rerenders TTY view in-place in active terminal."""
         rendered = self._format_tty_view(use_color=self._use_color)
-        lines = rendered.splitlines()
+        lines = [self._fit_terminal_line(line) for line in rendered.splitlines()]
 
         # In-place repositioning if previously rendered
         if self._last_rendered_line_count > 0:

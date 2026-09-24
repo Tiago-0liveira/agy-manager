@@ -18,6 +18,7 @@ import ast
 import io
 import os
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -47,6 +48,9 @@ from agym.orchestration.contracts import (
     WorkerRole,
     WorkspaceMode,
 )
+from agym.orchestration.streaming import extract_activity_description
+from agym.orchestration.usage_monitor import UsagePollingEventSink
+from agym.usage import AccountUsage, UsageBucket, UsageGroup
 from agym.orchestration.ui import (
     ROLE_DISPLAY_NAMES,
     OrchestrationUI,
@@ -832,6 +836,240 @@ class TestDryRunViewRendering(unittest.TestCase):
         self.assertIn("MEDIUM", out)
         self.assertIn("available capacity:", out)
         self.assertIn("5 available", out)
+
+
+class TestLiveActivityDashboard(unittest.TestCase):
+    """Live dashboard activity should be useful, bounded, and safe."""
+
+    def test_activity_feed_keeps_last_20_meaningful_entries(self) -> None:
+        sink = TerminalEventSink(
+            stream=io.StringIO(),
+            is_tty=False,
+            use_color=False,
+            run_id="run-live-feed",
+        )
+        for i in range(25):
+            sink.emit(
+                OrchestrationEvent(
+                    event_id=f"a-{i}",
+                    run_id=RunId("run-live-feed"),
+                    type=EventType.INVOCATION_ACTIVITY,
+                    payload={
+                        "worker_id": "architect",
+                        "invocation_id": "inv-architect",
+                        "activity": f"ReadFile src/module_{i}.py",
+                    },
+                )
+            )
+
+        worker = sink.state.workers["architect"]
+        self.assertEqual(len(worker.recent_activity), 20)
+        self.assertEqual(worker.recent_activity[0], "ReadFile src/module_5.py")
+        self.assertEqual(worker.current_activity, "ReadFile src/module_24.py")
+        self.assertEqual(worker.invocation_id, "inv-architect")
+
+        self.assertEqual(len(sink.state.activity_feed), 20)
+        rendered = sink.render(use_color=False)
+        self.assertIn("Live activity · last 20", rendered)
+        self.assertNotIn("src/module_0.py", rendered)
+        self.assertIn("src/module_24.py", rendered)
+
+    def test_activity_feed_deduplicates_consecutive_noise(self) -> None:
+        sink = TerminalEventSink(
+            stream=io.StringIO(),
+            is_tty=False,
+            use_color=False,
+            run_id="run-dedupe",
+        )
+        for event_id in ("one", "two"):
+            sink.emit(
+                OrchestrationEvent(
+                    event_id=event_id,
+                    run_id=RunId("run-dedupe"),
+                    type=EventType.INVOCATION_ACTIVITY,
+                    payload={"worker_id": "testing", "activity": "RunTests tests/test_cli.py"},
+                )
+            )
+        self.assertEqual(len(sink.state.activity_feed), 1)
+        self.assertEqual(sink.state.workers["testing"].recent_activity, ["RunTests tests/test_cli.py"])
+
+    def test_stringio_does_not_spawn_periodic_refresh_thread(self) -> None:
+        sink = TerminalEventSink(
+            stream=io.StringIO(),
+            is_tty=True,
+            use_color=False,
+            run_id="run-test-stream",
+            refresh_interval=0.05,
+        )
+        sink.emit(
+            OrchestrationEvent(
+                event_id="created",
+                run_id=RunId("run-test-stream"),
+                type=EventType.RUN_CREATED,
+            )
+        )
+        self.assertIsNone(sink._refresh_thread)
+        sink.close()
+
+    def test_activity_parser_understands_common_top_level_tool_calls(self) -> None:
+        line = '{"event":"tool_call","name":"read_file","path":"agym/cli.py"}'
+        self.assertEqual(
+            extract_activity_description(line),
+            "read_file agym/cli.py",
+        )
+
+    def test_activity_parser_understands_nested_tool_info_and_strips_ansi(self) -> None:
+        line = (
+            '{"event":"step_update","step_update":{"tool_info":'
+            '{"display_name":"RunCommand","command":"\\u001b[31mpython -m unittest\\u001b[0m"}}}'
+        )
+        self.assertEqual(
+            extract_activity_description(line),
+            "RunCommand python -m unittest",
+        )
+
+    def test_activity_parser_ignores_final_response_content(self) -> None:
+        line = '{"event":"result","result":{"response":"private final text"}}'
+        self.assertIsNone(extract_activity_description(line))
+
+
+class TestLiveUsageDashboard(unittest.TestCase):
+    """Periodic usage refresh should batch profiles and stay compact in the TUI."""
+
+    def test_usage_snapshot_renders_5h_and_week_remaining(self) -> None:
+        sink = TerminalEventSink(
+            stream=io.StringIO(),
+            is_tty=False,
+            use_color=False,
+            run_id="run-usage",
+        )
+        sink.emit(
+            OrchestrationEvent(
+                event_id="lease",
+                run_id=RunId("run-usage"),
+                type=EventType.PROFILE_LEASED,
+                payload={"worker_id": "coordinator", "profile_name": "p1"},
+            )
+        )
+        sink.emit(
+            OrchestrationEvent(
+                event_id="usage",
+                run_id=RunId("run-usage"),
+                type=EventType.USAGE_UPDATED,
+                payload={
+                    "refreshed_at": "2026-09-24T22:00:00+00:00",
+                    "profiles": [
+                        {
+                            "profile_name": "p1",
+                            "status": "success",
+                            "five_hour_remaining": 82,
+                            "week_remaining": 64,
+                        },
+                        {
+                            "profile_name": "p2",
+                            "status": "success",
+                            "five_hour_remaining": 41,
+                            "week_remaining": 91,
+                        },
+                    ],
+                },
+            )
+        )
+
+        rendered = sink.render(use_color=False)
+        self.assertIn("Quota remaining", rendered)
+        self.assertIn("Profile", rendered)
+        self.assertIn("5h", rendered)
+        self.assertIn("Week", rendered)
+        self.assertIn("p1", rendered)
+        self.assertIn("82%", rendered)
+        self.assertIn("64%", rendered)
+        self.assertIn("p2", rendered)
+        self.assertIn("41%", rendered)
+        self.assertIn("91%", rendered)
+        self.assertIn("* active profile", rendered)
+
+    def test_usage_poller_batches_profiles_and_forces_refresh(self) -> None:
+        class FakeProfile:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        class FakeStore:
+            def list(self):
+                return [FakeProfile("p1"), FakeProfile("p2"), FakeProfile("p3")]
+
+        called = threading.Event()
+        captured = {}
+
+        async def fake_fetcher(agy_path, profiles, **kwargs):
+            captured["agy_path"] = agy_path
+            captured["profiles"] = [p.name for p in profiles]
+            captured["kwargs"] = kwargs
+            called.set()
+            group = UsageGroup(
+                name="Gemini",
+                description=None,
+                buckets=[
+                    UsageBucket(
+                        id="g5",
+                        name="5h",
+                        window="5h",
+                        remaining_fraction=0.73,
+                        reset_time=None,
+                    ),
+                    UsageBucket(
+                        id="gw",
+                        name="Week",
+                        window="week",
+                        remaining_fraction=0.88,
+                        reset_time=None,
+                    ),
+                ],
+            )
+            return [
+                AccountUsage(account=p.name, status="success", groups=[group])
+                for p in profiles
+            ]
+
+        sink = TerminalEventSink(
+            stream=io.StringIO(),
+            is_tty=False,
+            use_color=False,
+            run_id="run-poll",
+        )
+        poller = UsagePollingEventSink(
+            sink,
+            profile_store=FakeStore(),
+            agy_path=Path("agy"),
+            interval_seconds=60,
+            fetcher=fake_fetcher,
+        )
+
+        poller.emit(
+            OrchestrationEvent(
+                event_id="created",
+                run_id=RunId("run-poll"),
+                type=EventType.RUN_CREATED,
+            )
+        )
+        self.assertTrue(called.wait(2.0))
+        deadline = time.monotonic() + 2.0
+        while not sink.state.profile_usage and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertEqual(captured["profiles"], ["p1", "p2", "p3"])
+        self.assertTrue(captured["kwargs"]["force_refresh"])
+        self.assertEqual(sink.state.profile_usage["p1"].five_hour_remaining, 73)
+        self.assertEqual(sink.state.profile_usage["p1"].week_remaining, 88)
+
+        poller.emit(
+            OrchestrationEvent(
+                event_id="done",
+                run_id=RunId("run-poll"),
+                type=EventType.RUN_COMPLETED,
+            )
+        )
+        self.assertTrue(poller._stop.is_set())
 
 
 class TestThreadSafetyAndEdgeCases(unittest.TestCase):

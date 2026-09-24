@@ -560,6 +560,23 @@ class FileRunStore:
             if stage_dir.exists():
                 shutil.rmtree(stage_dir, ignore_errors=True)
 
+        # create_run writes RUN_CREATED directly so the run directory is atomic.
+        # Broadcast that already-persisted event after the rename; otherwise the
+        # live TUI does not learn the task/run start until a later lifecycle event.
+        from agym.orchestration.recording import append_trace
+        append_trace(
+            self,
+            str(rid),
+            "orchestration",
+            initial_event.to_dict(),
+            event_id=str(initial_event.event_id),
+        )
+        if self.event_sink is not None:
+            try:
+                self.event_sink.emit(initial_event)
+            except Exception as exc:
+                logger.warning("EventSink failed to emit initial run event: %s", exc)
+
         return state
 
     # ------------------------------------------------------------------------
@@ -811,6 +828,7 @@ class FileRunStore:
             strategy = invocation.strategy
             ws_mode = invocation.workspace_mode
             prompt = invocation.prompt
+            objective = ""
             conv_id = invocation.conversation_id
         elif isinstance(invocation, WorkerRequest):
             iid = InvocationId(invocation_id or f"inv-{invocation.worker_id}-{uuid.uuid4().hex[:6]}")
@@ -819,6 +837,7 @@ class FileRunStore:
             strategy = invocation.strategy
             ws_mode = invocation.workspace_mode
             prompt = invocation.objective
+            objective = invocation.objective
             conv_id = None
         elif isinstance(invocation, dict):
             iid = InvocationId(invocation_id or invocation.get("invocation_id") or f"inv-{uuid.uuid4().hex[:8]}")
@@ -827,6 +846,7 @@ class FileRunStore:
             strategy = ExecutionStrategy(invocation.get("strategy", ExecutionStrategy.STANDARD))
             ws_mode = WorkspaceMode(invocation.get("workspace_mode", WorkspaceMode.READ_ONLY))
             prompt = str(invocation.get("prompt", invocation.get("objective", "")))
+            objective = str(invocation.get("objective", ""))
             conv_id = (
                 ConversationId(invocation["conversation_id"])
                 if invocation.get("conversation_id") is not None
@@ -864,7 +884,7 @@ class FileRunStore:
                 "worker_id": str(wid),
                 "role": role.value,
                 "strategy": strategy.value,
-                "objective": prompt[:300],
+                "objective": objective[:300],
             },
         )
         self.emit(event)
