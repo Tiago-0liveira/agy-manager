@@ -282,34 +282,113 @@ class TestPickerFormattingAndSorting(unittest.TestCase):
 
     def test_color_coding_thresholds(self) -> None:
         now = datetime(2026, 9, 22, 12, 0, 0, tzinfo=timezone.utc)
-        # > 50% -> Green (\033[32m)
-        u_green = _make_sample_usage("p-green", gemini_5h_fraction=0.51)
-        # 15% - 50% -> Yellow (\033[33m)
-        u_yellow = _make_sample_usage("p-yellow", gemini_5h_fraction=0.30)
-        # < 15% -> Red (\033[31m)
-        u_red = _make_sample_usage("p-red", gemini_5h_fraction=0.10)
+        u_green = _make_sample_usage("p-green", gemini_5h_fraction=0.85)
+        u_yellow = _make_sample_usage("p-yellow", gemini_5h_fraction=0.40)
+        u_red = _make_sample_usage("p-red", gemini_5h_fraction=0.05)
         u_err = _make_sample_usage("p-err", status="error")
 
         items = prepare_accounts_for_picker([u_green, u_yellow, u_red, u_err], now=now, use_color=True)
         item_map = {item.account_name: item for item in items}
 
-        self.assertIn("\033[32m", item_map["p-green"].formatted_line)
-        self.assertIn("\033[33m", item_map["p-yellow"].formatted_line)
-        self.assertIn("\033[31m", item_map["p-red"].formatted_line)
-        self.assertIn("\033[31m", item_map["p-err"].formatted_line)
+        # Uses shared palette from usage_graphs
+        self.assertIn("\033[38;5;40m", item_map["p-green"].formatted_line)   # Green for 85%
+        self.assertIn("\033[38;5;214m", item_map["p-yellow"].formatted_line) # Amber for 40%
+        self.assertIn("\033[38;5;196m", item_map["p-red"].formatted_line)    # Red for 5%
+        self.assertIn("\033[31m", item_map["p-err"].formatted_line)          # Red for error
 
     def test_line_layout_format(self) -> None:
         now = datetime(2026, 9, 22, 12, 0, 0, tzinfo=timezone.utc)
         u = _make_sample_usage("personal", gemini_5h_fraction=0.84, gemini_5h_reset_dt=now + timedelta(hours=1, minutes=45))
-        items = prepare_accounts_for_picker([u], now=now, use_color=False)
+        items = prepare_accounts_for_picker([u], session_counts={"personal": 2}, now=now, use_color=False)
         item = items[0]
 
         # Check plain formatted line structure
-        # [●] personal              |  5h: [████░]  84%  |  Reset in: 1h 45m
-        self.assertIn("[●] personal", item.formatted_line_plain)
-        self.assertIn("|  5h:", item.formatted_line_plain)
+        self.assertIn("personal", item.formatted_line_plain)
+        self.assertIn("2", item.formatted_line_plain)
+        self.assertIn("5h:", item.formatted_line_plain)
         self.assertIn("84%", item.formatted_line_plain)
-        self.assertIn("|  Reset in: 1h 45m", item.formatted_line_plain)
+        self.assertIn("Wk:", item.formatted_line_plain)
+        self.assertNotIn("Sub", item.formatted_line_plain)
+
+    def test_picker_display_renders_target_layout(self) -> None:
+        now = datetime(2026, 9, 22, 12, 0, 0, tzinfo=timezone.utc)
+        u1 = _make_sample_usage("ttb", gemini_5h_fraction=0.82, gemini_5h_reset_dt=now + timedelta(hours=2))
+        u2 = _make_sample_usage("account2", gemini_5h_fraction=0.98, gemini_5h_reset_dt=now + timedelta(hours=4))
+        items = prepare_accounts_for_picker(
+            [u1, u2],
+            session_counts={"ttb": 2, "account2": 0},
+            now=now,
+            use_color=False,
+        )
+        picker = AccountPicker(items, freshness_summary="Data: Cached · 45s ago", use_color=False)
+        lines = picker._render_menu_lines()
+        rendered = "\n".join(lines)
+
+        self.assertIn("Data: Cached · 45s ago", rendered)
+        self.assertIn("Account          Sess   Gemini 5h                 Gemini Wk", rendered)
+        self.assertIn("> account2       0      5h: [█████████▊]  98%   4h  Wk: [██████████] 100%    -", rendered)
+        self.assertIn("  ttb            2      5h: [████████▎░]  82%   2h  Wk: [██████████] 100%    -", rendered)
+        self.assertNotIn("Sub", rendered)
+
+    def test_picker_sorting_complete_tiebreak(self) -> None:
+        now = datetime(2026, 9, 22, 12, 0, 0, tzinfo=timezone.utc)
+
+        # 1. Gemini 5h remaining descending
+        u_5h_high = _make_sample_usage("p_5h_high", gemini_5h_fraction=0.90)
+        u_5h_low = _make_sample_usage("p_5h_low", gemini_5h_fraction=0.70)
+
+        # 2. Gemini weekly remaining descending (same 5h 0.80)
+        u_wk_high = _make_sample_usage("p_wk_high", gemini_5h_fraction=0.80)
+        # Manually alter weekly bucket fraction
+        u_wk_high.groups[0].buckets[0] = UsageBucket(
+            id="gemini-weekly", name="Weekly", window="weekly", remaining_fraction=0.95, reset_time=None
+        )
+        u_wk_low = _make_sample_usage("p_wk_low", gemini_5h_fraction=0.80)
+        u_wk_low.groups[0].buckets[0] = UsageBucket(
+            id="gemini-weekly", name="Weekly", window="weekly", remaining_fraction=0.40, reset_time=None
+        )
+
+        # 3. Open sessions ascending (same 5h 0.60, same weekly 1.0)
+        u_sess_0 = _make_sample_usage("p_sess_0", gemini_5h_fraction=0.60)
+        u_sess_2 = _make_sample_usage("p_sess_2", gemini_5h_fraction=0.60)
+        session_counts = {"p_sess_0": 0, "p_sess_2": 2}
+
+        # 4. 5h reset ascending (same 5h 0.0, same weekly 1.0, same sess 0)
+        u_reset_soon = _make_sample_usage("p_reset_soon", gemini_5h_fraction=0.0, gemini_5h_reset_dt=now + timedelta(minutes=10))
+        u_reset_late = _make_sample_usage("p_reset_late", gemini_5h_fraction=0.0, gemini_5h_reset_dt=now + timedelta(minutes=45))
+
+        # 5. Profile name ascending (same everything)
+        u_name_a = _make_sample_usage("alpha", gemini_5h_fraction=0.50)
+        u_name_b = _make_sample_usage("beta", gemini_5h_fraction=0.50)
+
+        all_usages = [
+            u_name_b,
+            u_reset_late,
+            u_sess_2,
+            u_5h_low,
+            u_wk_low,
+            u_name_a,
+            u_reset_soon,
+            u_sess_0,
+            u_wk_high,
+            u_5h_high,
+        ]
+
+        items = prepare_accounts_for_picker(all_usages, session_counts=session_counts, now=now, use_color=False)
+        order = [item.account_name for item in items]
+        expected_order = [
+            "p_5h_high",     # 5h: 0.90
+            "p_wk_high",     # 5h: 0.80, wk: 0.95
+            "p_wk_low",      # 5h: 0.80, wk: 0.40
+            "p_5h_low",      # 5h: 0.70
+            "p_sess_0",      # 5h: 0.60, sess: 0
+            "p_sess_2",      # 5h: 0.60, sess: 2
+            "alpha",         # 5h: 0.50, name: alpha
+            "beta",          # 5h: 0.50, name: beta
+            "p_reset_soon",  # 5h: 0.0, reset: 10m
+            "p_reset_late",  # 5h: 0.0, reset: 45m
+        ]
+        self.assertEqual(order, expected_order)
 
 
 class TestAccountPickerInteractive(unittest.TestCase):
@@ -429,6 +508,8 @@ class TestSelectCLICommand(unittest.TestCase):
                 force=False,
                 agy_path=None,
                 cache_manager=cm,
+                cache_ttl=300.0,
+                data_root=Path(tmp) / "data",
                 runner=None,
             )
 
@@ -446,6 +527,8 @@ class TestSelectCLICommand(unittest.TestCase):
                 force=True,
                 agy_path=None,
                 cache_manager=cm,
+                cache_ttl=300.0,
+                data_root=Path(tmp) / "data",
                 runner=None,
             )
 
@@ -460,6 +543,46 @@ class TestSelectCLICommand(unittest.TestCase):
 
             self.assertEqual(code3, 0)
             self.assertIn("Fetching fresh usage data...", out3.getvalue())
+
+    @mock.patch("agym.cli.fetch_and_cache_usage")
+    @mock.patch("agym.cli.run_agy")
+    @mock.patch("agym.cli.resolve_agy")
+    @mock.patch("agym.cli.ProfileStore")
+    def test_select_uses_configured_cache_ttl(
+        self,
+        Store: mock.Mock,
+        resolve: mock.Mock,
+        run_mock: mock.Mock,
+        mock_fetch: mock.Mock,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ProfileStore(Path(tmp) / "config", Path(tmp) / "data")
+            p = store.create("p1")
+            store.set_usage_cache_ttl(45.0)
+            Store.return_value = store
+            resolve.return_value = Path("/mock/agy")
+            run_mock.return_value = 0
+            cm = CacheManager(cache_root=Path(tmp) / "cache")
+            now = datetime.now(timezone.utc)
+            cm.set_usage("p1", {"status": "success"}, SAMPLE_REAL_RESPONSE, now=now)
+            mock_fetch.return_value = [_make_sample_usage("p1")]
+
+            out = io.StringIO()
+            with mock.patch("agym.cli.CacheManager", return_value=cm):
+                with mock.patch("agym.cli.run_picker", return_value="p1"):
+                    with mock.patch("sys.stdout", out):
+                        code = cli.main(["select"])
+
+            self.assertEqual(code, 0)
+            mock_fetch.assert_called_with(
+                profiles=[p],
+                force=False,
+                agy_path=None,
+                cache_manager=cm,
+                cache_ttl=45.0,
+                data_root=Path(tmp) / "data",
+                runner=None,
+            )
 
     @mock.patch("agym.cli.fetch_and_cache_usage")
     @mock.patch("agym.cli.ProfileStore")

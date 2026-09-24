@@ -8,7 +8,13 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
-from .cache import CacheManager, USAGE_CACHE_TTL_SECONDS, format_duration, parse_duration_seconds
+from .cache import (
+    CacheManager,
+    USAGE_CACHE_TTL_SECONDS,
+    format_cache_summary,
+    format_duration,
+    parse_duration_seconds,
+)
 from .diagnostics import doctor_lines
 from .git.auto_pr import AutoPrError, build_auto_pr_parser, handle_auto_pr, parse_auto_pr_args
 from .launcher import (
@@ -30,6 +36,7 @@ from .profiles import (
     validate_profile_name,
 )
 from .rotator import AccountRotator, RotationError
+from .sessions import get_session_counts
 from .subscription import (
     SubscriptionError,
     calculate_subscription_health,
@@ -962,10 +969,11 @@ def _select(
         out.flush()
         return 0
 
-    cm = cache_manager if cache_manager is not None else CacheManager()
+    cache_ttl = store.get_usage_cache_ttl()
+    cm = cache_manager if cache_manager is not None else CacheManager(cache_root=store.data_root / "cache" if store.data_root else None)
 
     needs_live = ns.fresh or any(
-        cm.get_usage(p.name, max_age=USAGE_CACHE_TTL_SECONDS) is None
+        cm.get_usage(p.name, max_age=cache_ttl) is None
         for p in profiles
     )
 
@@ -978,14 +986,24 @@ def _select(
         force=ns.fresh,
         agy_path=agy_path,
         cache_manager=cm,
+        cache_ttl=cache_ttl,
+        data_root=store.data_root,
         runner=runner,
     )
 
     use_color = hasattr(out, "isatty") and out.isatty()
-    items = prepare_accounts_for_picker(usages, use_color=use_color)
+    session_counts = get_session_counts(data_root=store.data_root)
+    freshness_summary = format_cache_summary(usages, use_color=use_color)
+
+    items = prepare_accounts_for_picker(
+        usages,
+        session_counts=session_counts,
+        use_color=use_color,
+    )
 
     selected = run_picker(
         items,
+        freshness_summary=freshness_summary,
         stdout=out,
         stdin=stdin,
         use_color=use_color,
