@@ -24,6 +24,7 @@ from agym.updater import (
     execute_python_update,
     fetch_latest_release,
     is_newer_version,
+    is_running_in_repo,
     load_update_state,
     maybe_prompt_startup_update,
     parse_semver,
@@ -175,11 +176,20 @@ class TestStartupPromptFiltering(unittest.TestCase):
         self._env_patch = mock.patch.dict(os.environ, {}, clear=False)
         self._env_patch.start()
         os.environ.pop("AGYM_NO_UPDATE_CHECK", None)
+        self._repo_patch = mock.patch("agym.updater.is_running_in_repo", return_value=False)
+        self._repo_patch.start()
 
     def tearDown(self):
+        self._repo_patch.stop()
         self._env_patch.stop()
         self._patcher.stop()
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_bypassed_when_running_in_repo(self):
+        with mock.patch("agym.updater.is_running_in_repo", return_value=True):
+            with mock.patch("agym.updater.check_for_updates") as mock_check:
+                maybe_prompt_startup_update(["list"])
+                mock_check.assert_not_called()
 
     def test_bypassed_when_env_var_set(self):
         with mock.patch.dict(os.environ, {"AGYM_NO_UPDATE_CHECK": "1"}):
@@ -529,6 +539,37 @@ class TestCliIntegration(unittest.TestCase):
             code = cli.main(["update", "--check"])
             self.assertEqual(code, 0)
             mock_run.assert_called_once_with(["--check"])
+
+
+class TestRunningInRepoDetection(unittest.TestCase):
+    def test_is_running_in_repo_in_current_repo(self):
+        self.assertTrue(is_running_in_repo())
+
+    def test_is_running_in_repo_false_outside_repo(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            fake_pkg_file = tmp_path / "venv" / "lib" / "python3.12" / "site-packages" / "agym" / "updater.py"
+            with mock.patch("agym.updater.Path.cwd", return_value=tmp_path), \
+                 mock.patch.object(updater, "__file__", str(fake_pkg_file)):
+                self.assertFalse(is_running_in_repo())
+
+    def test_is_running_in_repo_true_when_cwd_in_repo(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            repo_dir = tmp_path / "my_agy_repo"
+            repo_git = repo_dir / ".git"
+            repo_git.mkdir(parents=True)
+            repo_agym = repo_dir / "agym"
+            repo_agym.mkdir(parents=True)
+            (repo_agym / "cli.py").touch()
+
+            subdir = repo_dir / "some" / "subdir"
+            subdir.mkdir(parents=True)
+
+            fake_pkg_file = tmp_path / "venv" / "lib" / "python3.12" / "site-packages" / "agym" / "updater.py"
+            with mock.patch("agym.updater.Path.cwd", return_value=subdir), \
+                 mock.patch.object(updater, "__file__", str(fake_pkg_file)):
+                self.assertTrue(is_running_in_repo())
 
 
 if __name__ == "__main__":
