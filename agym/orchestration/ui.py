@@ -236,6 +236,7 @@ class PresentationState:
     profile_usage: dict[str, ProfileUsagePresentation] = field(default_factory=dict)
     usage_refreshed_at: str | None = None
     usage_error: str | None = None
+    usage_loading: bool = False
 
 
 def render_dry_run(
@@ -811,6 +812,11 @@ class TerminalEventSink(EventSink):
                         wp.duration_seconds = max(0.0, (et - st).total_seconds())
 
         elif etype == EventType.USAGE_UPDATED:
+            if payload.get("fetching"):
+                self.state.usage_loading = True
+                return
+
+            self.state.usage_loading = False
             refreshed_at = payload.get("refreshed_at") or event.timestamp
             self.state.usage_refreshed_at = str(refreshed_at) if refreshed_at else None
             self.state.usage_error = str(payload.get("error")) if payload.get("error") else None
@@ -960,13 +966,14 @@ class TerminalEventSink(EventSink):
 
         lines.append("")
 
-        if self.state.profile_usage or self.state.usage_error:
+        if self.state.profile_usage or self.state.usage_error or self.state.usage_loading:
             usage_age = ""
             refreshed = _parse_timestamp(self.state.usage_refreshed_at)
             if refreshed is not None:
                 now = datetime.now(refreshed.tzinfo) if refreshed.tzinfo else datetime.now()
                 usage_age = f" · refreshed {format_duration(max(0.0, (now - refreshed).total_seconds()))} ago"
-            lines.append(colorize(f"Quota remaining{usage_age}", BOLD, use_color))
+            refresh_state = " · refreshing…" if self.state.usage_loading else ""
+            lines.append(colorize(f"Quota remaining{usage_age}{refresh_state}", BOLD, use_color))
 
             active_profiles = {
                 w.profile_name
