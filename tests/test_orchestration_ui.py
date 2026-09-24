@@ -47,6 +47,7 @@ from agym.orchestration.contracts import (
     WorkerRole,
     WorkspaceMode,
 )
+from agym.orchestration.streaming import extract_activity_description
 from agym.orchestration.ui import (
     ROLE_DISPLAY_NAMES,
     OrchestrationUI,
@@ -832,6 +833,101 @@ class TestDryRunViewRendering(unittest.TestCase):
         self.assertIn("MEDIUM", out)
         self.assertIn("available capacity:", out)
         self.assertIn("5 available", out)
+
+
+class TestLiveActivityDashboard(unittest.TestCase):
+    """Live dashboard activity should be useful, bounded, and safe."""
+
+    def test_activity_feed_keeps_last_20_meaningful_entries(self) -> None:
+        sink = TerminalEventSink(
+            stream=io.StringIO(),
+            is_tty=False,
+            use_color=False,
+            run_id="run-live-feed",
+        )
+        for i in range(25):
+            sink.emit(
+                OrchestrationEvent(
+                    event_id=f"a-{i}",
+                    run_id=RunId("run-live-feed"),
+                    type=EventType.INVOCATION_ACTIVITY,
+                    payload={
+                        "worker_id": "architect",
+                        "invocation_id": "inv-architect",
+                        "activity": f"ReadFile src/module_{i}.py",
+                    },
+                )
+            )
+
+        worker = sink.state.workers["architect"]
+        self.assertEqual(len(worker.recent_activity), 20)
+        self.assertEqual(worker.recent_activity[0], "ReadFile src/module_5.py")
+        self.assertEqual(worker.current_activity, "ReadFile src/module_24.py")
+        self.assertEqual(worker.invocation_id, "inv-architect")
+
+        self.assertEqual(len(sink.state.activity_feed), 20)
+        rendered = sink.render(use_color=False)
+        self.assertIn("Live activity · last 20", rendered)
+        self.assertNotIn("src/module_0.py", rendered)
+        self.assertIn("src/module_24.py", rendered)
+
+    def test_activity_feed_deduplicates_consecutive_noise(self) -> None:
+        sink = TerminalEventSink(
+            stream=io.StringIO(),
+            is_tty=False,
+            use_color=False,
+            run_id="run-dedupe",
+        )
+        for event_id in ("one", "two"):
+            sink.emit(
+                OrchestrationEvent(
+                    event_id=event_id,
+                    run_id=RunId("run-dedupe"),
+                    type=EventType.INVOCATION_ACTIVITY,
+                    payload={"worker_id": "testing", "activity": "RunTests tests/test_cli.py"},
+                )
+            )
+        self.assertEqual(len(sink.state.activity_feed), 1)
+        self.assertEqual(sink.state.workers["testing"].recent_activity, ["RunTests tests/test_cli.py"])
+
+    def test_stringio_does_not_spawn_periodic_refresh_thread(self) -> None:
+        sink = TerminalEventSink(
+            stream=io.StringIO(),
+            is_tty=True,
+            use_color=False,
+            run_id="run-test-stream",
+            refresh_interval=0.05,
+        )
+        sink.emit(
+            OrchestrationEvent(
+                event_id="created",
+                run_id=RunId("run-test-stream"),
+                type=EventType.RUN_CREATED,
+            )
+        )
+        self.assertIsNone(sink._refresh_thread)
+        sink.close()
+
+    def test_activity_parser_understands_common_top_level_tool_calls(self) -> None:
+        line = '{"event":"tool_call","name":"read_file","path":"agym/cli.py"}'
+        self.assertEqual(
+            extract_activity_description(line),
+            "read_file agym/cli.py",
+        )
+
+    def test_activity_parser_understands_nested_tool_info_and_strips_ansi(self) -> None:
+        line = (
+            '{"event":"step_update","step_update":{"tool_info":'
+            '{"display_name":"RunCommand","command":"\\u001b[31mpython -m unittest\\u001b[0m"}}}'
+        )
+        self.assertEqual(
+            extract_activity_description(line),
+            "RunCommand python -m unittest",
+        )
+
+    def test_activity_parser_ignores_final_response_content(self) -> None:
+        line = '{"event":"result","result":{"response":"private final text"}}'
+        self.assertIsNone(extract_activity_description(line))
 
 
 class TestThreadSafetyAndEdgeCases(unittest.TestCase):
