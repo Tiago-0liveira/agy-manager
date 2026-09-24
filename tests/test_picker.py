@@ -502,7 +502,9 @@ class TestSelectCLICommand(unittest.TestCase):
             self.assertEqual(code1, 0)
             self.assertNotIn("Fetching fresh usage data...", out1.getvalue())
             self.assertIn("Opening agy with account 'p1'...", out1.getvalue())
-            run_mock.assert_called_with(Path("/mock/agy"), p1, [], replace_process=True)
+            run_mock.assert_called_with(
+                Path("/mock/agy"), p1, [], replace_process=True, data_root=store.data_root
+            )
             mock_fetch.assert_called_with(
                 profiles=[p1, p2],
                 force=False,
@@ -635,7 +637,9 @@ class TestSelectCLICommand(unittest.TestCase):
 
             self.assertEqual(code, 0)
             self.assertIn("Opening agy with account 'p1'...", out.getvalue())
-            run_mock.assert_called_with(Path("/mock/agy"), p, ["-p", "hello"], replace_process=True)
+            run_mock.assert_called_with(
+                Path("/mock/agy"), p, ["-p", "hello"], replace_process=True, data_root=store.data_root
+            )
 
 
 if __name__ == "__main__":

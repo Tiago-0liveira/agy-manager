@@ -514,6 +514,7 @@ class TestAutoPr(unittest.TestCase):
                 self.profile,
                 ["--", "--auto-pr"],
                 replace_process=True,
+                data_root=self.store.data_root,
             )
 
 

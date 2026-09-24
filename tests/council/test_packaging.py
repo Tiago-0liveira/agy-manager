@@ -166,7 +166,7 @@ class TestProfileCollisionImmunity(unittest.TestCase):
             self.assertEqual(code, 0)
             resolve_mock.assert_called_once()
             run_agy_mock.assert_called_once_with(
-                Path("/fake/agy"), profile, [], replace_process=True
+                Path("/fake/agy"), profile, [], replace_process=True, data_root=store.data_root
             )
 
     @mock.patch("agym.cli.ProfileStore")
@@ -191,6 +191,7 @@ class TestProfileCollisionImmunity(unittest.TestCase):
                 profile,
                 ["-p", "hello", "--model", "gemini-2.5-pro"],
                 replace_process=True,
+                data_root=store.data_root,
             )
 
     @mock.patch("agym.cli.ProfileStore")
