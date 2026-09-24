@@ -18,31 +18,43 @@ class AutoPrError(ProfileError):
     pass
 
 
-def parse_auto_pr_args(argv: list[str]) -> argparse.Namespace:
-    """Parses CLI arguments for the --auto-pr command workflow."""
+def build_auto_pr_parser() -> argparse.ArgumentParser:
+    """Builds and returns the ArgumentParser for auto-pr."""
+    usage = """auto-pr [profile]
+  [-b | --base BRANCH]
+  [--title TITLE]
+  [--body BODY]
+  [--draft]
+  [--no-push]
+  [-n | --dry-run]"""
     parser = argparse.ArgumentParser(
-        prog="agym <profile> --auto-pr",
+        prog="agym auto-pr",
+        usage=usage,
         description="Automatically create a pull request from the current branch into the target base branch.",
         add_help=True,
     )
+    parser.add_argument("profile", nargs="?", help="Optional specific profile to use")
     parser.add_argument(
         "--auto-pr",
         action="store_true",
         default=True,
-        help="Automatically create a pull request from the current branch into the target branch.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "-b", "--base",
+        metavar="BRANCH",
         default="main",
         help="Target base branch for PR (default: main).",
     )
     parser.add_argument(
         "--title",
+        metavar="TITLE",
         default=None,
         help="Custom PR title (if omitted, auto-generated from commit history).",
     )
     parser.add_argument(
         "--body",
+        metavar="BODY",
         default=None,
         help="Custom PR description (if omitted, auto-generated from diff and commits).",
     )
@@ -64,7 +76,12 @@ def parse_auto_pr_args(argv: list[str]) -> argparse.Namespace:
         default=False,
         help="Preview PR creation without pushing changes or creating a PR.",
     )
-    return parser.parse_args(argv)
+    return parser
+
+
+def parse_auto_pr_args(argv: list[str]) -> argparse.Namespace:
+    """Parses CLI arguments for the --auto-pr command workflow."""
+    return build_auto_pr_parser().parse_args(argv)
 
 
 def get_current_branch(
