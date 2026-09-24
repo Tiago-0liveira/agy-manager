@@ -18,6 +18,7 @@ import ast
 import io
 import os
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -48,6 +49,8 @@ from agym.orchestration.contracts import (
     WorkspaceMode,
 )
 from agym.orchestration.streaming import extract_activity_description
+from agym.orchestration.usage_monitor import UsagePollingEventSink
+from agym.usage import AccountUsage, UsageBucket, UsageGroup
 from agym.orchestration.ui import (
     ROLE_DISPLAY_NAMES,
     OrchestrationUI,
@@ -928,6 +931,145 @@ class TestLiveActivityDashboard(unittest.TestCase):
     def test_activity_parser_ignores_final_response_content(self) -> None:
         line = '{"event":"result","result":{"response":"private final text"}}'
         self.assertIsNone(extract_activity_description(line))
+
+
+class TestLiveUsageDashboard(unittest.TestCase):
+    """Periodic usage refresh should batch profiles and stay compact in the TUI."""
+
+    def test_usage_snapshot_renders_5h_and_week_remaining(self) -> None:
+        sink = TerminalEventSink(
+            stream=io.StringIO(),
+            is_tty=False,
+            use_color=False,
+            run_id="run-usage",
+        )
+        sink.emit(
+            OrchestrationEvent(
+                event_id="lease",
+                run_id=RunId("run-usage"),
+                type=EventType.PROFILE_LEASED,
+                payload={"worker_id": "coordinator", "profile_name": "p1"},
+            )
+        )
+        sink.emit(
+            OrchestrationEvent(
+                event_id="usage",
+                run_id=RunId("run-usage"),
+                type=EventType.USAGE_UPDATED,
+                payload={
+                    "refreshed_at": "2026-09-24T22:00:00+00:00",
+                    "profiles": [
+                        {
+                            "profile_name": "p1",
+                            "status": "success",
+                            "five_hour_remaining": 82,
+                            "week_remaining": 64,
+                        },
+                        {
+                            "profile_name": "p2",
+                            "status": "success",
+                            "five_hour_remaining": 41,
+                            "week_remaining": 91,
+                        },
+                    ],
+                },
+            )
+        )
+
+        rendered = sink.render(use_color=False)
+        self.assertIn("Quota remaining", rendered)
+        self.assertIn("Profile", rendered)
+        self.assertIn("5h", rendered)
+        self.assertIn("Week", rendered)
+        self.assertIn("p1", rendered)
+        self.assertIn("82%", rendered)
+        self.assertIn("64%", rendered)
+        self.assertIn("p2", rendered)
+        self.assertIn("41%", rendered)
+        self.assertIn("91%", rendered)
+        self.assertIn("* active profile", rendered)
+
+    def test_usage_poller_batches_profiles_and_forces_refresh(self) -> None:
+        class FakeProfile:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        class FakeStore:
+            def list(self):
+                return [FakeProfile("p1"), FakeProfile("p2"), FakeProfile("p3")]
+
+        called = threading.Event()
+        captured = {}
+
+        async def fake_fetcher(agy_path, profiles, **kwargs):
+            captured["agy_path"] = agy_path
+            captured["profiles"] = [p.name for p in profiles]
+            captured["kwargs"] = kwargs
+            called.set()
+            group = UsageGroup(
+                name="Gemini",
+                description=None,
+                buckets=[
+                    UsageBucket(
+                        id="g5",
+                        name="5h",
+                        window="5h",
+                        remaining_fraction=0.73,
+                        reset_time=None,
+                    ),
+                    UsageBucket(
+                        id="gw",
+                        name="Week",
+                        window="week",
+                        remaining_fraction=0.88,
+                        reset_time=None,
+                    ),
+                ],
+            )
+            return [
+                AccountUsage(account=p.name, status="success", groups=[group])
+                for p in profiles
+            ]
+
+        sink = TerminalEventSink(
+            stream=io.StringIO(),
+            is_tty=False,
+            use_color=False,
+            run_id="run-poll",
+        )
+        poller = UsagePollingEventSink(
+            sink,
+            profile_store=FakeStore(),
+            agy_path=Path("agy"),
+            interval_seconds=60,
+            fetcher=fake_fetcher,
+        )
+
+        poller.emit(
+            OrchestrationEvent(
+                event_id="created",
+                run_id=RunId("run-poll"),
+                type=EventType.RUN_CREATED,
+            )
+        )
+        self.assertTrue(called.wait(2.0))
+        deadline = time.monotonic() + 2.0
+        while not sink.state.profile_usage and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertEqual(captured["profiles"], ["p1", "p2", "p3"])
+        self.assertTrue(captured["kwargs"]["force_refresh"])
+        self.assertEqual(sink.state.profile_usage["p1"].five_hour_remaining, 73)
+        self.assertEqual(sink.state.profile_usage["p1"].week_remaining, 88)
+
+        poller.emit(
+            OrchestrationEvent(
+                event_id="done",
+                run_id=RunId("run-poll"),
+                type=EventType.RUN_COMPLETED,
+            )
+        )
+        self.assertTrue(poller._stop.is_set())
 
 
 class TestThreadSafetyAndEdgeCases(unittest.TestCase):
