@@ -9,11 +9,58 @@ from typing import Any
 
 from .profiles import _chmod_private_dir, _default_data_root
 
-# Default TTL policies
-TTL_USAGE_SECONDS = 60.0      # 1 minute for live quota
-USAGE_CACHE_TTL_SECONDS = 300.0  # 5 minutes for interactive picker cache freshness
+# Shared default usage cache TTL (5 minutes)
+DEFAULT_USAGE_CACHE_TTL_SECONDS = 300.0
+USAGE_CACHE_TTL_SECONDS = DEFAULT_USAGE_CACHE_TTL_SECONDS
+TTL_USAGE_SECONDS = DEFAULT_USAGE_CACHE_TTL_SECONDS
 TTL_TOKENS_SECONDS = 600.0    # 10 minutes for token usage tracking
 USAGE_CACHE_VERSION = 2  # v1 may contain quota values from the inaccurate direct API path
+
+
+def parse_duration_seconds(duration_str: str) -> float:
+    """Parses a simple duration string (e.g. '30s', '5m', '1h', '2d', or 'default') into seconds.
+
+    If 'default' is passed, returns DEFAULT_USAGE_CACHE_TTL_SECONDS (300.0).
+    Raises ValueError on invalid formats or non-positive durations.
+    """
+    raw = str(duration_str).strip().lower()
+    if raw == "default":
+        return DEFAULT_USAGE_CACHE_TTL_SECONDS
+
+    import re
+
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*([smhd]?)$", raw)
+    if not m:
+        raise ValueError(
+            f"invalid duration format '{duration_str}'. Expected e.g. 30s, 5m, 1h, or default"
+        )
+    val = float(m.group(1))
+    unit = m.group(2) or "s"
+    if val <= 0:
+        raise ValueError(f"duration must be greater than 0, got '{duration_str}'")
+
+    if unit == "s":
+        return val
+    elif unit == "m":
+        return val * 60.0
+    elif unit == "h":
+        return val * 3600.0
+    elif unit == "d":
+        return val * 86400.0
+    return val
+
+
+def format_duration(seconds: float) -> str:
+    """Formats seconds into concise duration representation (e.g. 30s, 5m, 1h)."""
+    secs = int(seconds) if isinstance(seconds, (int, float)) and float(seconds).is_integer() else seconds
+    if isinstance(secs, int):
+        if secs % 86400 == 0 and secs >= 86400:
+            return f"{secs // 86400}d"
+        if secs % 3600 == 0 and secs >= 3600:
+            return f"{secs // 3600}h"
+        if secs % 60 == 0 and secs >= 60:
+            return f"{secs // 60}m"
+    return f"{secs}s"
 
 
 def should_refresh_cache(

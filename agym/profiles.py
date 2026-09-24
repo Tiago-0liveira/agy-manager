@@ -310,6 +310,34 @@ class ProfileStore:
     def _save(self, data: dict[str, Any]) -> None:
         _write_json_private(self.config_path, data)
 
+    def get_usage_cache_ttl(self) -> float:
+        """Returns the configured usage cache TTL in seconds (default 300.0)."""
+        data = self._load()
+        settings = data.get("settings")
+        if isinstance(settings, dict):
+            val = settings.get("usage_cache_ttl_seconds")
+            if isinstance(val, (int, float)) and val > 0:
+                return float(val)
+        return 300.0
+
+    def set_usage_cache_ttl(self, ttl_seconds: float | None) -> float:
+        """Sets the global usage cache TTL. If None, resets to default (300.0)."""
+        with self._profile_lock():
+            data = self._load()
+            if "settings" not in data or not isinstance(data["settings"], dict):
+                data["settings"] = {}
+            if ttl_seconds is None:
+                data["settings"].pop("usage_cache_ttl_seconds", None)
+                if not data["settings"]:
+                    data.pop("settings", None)
+                self._save(data)
+                return 300.0
+            else:
+                eff = int(ttl_seconds) if isinstance(ttl_seconds, (int, float)) and float(ttl_seconds).is_integer() else float(ttl_seconds)
+                data["settings"]["usage_cache_ttl_seconds"] = eff
+                self._save(data)
+                return float(eff)
+
     def create(
         self,
         name: str,

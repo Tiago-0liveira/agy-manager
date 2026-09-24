@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
-from .cache import CacheManager, USAGE_CACHE_TTL_SECONDS
+from .cache import CacheManager, USAGE_CACHE_TTL_SECONDS, format_duration, parse_duration_seconds
 from .diagnostics import doctor_lines
 from .git.auto_pr import AutoPrError, build_auto_pr_parser, handle_auto_pr, parse_auto_pr_args
 from .launcher import (
@@ -62,16 +62,17 @@ def build_setup_parser() -> argparse.ArgumentParser:
 
 
 def build_config_parser() -> argparse.ArgumentParser:
-    usage = """config <profile>
+    usage = """config [profile]
   [--model MODEL]
-  [-y | --dsp | --skip-perms | --no-dsp | --no-skip-perms]"""
+  [-y | --dsp | --skip-perms | --no-dsp | --no-skip-perms]
+  [--cache-duration DURATION]"""
     parser = argparse.ArgumentParser(
         prog="agym config",
         usage=usage,
-        description="Configure profile model and permission settings.",
+        description="Configure profile model, permissions, or global cache duration.",
         add_help=True,
     )
-    parser.add_argument("profile", help="Name of the profile to configure")
+    parser.add_argument("profile", nargs="?", default=None, help="Name of the profile to configure (optional when setting global options)")
     parser.add_argument("--model", dest="model", default=None, metavar="MODEL", help="Set default model (or 'default' to clear)")
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
@@ -94,6 +95,13 @@ def build_config_parser() -> argparse.ArgumentParser:
         dest="dangerously_skip_permissions",
         action="store_false",
         help="Disable auto-skipping tool permissions for this profile",
+    )
+    parser.add_argument(
+        "--cache-duration",
+        dest="cache_duration",
+        default=None,
+        metavar="DURATION",
+        help="Set usage cache duration (e.g. 30s, 5m, 1h, or 'default')",
     )
     return parser
 
@@ -565,6 +573,31 @@ def _setup(argv: list[str], store: ProfileStore) -> int:
 def _config(argv: list[str], store: ProfileStore) -> int:
     parser = build_config_parser()
     ns = parser.parse_args(argv)
+
+    if ns.cache_duration is not None:
+        try:
+            if ns.cache_duration.strip().lower() == "default":
+                store.set_usage_cache_ttl(None)
+                print("cache-duration: default (5m)")
+            else:
+                secs = parse_duration_seconds(ns.cache_duration)
+                store.set_usage_cache_ttl(secs)
+                human = format_duration(secs)
+                print(f"cache-duration: {human} ({int(secs)}s)")
+        except ValueError as exc:
+            raise ProfileError(str(exc)) from exc
+
+        if ns.profile is None:
+            return 0
+
+    if ns.profile is None:
+        if ns.model is not None or ns.dangerously_skip_permissions is not None:
+            raise ProfileError("a profile name is required to configure model or permissions")
+        ttl = store.get_usage_cache_ttl()
+        human = format_duration(ttl)
+        print(f"cache-duration: {human} ({int(ttl)}s)")
+        return 0
+
     profile = store.get(ns.profile)
 
     changed = False

@@ -105,6 +105,36 @@ class CliTests(unittest.TestCase):
             self.assertIn("model: default", out.getvalue())
             self.assertIsNone(store.get("personal").settings.model)
 
+            # 6. Global cache duration configuration
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = cli.main(["config", "--cache-duration", "5m"])
+            self.assertEqual(code, 0)
+            self.assertIn("cache-duration: 5m (300s)", out.getvalue())
+            self.assertEqual(store.get_usage_cache_ttl(), 300.0)
+
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = cli.main(["config", "--cache-duration", "30s"])
+            self.assertEqual(code, 0)
+            self.assertIn("cache-duration: 30s (30s)", out.getvalue())
+            self.assertEqual(store.get_usage_cache_ttl(), 30.0)
+
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                code = cli.main(["config", "--cache-duration", "default"])
+            self.assertEqual(code, 0)
+            self.assertIn("cache-duration: default", out.getvalue())
+            self.assertEqual(store.get_usage_cache_ttl(), 300.0)
+
+            # Invalid duration format
+            out_err = io.StringIO()
+            with mock.patch("sys.stderr", out_err):
+                code = cli.main(["config", "--cache-duration", "invalid_time"])
+            self.assertNotEqual(code, 0)
+            self.assertIn("invalid duration format", out_err.getvalue())
+
+
     @mock.patch("agym.cli.ProfileStore")
     @mock.patch("agym.cli.resolve_agy")
     @mock.patch("agym.cli.run_auto_prompt")
