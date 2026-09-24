@@ -44,8 +44,12 @@ class TraceTests(unittest.TestCase):
         partial = path.parent / recovered[-2]["payload"]["partial_file"]
         self.assertEqual(partial.read_text(), '{"partial":')
         for cap in captures:
-            self.assertEqual((cap.directory / "prompt.txt").stat().st_mode & 0o777, 0o600)
-            self.assertEqual((cap.directory / "stdout.log").stat().st_mode & 0o777, 0o600)
+            if os.name == "posix":
+                self.assertEqual((cap.directory / "prompt.txt").stat().st_mode & 0o777, 0o600)
+                self.assertEqual((cap.directory / "stdout.log").stat().st_mode & 0o777, 0o600)
+            else:
+                self.assertTrue((cap.directory / "prompt.txt").is_file())
+                self.assertTrue((cap.directory / "stdout.log").is_file())
         self.assertIsNone(current_attempt.get())
 
     def test_exception_is_saved_and_context_restored(self):

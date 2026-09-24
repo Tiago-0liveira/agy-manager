@@ -175,11 +175,17 @@ def kill_process_tree(
     if not isinstance(pid, int) or pid <= 0:
         return
 
-    if is_windows_platform():
+    # Process semantics must follow the actual OS, independently of whether
+    # Windows credential integration is disabled for tests/headless use.
+    if os.name == "nt":
         try:
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, check=False)
         except Exception:
-            pass
+            try:
+                if hasattr(proc, "kill") and callable(proc.kill):
+                    proc.kill()
+            except Exception:
+                pass
     else:
         try:
             pgid = os.getpgid(pid)
@@ -294,7 +300,7 @@ class AntigravityRunner:
 
         for proc in procs:
             if getattr(proc, "returncode", None) is None:
-                kill_process_tree(proc, signal.SIGKILL)
+                kill_process_tree(proc, getattr(signal, "SIGKILL", signal.SIGTERM))
                 try:
                     if hasattr(proc, "kill") and callable(proc.kill):
                         proc.kill()
@@ -539,10 +545,10 @@ class AntigravityRunner:
         # Async subprocess execution
         proc: asyncio.subprocess.Process | None = None
         popen_kwargs: dict[str, Any] = {}
-        if not is_windows_platform():
-            popen_kwargs["start_new_session"] = True
-        else:
+        if os.name == "nt":
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
 
         try:
             if is_windows_platform() and profile is not None:
@@ -929,10 +935,10 @@ class AntigravitySession:
             cmd = [str(self._agy_path), *op_args]
 
         popen_kwargs: dict[str, Any] = {}
-        if not is_windows_platform():
-            popen_kwargs["start_new_session"] = True
-        else:
+        if os.name == "nt":
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
 
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
