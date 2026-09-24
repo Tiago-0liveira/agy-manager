@@ -1034,6 +1034,11 @@ def _auto_pr(argv: list[str], store: ProfileStore) -> int:
     )
 
 
+def _all(argv: list[str], store: ProfileStore) -> int:
+    from .panes.runner import run_all
+    return run_all(argv, store)
+
+
 def _launch(profile_name: str, argv: list[str], store: ProfileStore) -> int:
     validate_profile_name(profile_name)
     profile = store.get(profile_name)
@@ -1093,6 +1098,13 @@ COMMAND_REGISTRY: list[CommandSpec] = [
     # Launching
     CommandSpec(name="select", aliases=("pick",), group="Launching", description="Pick an account", parser_builder=build_select_parser, handler=_select),
     CommandSpec(name="rotate", group="Launching", description="Rotate accounts", parser_builder=build_rotate_parser, handler=_rotate),
+    CommandSpec(
+        name="all",
+        group="Launching",
+        description="Launch profiles in terminal panes",
+        parser_builder=lambda: __import__("agym.panes.runner", fromlist=["build_all_parser"]).build_all_parser(),
+        handler=_all,
+    ),
     # Tools
     CommandSpec(name="doctor", group="Tools", description="", parser_builder=build_doctor_parser, handler=_doctor),
     CommandSpec(name="auto-pr", aliases=("--auto-pr",), group="Tools", description="", parser_builder=build_auto_pr_parser, handler=_auto_pr),

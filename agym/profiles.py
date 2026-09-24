@@ -37,6 +37,7 @@ RESERVED_NAMES = {
     "rename",
     "mv",
     "auto-pr",
+    "all",
     "update",
 }
 

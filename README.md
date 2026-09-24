@@ -85,6 +85,10 @@ agym personal -- -p "explain this repository"
 # The `--` is optional with agym's dispatcher:
 agym personal -p "explain this repository"
 
+# Multi-pane fleet launch:
+agym all                                  # Launch all profiles in evenly arranged terminal panes
+agym all -- -p "fleet review"             # Pass arguments to all launched profiles
+
 agym list
 agym rename personal main
 agym rename jmcar AI1
@@ -112,6 +116,61 @@ agym remove work --yes
 ```
 
 `agym <profile>` launches Antigravity directly in the current terminal. On POSIX it replaces the wrapper process with `agy`, which preserves the native TTY, signals, colors, terminal resizing, alternate-screen behavior, current working directory, and `agy` exit semantics as closely as possible.
+
+### Multi-Pane Fleet Launch (`agym all`)
+
+`agym all` launches every configured Antigravity profile simultaneously, with one profile per terminal pane arranged as evenly as practical within the current terminal window.
+
+```bash
+# Launch all accounts in evenly subdivided panes
+agym all
+
+# Auto-approve permissions for all instances with --dsp (or -y)
+agym all --dsp
+
+# Limit how many profiles to launch (e.g. first 4 profiles in a 2x2 grid)
+agym all -n 4
+
+# Open all panes in a specific project directory (-C / --cwd)
+agym all -C /path/to/my-repo
+
+# Launch a specific subset of profiles by name
+agym all --profiles personal,work
+
+# Combine options and forward custom Antigravity flags
+agym all -n 4 -C /path/to/project --dsp -- -p "fleet review"
+```
+
+#### Core Behavior & Profile Isolation
+- **Discovery**: Retrieves all configured profiles from `ProfileStore` (matching `agym list`).
+- **Full Isolation**: Each pane executes through the standard `agym <profile>` launch path, preserving isolated home directories (`HOME`, `USERPROFILE`, `LOCALAPPDATA`, `APPDATA`), credentials, statuslines, default models, permission flags, and current working directory.
+- **Shortcut Handling**: If no profiles exist, displays setup guidance (`agym setup <profile>`). If exactly 1 profile exists, launches it directly without initializing multi-pane backends.
+
+#### Supported Terminal Backends by OS
+
+`agym all` automatically detects the current operating system and hosting terminal/multiplexer using reliable environment signals:
+
+| OS | Supported Backends | Detection & Behavior |
+|---|---|---|
+| **Windows** | Windows Terminal | Detected via `WT_SESSION`. Targets the existing/recent tab/window (`-w 0`) using documented `wt.exe` pane commands (`split-pane`, `move-focus`) and argument vectors without opening separate GUI windows. |
+| **Linux** | tmux, WezTerm | If inside tmux (`$TMUX`), splits active session panes. If outside tmux but `tmux` is installed, automatically creates a managed session, configures panes, and attaches. Inside WezTerm (`$WEZTERM_PANE`), splits via `wezterm cli`. |
+| **macOS** | tmux, WezTerm | If inside tmux (`$TMUX`), splits active session panes. If outside tmux but `tmux` is installed, automatically creates a managed session and attaches. Inside WezTerm (`$WEZTERM_PANE`), splits via `wezterm cli`. |
+
+#### Managed tmux Fallback (Linux & macOS)
+When running outside tmux on Linux or macOS, `agym all` creates a dedicated collision-safe tmux session (`agym-<pid>-<timestamp>`), calculates the split geometry, spawns each profile, and attaches the user's terminal to that session. If setup fails at any point, the session is cleanly destroyed immediately so no orphaned or broken sessions remain.
+
+#### Recursive Pane Layout Algorithm
+The pane layout is generated recursively using pure geometric subdivision rather than hard-coded grids:
+1. Begins with the full window area as one rectangular pane.
+2. Selects the candidate pane with the largest area to split next.
+3. If multiple candidate panes have equal area, breaks ties spatially: **bottom before top**, and **right before left**.
+4. Splits the chosen pane into two equal halves along its longer dimension (width $\ge$ height $\to$ left/right side-by-side split; height $>$ width $\to$ top/bottom stacked split).
+5. When subdividing four equal quadrants (e.g. going from 4 to 5, 6, 7, and 8 panes), candidates are selected in the exact deterministic order:
+   $\text{bottom-right} \longrightarrow \text{bottom-left} \longrightarrow \text{top-right} \longrightarrow \text{top-left}$
+6. Works deterministically for arbitrary numbers of profiles ($N \ge 1$).
+
+#### Unsupported Terminal Environments
+If running in a terminal emulator without programmatic pane creation APIs (and without `tmux` available on Linux/macOS), `agym all` exits cleanly with a descriptive error reporting the detected OS, detected terminal, supported alternatives, and remediation steps (e.g. installing tmux or running inside Windows Terminal). `agym` never attempts brittle GUI or keyboard automation.
 
 ### Quota and Usage Retrieval
 
