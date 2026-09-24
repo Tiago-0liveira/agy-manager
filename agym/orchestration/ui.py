@@ -51,6 +51,7 @@ __all__ = [
     "OrchestrationUI",
     "PresentationState",
     "ActivityPresentation",
+    "ProfileUsagePresentation",
     "WorkerPresentation",
     "WavePresentation",
     "WorkerStatus",
@@ -161,6 +162,17 @@ class ActivityPresentation:
 
 
 @dataclass
+class ProfileUsagePresentation:
+    """Compact quota snapshot for one configured AGYM profile."""
+
+    profile_name: str
+    status: str = "unknown"
+    five_hour_remaining: int | None = None
+    week_remaining: int | None = None
+    error: str | None = None
+
+
+@dataclass
 class WorkerPresentation:
     """Visual representation of a worker task within a wave."""
 
@@ -221,6 +233,9 @@ class PresentationState:
     action_reason: str = ""
     artifact_paths: list[str] = field(default_factory=list)
     activity_feed: list[ActivityPresentation] = field(default_factory=list)
+    profile_usage: dict[str, ProfileUsagePresentation] = field(default_factory=dict)
+    usage_refreshed_at: str | None = None
+    usage_error: str | None = None
 
 
 def render_dry_run(
@@ -795,6 +810,38 @@ class TerminalEventSink(EventSink):
                     if st and et:
                         wp.duration_seconds = max(0.0, (et - st).total_seconds())
 
+        elif etype == EventType.USAGE_UPDATED:
+            refreshed_at = payload.get("refreshed_at") or event.timestamp
+            self.state.usage_refreshed_at = str(refreshed_at) if refreshed_at else None
+            self.state.usage_error = str(payload.get("error")) if payload.get("error") else None
+            profiles = payload.get("profiles", [])
+            if isinstance(profiles, list):
+                next_usage: dict[str, ProfileUsagePresentation] = {}
+                for item in profiles:
+                    if not isinstance(item, dict):
+                        continue
+                    profile_name = str(item.get("profile_name", "")).strip()
+                    if not profile_name:
+                        continue
+
+                    def _pct(value: Any) -> int | None:
+                        if value is None:
+                            return None
+                        try:
+                            return max(0, min(100, int(round(float(value)))))
+                        except (TypeError, ValueError):
+                            return None
+
+                    next_usage[profile_name] = ProfileUsagePresentation(
+                        profile_name=profile_name,
+                        status=str(item.get("status", "unknown")),
+                        five_hour_remaining=_pct(item.get("five_hour_remaining")),
+                        week_remaining=_pct(item.get("week_remaining")),
+                        error=str(item.get("error")) if item.get("error") else None,
+                    )
+                if next_usage:
+                    self.state.profile_usage = next_usage
+
         elif etype == EventType.INVOCATION_ACTIVITY:
             wid = payload.get("worker_id")
             if wid:
@@ -912,6 +959,45 @@ class TerminalEventSink(EventSink):
             lines.append(f"{label_fleet}{icon} checking")
 
         lines.append("")
+
+        if self.state.profile_usage or self.state.usage_error:
+            usage_age = ""
+            refreshed = _parse_timestamp(self.state.usage_refreshed_at)
+            if refreshed is not None:
+                now = datetime.now(refreshed.tzinfo) if refreshed.tzinfo else datetime.now()
+                usage_age = f" · refreshed {format_duration(max(0.0, (now - refreshed).total_seconds()))} ago"
+            lines.append(colorize(f"Quota remaining{usage_age}", BOLD, use_color))
+
+            active_profiles = {
+                w.profile_name
+                for w in self.state.workers.values()
+                if w.profile_name and w.status in (WorkerStatus.RUNNING, WorkerStatus.RETRYING)
+            }
+            if self.state.coordinator_profile:
+                active_profiles.add(self.state.coordinator_profile)
+
+            if self.state.profile_usage:
+                lines.append("  Profile              5h    Week")
+                for name, usage in sorted(
+                    self.state.profile_usage.items(),
+                    key=lambda item: (
+                        item[0] not in active_profiles,
+                        item[0].lower(),
+                    ),
+                ):
+                    marker = "*" if name in active_profiles else " "
+                    five = f"{usage.five_hour_remaining:>3}%" if usage.five_hour_remaining is not None else "  ? "
+                    week = f"{usage.week_remaining:>3}%" if usage.week_remaining is not None else "  ? "
+                    suffix = ""
+                    if usage.status != "success" and usage.error:
+                        suffix = f"  {usage.error[:50]}"
+                    lines.append(f" {marker} {name[:18].ljust(18)} {five}  {week}{suffix}")
+                if active_profiles:
+                    lines.append("  * active profile")
+            elif self.state.usage_error:
+                lines.append(f"  unavailable: {self.state.usage_error[:80]}")
+            lines.append("")
+
         if self.state.current_action_kind:
             lines.append(colorize("Coordinator", BOLD, use_color))
             lines.append(f"  → {self.state.current_action_kind}")
