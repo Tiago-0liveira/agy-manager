@@ -187,6 +187,8 @@ class RunStatus(_CaseInsensitiveStrEnum):
     CREATED = "CREATED"
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
+    COMPLETED_WITH_LIMITATIONS = "COMPLETED_WITH_LIMITATIONS"
+    RESOURCE_EXHAUSTED = "RESOURCE_EXHAUSTED"
     FAILED = "FAILED"
     INTERRUPTED = "INTERRUPTED"
 
@@ -208,7 +210,15 @@ class ActionKind(_CaseInsensitiveStrEnum):
     RUN_AUDITORS = "RUN_AUDITORS"
     RUN_SYNTHESIS = "RUN_SYNTHESIS"
     RUN_EXECUTOR = "RUN_EXECUTOR"
+    FINAL_REVIEW = "FINAL_REVIEW"
     FINALIZE = "FINALIZE"
+
+
+class FinalReviewDecision(_CaseInsensitiveStrEnum):
+    """Coordinator decision made during FINAL_REVIEW."""
+
+    STOP = "STOP"
+    CONTINUE = "CONTINUE"
 
 
 class FailureClass(_CaseInsensitiveStrEnum):
@@ -334,6 +344,49 @@ class TaskAssessment:
 
 
 @dataclass
+class RunPlan:
+    """High-level orchestration plan produced with the initial assessment."""
+
+    goal: str
+    phases: list[str] = field(default_factory=list)
+    current_phase: str = ""
+    completion_criteria: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.goal = str(self.goal)
+        self.phases = [str(v) for v in self.phases]
+        self.current_phase = str(self.current_phase)
+        self.completion_criteria = [str(v) for v in self.completion_criteria]
+        if not self.goal.strip():
+            raise ValueError("RunPlan.goal must not be empty")
+        if not self.phases:
+            raise ValueError("RunPlan.phases must contain at least one phase")
+        if not self.current_phase.strip():
+            raise ValueError("RunPlan.current_phase must not be empty")
+        if not self.completion_criteria:
+            raise ValueError("RunPlan.completion_criteria must contain at least one item")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "goal": self.goal,
+            "phases": list(self.phases),
+            "current_phase": self.current_phase,
+            "completion_criteria": list(self.completion_criteria),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RunPlan:
+        if not isinstance(data, dict):
+            raise ValueError(f"Expected dict for RunPlan, got {type(data).__name__}")
+        return cls(
+            goal=str(data.get("goal", "")),
+            phases=list(data.get("phases", [])),
+            current_phase=str(data.get("current_phase", "")),
+            completion_criteria=list(data.get("completion_criteria", [])),
+        )
+
+
+@dataclass
 class WorkerRequest:
     """Request from the coordinator to run a worker.
 
@@ -347,7 +400,7 @@ class WorkerRequest:
     workspace_mode: WorkspaceMode = WorkspaceMode.READ_ONLY
     objective: str = ""
     context_worker_ids: list[WorkerId] = field(default_factory=list)
-    timeout_seconds: float = 300.0
+    stall_timeout_seconds: float = 180.0
 
     def __post_init__(self) -> None:
         self.worker_id = WorkerId(self.worker_id)
@@ -358,9 +411,9 @@ class WorkerRequest:
         if isinstance(self.workspace_mode, str) and not isinstance(self.workspace_mode, WorkspaceMode):
             self.workspace_mode = WorkspaceMode(self.workspace_mode)
         self.context_worker_ids = [WorkerId(w) for w in self.context_worker_ids]
-        self.timeout_seconds = float(self.timeout_seconds)
-        if self.timeout_seconds <= 0:
-            raise ValueError(f"timeout_seconds must be positive, got {self.timeout_seconds}")
+        self.stall_timeout_seconds = float(self.stall_timeout_seconds)
+        if self.stall_timeout_seconds <= 0:
+            raise ValueError(f"stall_timeout_seconds must be positive, got {self.stall_timeout_seconds}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -370,7 +423,7 @@ class WorkerRequest:
             "workspace_mode": self.workspace_mode.value,
             "objective": self.objective,
             "context_worker_ids": [str(w) for w in self.context_worker_ids],
-            "timeout_seconds": self.timeout_seconds,
+            "stall_timeout_seconds": self.stall_timeout_seconds,
         }
 
     def to_json(self, indent: int | None = None) -> str:
@@ -387,7 +440,7 @@ class WorkerRequest:
             workspace_mode=WorkspaceMode(data.get("workspace_mode", WorkspaceMode.READ_ONLY)),
             objective=str(data.get("objective", "")),
             context_worker_ids=[WorkerId(w) for w in data.get("context_worker_ids", [])],
-            timeout_seconds=float(data.get("timeout_seconds", 300.0)),
+            stall_timeout_seconds=float(data.get("stall_timeout_seconds", data.get("timeout_seconds", 180.0))),
         )
 
     @classmethod
@@ -481,16 +534,16 @@ class AuditRequest:
     target_worker_ids: list[WorkerId] = field(default_factory=list)
     focus: str = ""
     strategy: ExecutionStrategy = ExecutionStrategy.STANDARD
-    timeout_seconds: float = 300.0
+    stall_timeout_seconds: float = 180.0
 
     def __post_init__(self) -> None:
         self.worker_id = WorkerId(self.worker_id)
         self.target_worker_ids = [WorkerId(w) for w in self.target_worker_ids]
         if isinstance(self.strategy, str) and not isinstance(self.strategy, ExecutionStrategy):
             self.strategy = ExecutionStrategy(self.strategy)
-        self.timeout_seconds = float(self.timeout_seconds)
-        if self.timeout_seconds <= 0:
-            raise ValueError(f"timeout_seconds must be positive, got {self.timeout_seconds}")
+        self.stall_timeout_seconds = float(self.stall_timeout_seconds)
+        if self.stall_timeout_seconds <= 0:
+            raise ValueError(f"stall_timeout_seconds must be positive, got {self.stall_timeout_seconds}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -498,7 +551,7 @@ class AuditRequest:
             "target_worker_ids": [str(w) for w in self.target_worker_ids],
             "focus": self.focus,
             "strategy": self.strategy.value,
-            "timeout_seconds": self.timeout_seconds,
+            "stall_timeout_seconds": self.stall_timeout_seconds,
         }
 
     def to_json(self, indent: int | None = None) -> str:
@@ -513,7 +566,7 @@ class AuditRequest:
             target_worker_ids=[WorkerId(w) for w in data.get("target_worker_ids", [])],
             focus=str(data.get("focus", "")),
             strategy=ExecutionStrategy(data.get("strategy", ExecutionStrategy.STANDARD)),
-            timeout_seconds=float(data.get("timeout_seconds", 300.0)),
+            stall_timeout_seconds=float(data.get("stall_timeout_seconds", data.get("timeout_seconds", 180.0))),
         )
 
     @classmethod
@@ -769,6 +822,13 @@ class CoordinatorAction:
     reason: str = ""
     quality_update: CoordinatorQualityUpdate | None = None
     final_response: str | None = None
+    review_decision: FinalReviewDecision | None = None
+    continuation_issue_id: str | None = None
+    unresolved_issue: str | None = None
+    why_it_matters: str | None = None
+    required_evidence: str | None = None
+    exact_next_action: str | None = None
+    expected_value: str | None = None
 
     def __post_init__(self) -> None:
         self.action_id = ActionId(self.action_id)
@@ -784,6 +844,8 @@ class CoordinatorAction:
         ]
         if isinstance(self.quality_update, dict):
             self.quality_update = CoordinatorQualityUpdate.from_dict(self.quality_update)
+        if self.review_decision is not None and isinstance(self.review_decision, str) and not isinstance(self.review_decision, FinalReviewDecision):
+            self.review_decision = FinalReviewDecision(self.review_decision)
         self.reason_summary = str(self.reason_summary or "")
         self.reason = str(self.reason or "")
         if self.reason and not self.reason_summary:
@@ -801,9 +863,35 @@ class CoordinatorAction:
                 raise ValueError("FINALIZE action cannot contain workers")
             if self.auditors:
                 raise ValueError("FINALIZE action cannot contain auditors")
+        elif self.kind == ActionKind.FINAL_REVIEW:
+            if self.workers or self.auditors:
+                raise ValueError("FINAL_REVIEW is a decision-only action and cannot contain workers or auditors")
+            if self.review_decision is None:
+                raise ValueError("FINAL_REVIEW requires review_decision STOP or CONTINUE")
+            if self.review_decision == FinalReviewDecision.STOP:
+                if not self.final_response:
+                    raise ValueError("FINAL_REVIEW STOP requires final_response")
+            else:
+                required = {
+                    "continuation_issue_id": self.continuation_issue_id,
+                    "unresolved_issue": self.unresolved_issue,
+                    "why_it_matters": self.why_it_matters,
+                    "required_evidence": self.required_evidence,
+                    "exact_next_action": self.exact_next_action,
+                    "expected_value": self.expected_value,
+                }
+                missing = [name for name, value in required.items() if not str(value or "").strip()]
+                if missing:
+                    raise ValueError(
+                        "FINAL_REVIEW CONTINUE requires targeted continuation fields: " + ", ".join(missing)
+                    )
+                if self.final_response is not None:
+                    raise ValueError("FINAL_REVIEW CONTINUE cannot contain final_response")
         else:
             if self.final_response is not None:
-                raise ValueError("final_response is only permitted for FINALIZE actions")
+                raise ValueError("final_response is only permitted for FINALIZE or FINAL_REVIEW STOP actions")
+            if self.review_decision is not None:
+                raise ValueError("review_decision is only permitted for FINAL_REVIEW")
 
         if self.kind == ActionKind.RUN_WORKERS:
             if not self.workers:
@@ -853,6 +941,13 @@ class CoordinatorAction:
             "reason": self.reason,
             "quality_update": self.quality_update.to_dict() if self.quality_update is not None else None,
             "final_response": self.final_response,
+            "review_decision": self.review_decision.value if self.review_decision is not None else None,
+            "continuation_issue_id": self.continuation_issue_id,
+            "unresolved_issue": self.unresolved_issue,
+            "why_it_matters": self.why_it_matters,
+            "required_evidence": self.required_evidence,
+            "exact_next_action": self.exact_next_action,
+            "expected_value": self.expected_value,
         }
 
     def to_json(self, indent: int | None = None) -> str:
@@ -881,6 +976,17 @@ class CoordinatorAction:
                 else data.get("quality_update")
             ),
             final_response=data.get("final_response"),
+            review_decision=(
+                FinalReviewDecision(data["review_decision"])
+                if data.get("review_decision") is not None
+                else None
+            ),
+            continuation_issue_id=data.get("continuation_issue_id"),
+            unresolved_issue=data.get("unresolved_issue"),
+            why_it_matters=data.get("why_it_matters"),
+            required_evidence=data.get("required_evidence"),
+            exact_next_action=data.get("exact_next_action"),
+            expected_value=data.get("expected_value"),
         )
 
     @classmethod
@@ -1100,7 +1206,6 @@ class OrchestrationBudget:
     max_rounds: int = 10
     max_boost_invocations: int = 2
     max_retries: int = 3
-    max_runtime_seconds: float = 1800.0
     min_quota_remaining: float = 10.0
     max_consecutive_rejections: int = 3
 
@@ -1111,7 +1216,6 @@ class OrchestrationBudget:
             "max_rounds": self.max_rounds,
             "max_boost_invocations": self.max_boost_invocations,
             "max_retries": self.max_retries,
-            "max_runtime_seconds": self.max_runtime_seconds,
             "min_quota_remaining": self.min_quota_remaining,
             "max_consecutive_rejections": self.max_consecutive_rejections,
         }
@@ -1129,7 +1233,6 @@ class OrchestrationBudget:
             max_rounds=int(data.get("max_rounds", 10)),
             max_boost_invocations=int(data.get("max_boost_invocations", 2)),
             max_retries=int(data.get("max_retries", 3)),
-            max_runtime_seconds=float(data.get("max_runtime_seconds", 1800.0)),
             min_quota_remaining=float(data.get("min_quota_remaining", 10.0)),
             max_consecutive_rejections=int(data.get("max_consecutive_rejections", 3)),
         )
@@ -1303,7 +1406,7 @@ class ModelInvocation:
     workspace_mode: WorkspaceMode = WorkspaceMode.READ_ONLY
     prompt: str = ""
     output_schema: dict[str, Any] | None = None
-    timeout_seconds: float = 300.0
+    stall_timeout_seconds: float = 180.0
     conversation_id: ConversationId | None = None
 
     def __post_init__(self) -> None:
@@ -1316,7 +1419,7 @@ class ModelInvocation:
             self.strategy = ExecutionStrategy(self.strategy)
         if isinstance(self.workspace_mode, str) and not isinstance(self.workspace_mode, WorkspaceMode):
             self.workspace_mode = WorkspaceMode(self.workspace_mode)
-        self.timeout_seconds = float(self.timeout_seconds)
+        self.stall_timeout_seconds = float(self.stall_timeout_seconds)
         if self.conversation_id is not None:
             self.conversation_id = ConversationId(self.conversation_id)
 
@@ -1330,7 +1433,7 @@ class ModelInvocation:
             "workspace_mode": self.workspace_mode.value,
             "prompt": self.prompt,
             "output_schema": self.output_schema,
-            "timeout_seconds": self.timeout_seconds,
+            "stall_timeout_seconds": self.stall_timeout_seconds,
             "conversation_id": str(self.conversation_id) if self.conversation_id is not None else None,
         }
 
@@ -1350,7 +1453,7 @@ class ModelInvocation:
             workspace_mode=WorkspaceMode(data.get("workspace_mode", WorkspaceMode.READ_ONLY)),
             prompt=str(data.get("prompt", "")),
             output_schema=data.get("output_schema"),
-            timeout_seconds=float(data.get("timeout_seconds", 300.0)),
+            stall_timeout_seconds=float(data.get("stall_timeout_seconds", data.get("timeout_seconds", 180.0))),
             conversation_id=(
                 ConversationId(data["conversation_id"])
                 if data.get("conversation_id") is not None
@@ -1448,6 +1551,7 @@ class RunState:
     mode: RunMode = RunMode.PLAN
     status: RunStatus = RunStatus.CREATED
     assessment: TaskAssessment | None = None
+    run_plan: RunPlan | None = None
     coordinator_conversation_id: ConversationId | None = None
     round_number: int = 0
     budget: OrchestrationBudget = field(default_factory=OrchestrationBudget)
@@ -1458,6 +1562,7 @@ class RunState:
     updated_at: str = ""
     final_result: str | None = None
     final_artifact_path: str | None = None
+    continuation_issue_history: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.run_id = RunId(self.run_id)
@@ -1467,6 +1572,11 @@ class RunState:
             self.status = RunStatus(self.status)
         if isinstance(self.assessment, dict):
             self.assessment = TaskAssessment.from_dict(self.assessment)
+        if isinstance(self.run_plan, dict):
+            self.run_plan = RunPlan.from_dict(self.run_plan)
+        self.continuation_issue_history = {
+            str(k): str(v) for k, v in dict(self.continuation_issue_history).items()
+        }
         if self.coordinator_conversation_id is not None:
             self.coordinator_conversation_id = ConversationId(self.coordinator_conversation_id)
         self.round_number = int(self.round_number)
@@ -1485,6 +1595,7 @@ class RunState:
             "mode": self.mode.value,
             "status": self.status.value,
             "assessment": self.assessment.to_dict() if self.assessment is not None else None,
+            "run_plan": self.run_plan.to_dict() if self.run_plan is not None else None,
             "coordinator_conversation_id": (
                 str(self.coordinator_conversation_id)
                 if self.coordinator_conversation_id is not None
@@ -1499,6 +1610,7 @@ class RunState:
             "updated_at": self.updated_at,
             "final_result": self.final_result,
             "final_artifact_path": self.final_artifact_path,
+            "continuation_issue_history": dict(self.continuation_issue_history),
         }
 
     def to_json(self, indent: int | None = None) -> str:
@@ -1517,6 +1629,11 @@ class RunState:
                 TaskAssessment.from_dict(data["assessment"])
                 if isinstance(data.get("assessment"), dict)
                 else data.get("assessment")
+            ),
+            run_plan=(
+                RunPlan.from_dict(data["run_plan"])
+                if isinstance(data.get("run_plan"), dict)
+                else data.get("run_plan")
             ),
             coordinator_conversation_id=(
                 ConversationId(data["coordinator_conversation_id"])
@@ -1544,6 +1661,7 @@ class RunState:
             updated_at=str(data.get("updated_at", "")),
             final_result=data.get("final_result"),
             final_artifact_path=data.get("final_artifact_path"),
+            continuation_issue_history=dict(data.get("continuation_issue_history", {})),
         )
 
     @classmethod

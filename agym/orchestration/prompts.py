@@ -59,8 +59,8 @@ Do not force SECURITY, PERFORMANCE, or other specialties when they are irrelevan
 
 Auditors inspect EXISTING outputs. They look for incorrect assumptions, missed requirements, regressions,
 contradictions, edge cases, test gaps, and architectural weaknesses. An auditor must not simply repeat the task.
-For MEDIUM work, auditing is normally worthwhile when `value_of_auditing >= 0.5`, but the deterministic
-MEDIUM finalization gate remains perspectives + synthesis + no open critical findings.
+For MEDIUM work, auditing is normally worthwhile when `value_of_auditing >= 0.5`, but review work is
+confidence-building rather than a mandatory checkbox. Finalization is blocked only by substantive unresolved conditions.
 
 When an audit or critique finds a concrete problem, prefer a small targeted follow-up worker for that unresolved
 issue instead of rerunning the entire worker wave. Launch another broad wave only when the uncertainty is broad.
@@ -80,9 +80,9 @@ that an audit/synthesis/verification happened through quality_update.
 
 ### EXPECTED DEEP PLAN SHAPE
 For HIGH-complexity PLAN work, normally use:
-ASSESS -> distinct parallel investigation -> independent audit -> synthesis v1 -> critique of that synthesis
--> targeted refinement when needed -> synthesis v2 when needed -> FINALIZE.
-This is guidance, not a fixed sequence; AGYM's deterministic quality gates decide whether FINALIZE is allowed.
+ASSESS -> distinct parallel investigation -> reconcile -> synthesize -> FINAL_REVIEW.
+A synthesis critique may improve confidence, but failure to obtain one must not make stopping illegal.
+This is guidance, not a fixed sequence.
 
 ### IMPLEMENT MODE
 Strongly separate reasoning from mutation:
@@ -100,7 +100,15 @@ You may request workers and specialists, audits, synthesis, another round, an ex
 2. RUN_AUDITORS to independently inspect prior outputs.
 3. RUN_SYNTHESIS for a read-only SYNTHESIZER that consolidates evidence.
 4. RUN_EXECUTOR for exactly one mutating EXECUTOR.
-5. FINALIZE with the definitive user-facing response.
+5. FINAL_REVIEW after a usable deliverable exists. Choose STOP or CONTINUE.
+6. FINALIZE remains a legacy direct-finalization action for simple/self-contained cases.
+
+For FINAL_REVIEW:
+- STOP means the deliverable is sufficient and must include final_response.
+- CONTINUE is valid only for a specific unresolved issue and must include continuation_issue_id,
+  unresolved_issue, why_it_matters, required_evidence, exact_next_action, and expected_value.
+- Never request a vague "another review". Repeating the same continuation issue without new evidence
+  or a materially different action is rejected mechanically by AGYM.
 
 ### FORBIDDEN
 Never:
@@ -123,7 +131,9 @@ is useful. Do not reveal private chain-of-thought. A short decision summary is s
 
 ### RESPONSE FORMAT
 All responses must be structured JSON.
-Round 0: return both `assessment` (TaskAssessment) and `action` (CoordinatorAction).
+Round 0: return `assessment` (TaskAssessment), `run_plan` (RunPlan), and `action` (CoordinatorAction).
+RunPlan contains only goal, phases, current_phase, and completion_criteria. Prefer phases such as
+Investigate, Reconcile, Synthesize, and Final Review, adapting names to the task.
 Later rounds: return one valid CoordinatorAction. After completed work, include all four quality_update fields.
 """
 
@@ -145,9 +155,10 @@ def build_assessment_prompt(
 ) -> str:
     """Build the prompt for the coordinator's initial Round 0 task assessment.
 
-    The coordinator's response MUST contain both:
+    The coordinator's response MUST contain:
     1. TaskAssessment
-    2. CoordinatorAction
+    2. RunPlan
+    3. CoordinatorAction
     No arbitrary prose-only decisions are accepted.
 
     Args:
@@ -185,10 +196,16 @@ def build_assessment_prompt(
    - Specify whether `mutation_required` is true.
    - Evaluate `value_of_parallel_reasoning` (0.0 to 1.0) and `value_of_auditing` (0.0 to 1.0).
    - Provide an executive `summary` and `proposed_initial_work`.
-2. Propose your first `CoordinatorAction`:
+2. Produce a concise `RunPlan` with only:
+   - `goal`
+   - `phases`
+   - `current_phase`
+   - `completion_criteria`
+   The plan guides orchestration but does not rigidly prescribe every action.
+3. Propose your first `CoordinatorAction`:
    - If parallel exploration/analysis is beneficial, propose `RUN_WORKERS` with one or more workers.
    - If the task is simple and clear, you may propose `RUN_EXECUTOR` directly (if mutation is required) or `FINALIZE` (if answerable directly).
-3. Output Requirement:
+4. Output Requirement:
    Your response MUST be a single valid JSON object matching the schema below.
    Do NOT provide an arbitrary prose-only answer without the JSON object.
 
@@ -334,7 +351,8 @@ def format_coordinator_observation(observation: CoordinatorObservation) -> str:
         "- RUN_AUDITORS: Launch auditors to critically inspect completed worker outputs.",
         "- RUN_SYNTHESIS: Synthesize prior worker outputs into a resolved plan.",
         "- RUN_EXECUTOR: Execute file modifications via a single mutating EXECUTOR worker.",
-        "- FINALIZE: Conclude only when AGYM quality requirements are satisfied.",
+        "- FINAL_REVIEW: Once a usable deliverable exists, choose STOP or a concrete targeted CONTINUE.",
+        "- FINALIZE: Legacy direct completion for simple/self-contained cases.",
         "- Include a short `reason` (<=500 chars) and, after completed work, all four `quality_update` fields.",
         "",
         "Respond with a single valid JSON object adhering to CoordinatorAction schema:",

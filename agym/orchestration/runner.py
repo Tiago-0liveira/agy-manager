@@ -198,6 +198,20 @@ def kill_process_tree(
                 pass
 
 
+class ProcessStalledError(asyncio.TimeoutError):
+    """Raised when a model subprocess produces no stdout/stderr activity."""
+
+    def __init__(self, stall_timeout_seconds: float, stdout: bytes = b"", stderr: bytes = b"") -> None:
+        super().__init__(f"Process stalled after {stall_timeout_seconds:.1f}s without stdout/stderr activity")
+        self.stall_timeout_seconds = float(stall_timeout_seconds)
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class EmergencyWatchdogError(asyncio.TimeoutError):
+    """Raised only for pathological process hangs that outlive the emergency watchdog."""
+
+
 class AntigravityRunner:
     """Conforms to ModelRunner.
 
@@ -210,6 +224,7 @@ class AntigravityRunner:
         agy_path: Path | str | None = None,
         profile_store: ProfileStore | None = None,
         base_env: Mapping[str, str] | None = None,
+        emergency_watchdog_seconds: float = 21600.0,
     ) -> None:
         if agy_path:
             self._agy_path = Path(agy_path)
@@ -221,6 +236,9 @@ class AntigravityRunner:
 
         self._profile_store = profile_store or ProfileStore()
         self._base_env = dict(base_env) if base_env else None
+        self.emergency_watchdog_seconds = float(emergency_watchdog_seconds)
+        if self.emergency_watchdog_seconds <= 0:
+            raise ValueError("emergency_watchdog_seconds must be positive")
         self._activity_callback: Callable[[RunId, InvocationId, str, str], None] | None = None
 
         # Instance-scoped process tracking: run_id -> {invocation_id -> Process}
@@ -435,14 +453,21 @@ class AntigravityRunner:
         proc: asyncio.subprocess.Process,
         invocation: ModelInvocation | None = None,
     ) -> tuple[bytes, bytes]:
+        """Drain both streams while enforcing inactivity-based stall detection."""
         capture = current_attempt.get()
-        if capture is None and self._activity_callback is None:
-            return await proc.communicate()
+        stdout_chunks: list[bytes] = []
+        stderr_chunks: list[bytes] = []
+        last_process_activity = time.monotonic()
+        started = last_process_activity
+        stall_timeout = (
+            invocation.stall_timeout_seconds if invocation is not None else 180.0
+        )
 
-        async def drain(reader: asyncio.StreamReader, stream: str) -> bytes:
-            chunks: list[bytes] = []
+        async def drain(reader: asyncio.StreamReader, stream: str, chunks: list[bytes]) -> bytes:
+            nonlocal last_process_activity
             pending = b""
             while chunk := await reader.read(65536):
+                last_process_activity = time.monotonic()
                 if capture is not None:
                     capture.write(stream, chunk)
                 chunks.append(chunk)
@@ -463,13 +488,32 @@ class AntigravityRunner:
             return b"".join(chunks)
 
         tasks = [
-            asyncio.create_task(drain(proc.stdout, "stdout")),
-            asyncio.create_task(drain(proc.stderr, "stderr")),
+            asyncio.create_task(drain(proc.stdout, "stdout", stdout_chunks)),
+            asyncio.create_task(drain(proc.stderr, "stderr", stderr_chunks)),
         ]
         try:
-            stdout, stderr = await asyncio.gather(*tasks)
-            await proc.wait()
-            return stdout, stderr
+            while True:
+                done, _ = await asyncio.wait(tasks, timeout=min(1.0, stall_timeout))
+                if all(task.done() for task in tasks):
+                    stdout, stderr = [task.result() for task in tasks]
+                    await proc.wait()
+                    return stdout, stderr
+
+                now = time.monotonic()
+                if now - last_process_activity >= stall_timeout:
+                    raise ProcessStalledError(
+                        stall_timeout,
+                        stdout=b"".join(stdout_chunks),
+                        stderr=b"".join(stderr_chunks),
+                    )
+                if now - started >= self.emergency_watchdog_seconds:
+                    raise EmergencyWatchdogError(
+                        f"Emergency watchdog exceeded {self.emergency_watchdog_seconds:.1f}s"
+                    )
+                for task in done:
+                    exc = task.exception()
+                    if exc is not None:
+                        raise exc
         finally:
             for task in tasks:
                 if not task.done():
@@ -578,18 +622,34 @@ class AntigravityRunner:
                 capture.note("process_started", pid=proc.pid, argv=cmd, cwd=str(Path.cwd()),
                              output_format="stream-json")
 
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                self._collect_output(proc, invocation),
-                timeout=invocation.timeout_seconds,
+            stdout_bytes, stderr_bytes = await self._collect_output(proc, invocation)
+        except ProcessStalledError as exc:
+            if proc:
+                await self._cleanup_process(proc)
+            partial_stdout = exc.stdout.decode("utf-8", errors="replace").strip()
+            partial_stderr = exc.stderr.decode("utf-8", errors="replace").strip()
+            return ModelResult(
+                invocation_id=invocation.invocation_id,
+                status=InvocationStatus.FAILED,
+                response=partial_stdout or None,
+                structured_data={
+                    "stall": True,
+                    "stall_timeout_seconds": exc.stall_timeout_seconds,
+                    "partial_stderr": partial_stderr or None,
+                },
+                exit_code=proc.returncode if proc else None,
+                error=f"STALLED: no stdout/stderr activity for {exc.stall_timeout_seconds:.1f}s",
+                started_at=started_at,
+                completed_at=datetime.now(timezone.utc).isoformat(),
             )
-        except asyncio.TimeoutError:
+        except EmergencyWatchdogError as exc:
             if proc:
                 await self._cleanup_process(proc)
             return ModelResult(
                 invocation_id=invocation.invocation_id,
                 status=InvocationStatus.FAILED,
                 exit_code=proc.returncode if proc else None,
-                error=f"Execution timed out after {invocation.timeout_seconds}s",
+                error=str(exc),
                 started_at=started_at,
                 completed_at=datetime.now(timezone.utc).isoformat(),
             )
@@ -804,7 +864,7 @@ class AntigravityRunner:
         self,
         profile_name: str | None = None,
         strategy: ExecutionStrategy = ExecutionStrategy.STANDARD,
-        timeout_seconds: float = 300.0,
+        stall_timeout_seconds: float = 180.0,
         conversation_id: ConversationId | str | None = None,
     ) -> AntigravitySession:
         """Create a multi-turn persistent session."""
@@ -814,7 +874,8 @@ class AntigravityRunner:
             agy_path=self._agy_path,
             profile_store=self._profile_store,
             base_env=self._base_env,
-            timeout_seconds=timeout_seconds,
+            stall_timeout_seconds=stall_timeout_seconds,
+            emergency_watchdog_seconds=self.emergency_watchdog_seconds,
             conversation_id=conversation_id,
         )
 
@@ -833,7 +894,8 @@ class AntigravitySession:
         agy_path: Path | str | None = None,
         profile_store: ProfileStore | None = None,
         base_env: Mapping[str, str] | None = None,
-        timeout_seconds: float = 300.0,
+        stall_timeout_seconds: float = 180.0,
+        emergency_watchdog_seconds: float = 21600.0,
         conversation_id: ConversationId | str | None = None,
     ) -> None:
         self.profile_name = profile_name
@@ -852,7 +914,11 @@ class AntigravitySession:
 
         self._profile_store = profile_store or ProfileStore()
         self._base_env = dict(base_env) if base_env else None
-        self.default_timeout = float(timeout_seconds)
+        self.default_stall_timeout = float(stall_timeout_seconds)
+        self.emergency_watchdog_seconds = float(emergency_watchdog_seconds)
+        if self.default_stall_timeout <= 0 or self.emergency_watchdog_seconds <= 0:
+            raise ValueError("stall and emergency watchdog timeouts must be positive")
+        self._last_process_activity = time.monotonic()
         self._conversation_id = ConversationId(conversation_id) if conversation_id else None
         self._turn_count = 0
         self._is_closed = False
@@ -961,6 +1027,7 @@ class AntigravitySession:
                 line = bytes(self._stdout_buffer)
                 self._stdout_buffer.clear()
                 return line
+            self._last_process_activity = time.monotonic()
             if self._active_capture is not None:
                 self._active_capture.write("stdout", chunk)
             self._stdout_buffer.extend(chunk)
@@ -971,6 +1038,7 @@ class AntigravitySession:
 
     async def _drain_stderr(self, reader: asyncio.StreamReader) -> None:
         while chunk := await reader.read(65536):
+            self._last_process_activity = time.monotonic()
             if self._active_capture is not None:
                 self._active_capture.write("stderr", chunk)
 
@@ -985,19 +1053,21 @@ class AntigravitySession:
     # Request execution: send() / ask()
     # =========================================================================
 
-    def send(self, prompt: str, timeout_seconds: float | None = None) -> ModelResult:
-        """Send a prompt and receive the model's result (ModelSession protocol)."""
+    def send(self, prompt: str, stall_stall_timeout_seconds: float | None = None) -> ModelResult:
+        """Send a prompt and receive the model's result using stall detection."""
         if self._is_closed:
             raise RuntimeError("Session is closed")
-        timeout = timeout_seconds if timeout_seconds is not None else self.default_timeout
+        stall_timeout = (
+            stall_timeout_seconds if stall_timeout_seconds is not None else self.default_stall_timeout
+        )
         with self._turn_lock:
             fut = asyncio.run_coroutine_threadsafe(
-                self._send_coro(prompt, timeout),
+                self._send_coro(prompt, stall_timeout),
                 self._loop,
             )
             try:
-                return fut.result(timeout=timeout + 5.0)
-            except (concurrent.futures.TimeoutError, Exception) as exc:
+                return fut.result(timeout=self.emergency_watchdog_seconds + 5.0)
+            except concurrent.futures.TimeoutError as exc:
                 fut.cancel()
                 self._is_invalid = True
                 asyncio.run_coroutine_threadsafe(self._close_process(), self._loop)
@@ -1005,27 +1075,42 @@ class AntigravitySession:
                 return ModelResult(
                     invocation_id=InvocationId(f"{self.conversation_id}-{self._turn_count}"),
                     status=InvocationStatus.FAILED,
-                    error=f"Session turn timed out or failed: {exc}",
+                    error=f"Emergency watchdog exceeded: {exc}",
+                    started_at=started_at,
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+            except Exception as exc:
+                fut.cancel()
+                self._is_invalid = True
+                asyncio.run_coroutine_threadsafe(self._close_process(), self._loop)
+                started_at = datetime.now(timezone.utc).isoformat()
+                return ModelResult(
+                    invocation_id=InvocationId(f"{self.conversation_id}-{self._turn_count}"),
+                    status=InvocationStatus.FAILED,
+                    error=f"Session turn failed: {exc}",
                     started_at=started_at,
                     completed_at=datetime.now(timezone.utc).isoformat(),
                 )
 
-    def ask(self, prompt: str, timeout_seconds: float | None = None) -> ModelResult:
-        """Alias for send() to satisfy wave1-A requirements."""
-        return self.send(prompt, timeout_seconds=timeout_seconds)
+    def ask(self, prompt: str, stall_stall_timeout_seconds: float | None = None) -> ModelResult:
+        return self.send(prompt, stall_timeout_seconds=stall_timeout_seconds)
 
-    async def send_async(self, prompt: str, timeout_seconds: float | None = None) -> ModelResult:
-        """Async send implementation."""
+    async def send_async(self, prompt: str, stall_stall_timeout_seconds: float | None = None) -> ModelResult:
         if self._is_closed:
             raise RuntimeError("Session is closed")
-        timeout = timeout_seconds if timeout_seconds is not None else self.default_timeout
+        stall_timeout = (
+            stall_timeout_seconds if stall_timeout_seconds is not None else self.default_stall_timeout
+        )
         fut = asyncio.run_coroutine_threadsafe(
-            self._send_coro(prompt, timeout),
+            self._send_coro(prompt, stall_timeout),
             self._loop,
         )
         try:
             return await asyncio.wrap_future(fut)
-        except (asyncio.TimeoutError, asyncio.CancelledError, Exception) as exc:
+        except asyncio.CancelledError:
+            fut.cancel()
+            raise
+        except Exception as exc:
             fut.cancel()
             self._is_invalid = True
             asyncio.run_coroutine_threadsafe(self._close_process(), self._loop)
@@ -1033,20 +1118,42 @@ class AntigravitySession:
             return ModelResult(
                 invocation_id=InvocationId(f"{self.conversation_id}-{self._turn_count}"),
                 status=InvocationStatus.FAILED,
-                error=f"Session turn timed out or failed: {exc}",
+                error=f"Session turn failed: {exc}",
                 started_at=started_at,
                 completed_at=datetime.now(timezone.utc).isoformat(),
             )
 
-    async def ask_async(self, prompt: str, timeout_seconds: float | None = None) -> ModelResult:
-        """Async alias for ask()."""
-        return await self.send_async(prompt, timeout_seconds=timeout_seconds)
+    async def ask_async(self, prompt: str, stall_stall_timeout_seconds: float | None = None) -> ModelResult:
+        return await self.send_async(prompt, stall_timeout_seconds=stall_timeout_seconds)
 
-    async def _send_coro(self, prompt: str, timeout: float) -> ModelResult:
+    async def _read_session_line_with_stall(
+        self,
+        stall_timeout: float,
+        emergency_deadline: float,
+    ) -> bytes:
+        read_task = asyncio.create_task(self._read_session_line())
+        try:
+            while not read_task.done():
+                await asyncio.wait({read_task}, timeout=min(1.0, stall_timeout))
+                now = time.monotonic()
+                if now - self._last_process_activity >= stall_timeout:
+                    raise ProcessStalledError(stall_timeout)
+                if now >= emergency_deadline:
+                    raise EmergencyWatchdogError(
+                        f"Emergency watchdog exceeded {self.emergency_watchdog_seconds:.1f}s"
+                    )
+            return await read_task
+        finally:
+            if not read_task.done():
+                read_task.cancel()
+                await asyncio.gather(read_task, return_exceptions=True)
+
+    async def _send_coro(self, prompt: str, stall_timeout: float) -> ModelResult:
         """Internal coroutine executed on self._loop to send a turn and read response."""
         started_at = datetime.now(timezone.utc).isoformat()
         self._turn_count += 1
         inv_id = InvocationId(f"{self.conversation_id}-{self._turn_count}")
+        emergency_deadline = time.monotonic() + self.emergency_watchdog_seconds
 
         if self._stream_lock is None:
             self._stream_lock = asyncio.Lock()
@@ -1079,7 +1186,6 @@ class AntigravitySession:
                                           argv=self._session_command, cwd=str(Path.cwd()),
                                           output_format="stream-json")
 
-            # Write NDJSON prompt line to stdin
             payload = json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
             try:
                 assert self._proc.stdin is not None
@@ -1089,6 +1195,7 @@ class AntigravitySession:
                 drain_coro = self._proc.stdin.drain()
                 if asyncio.iscoroutine(drain_coro):
                     await drain_coro
+                self._last_process_activity = time.monotonic()
             except Exception as exc:
                 self._is_invalid = True
                 await self._close_process()
@@ -1100,7 +1207,6 @@ class AntigravitySession:
                     completed_at=datetime.now(timezone.utc).isoformat(),
                 )
 
-            # Read NDJSON response events from stdout
             response_lines: list[str] = []
             usage = None
             structured_data: dict[str, Any] | None = None
@@ -1110,18 +1216,13 @@ class AntigravitySession:
             try:
                 assert self._proc.stdout is not None
                 while True:
-                    line_bytes = await asyncio.wait_for(
-                        self._read_session_line(),
-                        timeout=timeout,
+                    line_bytes = await self._read_session_line_with_stall(
+                        stall_timeout, emergency_deadline
                     )
                     if not line_bytes:
                         break
 
-                    if isinstance(line_bytes, bytes):
-                        line_str = line_bytes.decode("utf-8", errors="replace").strip()
-                    else:
-                        line_str = str(line_bytes).strip()
-
+                    line_str = line_bytes.decode("utf-8", errors="replace").strip()
                     if not line_str:
                         continue
 
@@ -1134,7 +1235,6 @@ class AntigravitySession:
                     if not isinstance(event, dict):
                         continue
 
-                    # Capture conversation ID from event
                     cid = (
                         event.get("conversation_id")
                         or event.get("conversationId")
@@ -1146,7 +1246,7 @@ class AntigravitySession:
                     evt_type = event.get("event") or event.get("step_type") or event.get("type")
                     if evt_type == "init":
                         continue
-                    elif evt_type in ("result", "turn_complete", "response"):
+                    if evt_type in ("result", "turn_complete", "response"):
                         try:
                             raw_response_text, inner_cid, usage = decode_response(line_str)
                         except ValueError as exc:
@@ -1165,7 +1265,7 @@ class AntigravitySession:
                             pass
                         has_terminal_event = True
                         break
-                    elif evt_type == "error":
+                    if evt_type == "error":
                         err_msg = str(event.get("error") or event.get("message") or event)
                         has_terminal_event = True
                         return ModelResult(
@@ -1176,22 +1276,35 @@ class AntigravitySession:
                             started_at=started_at,
                             completed_at=datetime.now(timezone.utc).isoformat(),
                         )
-                    elif "response" in event:
+                    if "response" in event:
                         raw_response_text = str(event["response"])
                         has_terminal_event = True
                         break
-                    else:
-                        if "delta" in event:
-                            response_lines.append(str(event["delta"]))
-                        elif "text" in event:
-                            response_lines.append(str(event["text"]))
-            except asyncio.TimeoutError:
+                    if "delta" in event:
+                        response_lines.append(str(event["delta"]))
+                    elif "text" in event:
+                        response_lines.append(str(event["text"]))
+            except ProcessStalledError as exc:
+                self._is_invalid = True
+                await self._close_process()
+                partial = "\n".join(response_lines).strip()
+                return ModelResult(
+                    invocation_id=inv_id,
+                    status=InvocationStatus.FAILED,
+                    response=partial or None,
+                    structured_data={"stall": True, "stall_timeout_seconds": exc.stall_timeout_seconds},
+                    error=f"STALLED: no stdout/stderr activity for {exc.stall_timeout_seconds:.1f}s",
+                    conversation_id=self.conversation_id,
+                    started_at=started_at,
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+            except EmergencyWatchdogError as exc:
                 self._is_invalid = True
                 await self._close_process()
                 return ModelResult(
                     invocation_id=inv_id,
                     status=InvocationStatus.FAILED,
-                    error=f"Session turn timed out after {timeout}s",
+                    error=str(exc),
                     conversation_id=self.conversation_id,
                     started_at=started_at,
                     completed_at=datetime.now(timezone.utc).isoformat(),
@@ -1208,7 +1321,6 @@ class AntigravitySession:
                     completed_at=datetime.now(timezone.utc).isoformat(),
                 )
 
-            # Process status and EOF verification
             proc_returncode = getattr(self._proc, "returncode", None)
             if proc_returncode is not None and not has_terminal_event:
                 self._is_invalid = True
@@ -1229,6 +1341,7 @@ class AntigravitySession:
                 return ModelResult(
                     invocation_id=inv_id,
                     status=InvocationStatus.FAILED,
+                    response="\n".join(response_lines).strip() or None,
                     error="Subprocess stream closed with EOF before delivering response",
                     conversation_id=self.conversation_id,
                     started_at=started_at,
@@ -1435,7 +1548,7 @@ class FakeModelRunner:
             return ModelResult(
                 invocation_id=invocation.invocation_id,
                 status=InvocationStatus.FAILED,
-                error=f"Execution timed out after {invocation.timeout_seconds}s",
+                error=f"Execution stalled after {invocation.stall_timeout_seconds}s",
                 started_at=started_at,
                 completed_at=completed_at,
             )
@@ -1555,7 +1668,7 @@ class FakeModelSession:
     def conversation_id(self) -> ConversationId:
         return self._conversation_id
 
-    def send(self, prompt: str, timeout_seconds: float | None = None) -> ModelResult:
+    def send(self, prompt: str, stall_timeout_seconds: float | None = None) -> ModelResult:
         """Send a prompt and return scripted result (ModelSession protocol)."""
         if self._is_closed:
             raise RuntimeError("Session is closed")
@@ -1618,15 +1731,15 @@ class FakeModelSession:
             completed_at=completed_at,
         )
 
-    def ask(self, prompt: str, timeout_seconds: float | None = None) -> ModelResult:
+    def ask(self, prompt: str, stall_timeout_seconds: float | None = None) -> ModelResult:
         """Alias for send()."""
-        return self.send(prompt, timeout_seconds=timeout_seconds)
+        return self.send(prompt, stall_timeout_seconds=stall_timeout_seconds)
 
-    async def send_async(self, prompt: str, timeout_seconds: float | None = None) -> ModelResult:
-        return self.send(prompt, timeout_seconds=timeout_seconds)
+    async def send_async(self, prompt: str, stall_timeout_seconds: float | None = None) -> ModelResult:
+        return self.send(prompt, stall_timeout_seconds=stall_timeout_seconds)
 
-    async def ask_async(self, prompt: str, timeout_seconds: float | None = None) -> ModelResult:
-        return self.send(prompt, timeout_seconds=timeout_seconds)
+    async def ask_async(self, prompt: str, stall_timeout_seconds: float | None = None) -> ModelResult:
+        return self.send(prompt, stall_timeout_seconds=stall_timeout_seconds)
 
     def close(self) -> None:
         self._is_closed = True

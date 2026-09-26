@@ -28,7 +28,9 @@ from agym.orchestration.contracts import (
     CoordinatorQualityUpdate,
     ExecutionStrategy,
     FailureClass,
+    FinalReviewDecision,
     InvocationStatus,
+    RunPlan,
     TaskAssessment,
     TaskType,
     WorkerId,
@@ -51,8 +53,10 @@ __all__ = [
     "WORKER_REQUEST_ALLOWED_FIELDS",
     "AUDIT_REQUEST_ALLOWED_FIELDS",
     "TASK_ASSESSMENT_ALLOWED_FIELDS",
+    "RUN_PLAN_ALLOWED_FIELDS",
     "INITIAL_RESPONSE_ALLOWED_FIELDS",
     "TASK_ASSESSMENT_SCHEMA",
+    "RUN_PLAN_SCHEMA",
     "WORKER_REQUEST_SCHEMA",
     "AUDIT_REQUEST_SCHEMA",
     "COORDINATOR_ACTION_SCHEMA",
@@ -131,6 +135,13 @@ COORDINATOR_ACTION_ALLOWED_FIELDS: frozenset[str] = frozenset({
     "reason",
     "quality_update",
     "final_response",
+    "review_decision",
+    "continuation_issue_id",
+    "unresolved_issue",
+    "why_it_matters",
+    "required_evidence",
+    "exact_next_action",
+    "expected_value",
 })
 
 WORKER_REQUEST_ALLOWED_FIELDS: frozenset[str] = frozenset({
@@ -140,7 +151,7 @@ WORKER_REQUEST_ALLOWED_FIELDS: frozenset[str] = frozenset({
     "workspace_mode",
     "objective",
     "context_worker_ids",
-    "timeout_seconds",
+    "stall_timeout_seconds",
 })
 
 AUDIT_REQUEST_ALLOWED_FIELDS: frozenset[str] = frozenset({
@@ -163,8 +174,16 @@ TASK_ASSESSMENT_ALLOWED_FIELDS: frozenset[str] = frozenset({
     "proposed_initial_work",
 })
 
+RUN_PLAN_ALLOWED_FIELDS: frozenset[str] = frozenset({
+    "goal",
+    "phases",
+    "current_phase",
+    "completion_criteria",
+})
+
 INITIAL_RESPONSE_ALLOWED_FIELDS: frozenset[str] = frozenset({
     "assessment",
+    "run_plan",
     "action",
 })
 
@@ -238,6 +257,28 @@ TASK_ASSESSMENT_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+RUN_PLAN_SCHEMA: dict[str, Any] = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "RunPlan",
+    "type": "object",
+    "required": ["goal", "phases", "current_phase", "completion_criteria"],
+    "properties": {
+        "goal": {"type": "string", "minLength": 1},
+        "phases": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 1,
+        },
+        "current_phase": {"type": "string", "minLength": 1},
+        "completion_criteria": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 1,
+        },
+    },
+    "additionalProperties": False,
+}
+
 WORKER_REQUEST_SCHEMA: dict[str, Any] = {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "title": "WorkerRequest",
@@ -276,11 +317,11 @@ WORKER_REQUEST_SCHEMA: dict[str, Any] = {
             "default": [],
             "description": "IDs of prior completed workers whose outputs should be in context.",
         },
-        "timeout_seconds": {
+        "stall_timeout_seconds": {
             "type": "number",
             "exclusiveMinimum": 0.0,
-            "default": 300.0,
-            "description": "Execution timeout in seconds.",
+            "default": 180.0,
+            "description": "Maximum stdout/stderr inactivity window before the process is classified STALLED.",
         },
     },
     "additionalProperties": False,
@@ -313,11 +354,11 @@ AUDIT_REQUEST_SCHEMA: dict[str, Any] = {
             "default": ExecutionStrategy.STANDARD.value,
             "description": "Effort tier for the audit.",
         },
-        "timeout_seconds": {
+        "stall_timeout_seconds": {
             "type": "number",
             "exclusiveMinimum": 0.0,
-            "default": 300.0,
-            "description": "Execution timeout in seconds.",
+            "default": 180.0,
+            "description": "Maximum stdout/stderr inactivity window before the process is classified STALLED.",
         },
     },
     "additionalProperties": False,
@@ -336,7 +377,7 @@ COORDINATOR_ACTION_SCHEMA: dict[str, Any] = {
         "kind": {
             "type": "string",
             "enum": [k.value for k in ActionKind],
-            "description": "Kind of action (RUN_WORKERS, RUN_AUDITORS, RUN_SYNTHESIS, RUN_EXECUTOR, FINALIZE).",
+            "description": "Kind of action (RUN_WORKERS, RUN_AUDITORS, RUN_SYNTHESIS, RUN_EXECUTOR, FINAL_REVIEW, FINALIZE).",
         },
         "workers": {
             "type": "array",
@@ -377,8 +418,20 @@ COORDINATOR_ACTION_SCHEMA: dict[str, Any] = {
         "final_response": {
             "type": ["string", "null"],
             "default": None,
-            "description": "Final user-facing result. Only allowed for FINALIZE action.",
+            "description": "Final user-facing result. Allowed for FINALIZE and FINAL_REVIEW STOP.",
         },
+        "review_decision": {
+            "type": ["string", "null"],
+            "enum": [None, *[v.value for v in FinalReviewDecision]],
+            "default": None,
+            "description": "STOP or CONTINUE for FINAL_REVIEW.",
+        },
+        "continuation_issue_id": {"type": ["string", "null"], "default": None},
+        "unresolved_issue": {"type": ["string", "null"], "default": None},
+        "why_it_matters": {"type": ["string", "null"], "default": None},
+        "required_evidence": {"type": ["string", "null"], "default": None},
+        "exact_next_action": {"type": ["string", "null"], "default": None},
+        "expected_value": {"type": ["string", "null"], "default": None},
     },
     "additionalProperties": False,
 }
@@ -387,9 +440,10 @@ INITIAL_RESPONSE_SCHEMA: dict[str, Any] = {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "title": "InitialCoordinatorResponse",
     "type": "object",
-    "required": ["assessment", "action"],
+    "required": ["assessment", "run_plan", "action"],
     "properties": {
         "assessment": TASK_ASSESSMENT_SCHEMA,
+        "run_plan": RUN_PLAN_SCHEMA,
         "action": COORDINATOR_ACTION_SCHEMA,
     },
     "additionalProperties": False,
@@ -418,17 +472,19 @@ def get_initial_response_schema() -> dict[str, Any]:
 
 @dataclass
 class InitialCoordinatorResponse:
-    """Coordinator's mandatory initial response combining TaskAssessment and CoordinatorAction."""
+    """Coordinator's mandatory initial response combining TaskAssessment, RunPlan, and CoordinatorAction."""
 
     assessment: TaskAssessment
+    run_plan: RunPlan
     action: CoordinatorAction
 
     def __iter__(self):
-        return iter((self.assessment, self.action))
+        return iter((self.assessment, self.run_plan, self.action))
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "assessment": self.assessment.to_dict(),
+            "run_plan": self.run_plan.to_dict(),
             "action": self.action.to_dict(),
         }
 
@@ -698,11 +754,15 @@ def parse_initial_response(
     # 2. Check allowed top-level keys
     check_allowed_fields(data, INITIAL_RESPONSE_ALLOWED_FIELDS, "InitialCoordinatorResponse")
 
-    # 3. Check presence of both assessment and action
+    # 3. Check presence of assessment, run plan, and action
     if "assessment" not in data or not isinstance(data["assessment"], dict):
         raise ProtocolSchemaError(
             "Initial coordinator response must contain an 'assessment' object. "
             "Arbitrary prose-only decisions are not permitted."
+        )
+    if "run_plan" not in data or not isinstance(data["run_plan"], dict):
+        raise ProtocolSchemaError(
+            "Initial coordinator response must contain a 'run_plan' object."
         )
     if "action" not in data or not isinstance(data["action"], dict):
         raise ProtocolSchemaError(
@@ -736,10 +796,19 @@ def parse_initial_response(
     except ValueError as exc:
         raise ProtocolSchemaError(f"TaskAssessment validation error: {exc}") from exc
 
-    # 5. Parse and validate action
+    # 5. Parse and validate run plan
+    run_plan_dict = data["run_plan"]
+    check_forbidden_fields(run_plan_dict, "run_plan")
+    check_allowed_fields(run_plan_dict, RUN_PLAN_ALLOWED_FIELDS, "RunPlan")
+    try:
+        run_plan = RunPlan.from_dict(run_plan_dict)
+    except ValueError as exc:
+        raise ProtocolSchemaError(f"RunPlan validation error: {exc}") from exc
+
+    # 6. Parse and validate action
     action = parse_coordinator_action(data["action"], known_worker_ids=known_worker_ids)
 
-    return InitialCoordinatorResponse(assessment=assessment, action=action)
+    return InitialCoordinatorResponse(assessment=assessment, run_plan=run_plan, action=action)
 
 
 # ============================================================================
@@ -806,6 +875,9 @@ def validate_coordinator_action(
         if action.workers[0].role != WorkerRole.EXECUTOR:
             raise ActionValidationError("RUN_EXECUTOR worker must have role EXECUTOR")
 
+    elif action.kind == ActionKind.FINAL_REVIEW:
+        if action.workers or action.auditors:
+            raise ActionValidationError("FINAL_REVIEW cannot contain workers or auditors")
     elif action.kind == ActionKind.FINALIZE:
         if action.workers:
             raise ActionValidationError("FINALIZE action cannot contain workers")
