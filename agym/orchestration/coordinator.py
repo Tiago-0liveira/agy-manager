@@ -174,7 +174,8 @@ class CoordinatorStartResult:
     conversation_id: ConversationId
 
     def __iter__(self):
-        return iter((self.assessment, self.run_plan, self.action, self.conversation_id))
+        # Preserve the historical tuple shape while exposing run_plan as an attribute.
+        return iter((self.assessment, self.action, self.conversation_id))
 
 
 # ============================================================================

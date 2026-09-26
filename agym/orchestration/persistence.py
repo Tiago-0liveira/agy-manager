@@ -985,6 +985,7 @@ class FileRunStore:
         failure: FailureClass | str | None = None,
         exit_code: int | None = None,
         output_text: str | None = None,
+        structured_data: dict[str, Any] | None = None,
     ) -> InvocationRecord:
         """Persist invocation failure metadata and emit INVOCATION_FAILED."""
         rid = RunId(run_id)

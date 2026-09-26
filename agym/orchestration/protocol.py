@@ -480,7 +480,8 @@ class InitialCoordinatorResponse:
     action: CoordinatorAction
 
     def __iter__(self):
-        return iter((self.assessment, self.run_plan, self.action))
+        # Keep legacy two-value unpacking; run_plan remains an explicit attribute.
+        return iter((self.assessment, self.action))
 
     def to_dict(self) -> dict[str, Any]:
         return {
