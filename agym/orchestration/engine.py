@@ -1369,6 +1369,7 @@ class OrchestrationEngine:
                         failure=failure_class,
                         exit_code=getattr(model_res, "exit_code", None),
                         output_text=model_res.response,
+                        structured_data=model_res.structured_data,
                     )
                 else:
                     self._emit_event(
@@ -1598,6 +1599,7 @@ class OrchestrationEngine:
                         failure=failure_class,
                         exit_code=getattr(model_res, "exit_code", None),
                         output_text=model_res.response,
+                        structured_data=model_res.structured_data,
                     )
                 else:
                     self._emit_event(
@@ -2310,7 +2312,11 @@ class OrchestrationEngine:
         if state is None:
             raise EngineError(f"Cannot resume: run '{rid}' not found")
 
-        if state.status == RunStatus.COMPLETED:
+        if state.status in (
+            RunStatus.COMPLETED,
+            RunStatus.COMPLETED_WITH_LIMITATIONS,
+            RunStatus.RESOURCE_EXHAUSTED,
+        ):
             return state
 
         with _ACTIVE_RUNS_LOCK:

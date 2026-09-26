@@ -781,6 +781,18 @@ class CoordinatorClient:
     # Execution & Bounded Invalid Output Recovery
     # ------------------------------------------------------------------------
 
+    def _send_session(self, session: ModelSession, prompt: str) -> ModelResult:
+        """Send using stall semantics while tolerating legacy third-party session signatures."""
+        try:
+            parameters = inspect.signature(session.send).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "stall_timeout_seconds" in parameters:
+            return session.send(prompt, stall_timeout_seconds=self.stall_timeout_seconds)
+        if "timeout_seconds" in parameters:
+            return session.send(prompt, timeout_seconds=self.stall_timeout_seconds)
+        return session.send(prompt)
+
     def _send_and_parse(
         self,
         prompt: str,
@@ -810,7 +822,7 @@ class CoordinatorClient:
                     schema_name=schema_name, conversation_id=self.conversation_id,
                     stall_timeout_seconds=self.stall_timeout_seconds, strategy=self.strategy.value,
                 ) as capture:
-                    res = session.send(current_prompt, stall_timeout_seconds=self.stall_timeout_seconds)
+                    res = self._send_session(session, current_prompt)
                     if capture is not None:
                         capture.finish(res)
             except Exception as exc:
