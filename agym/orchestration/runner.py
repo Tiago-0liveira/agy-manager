@@ -123,7 +123,7 @@ def classify_failure(result: ModelResult) -> FailureClass:
     """Classify mechanical execution failure of a ModelResult into FailureClass.
 
     Reports mechanical execution classifications:
-    - TIMEOUT, NONZERO, EMPTY OUTPUT -> RETRYABLE
+    - STALL, temporary provider failure, NONZERO, EMPTY OUTPUT -> RETRYABLE
     - AUTHENTICATION, UNSUPPORTED STRATEGY, CANCELLED -> UNRECOVERABLE
     - MALFORMED JSON, MALFORMED STRUCTURED PAYLOAD -> RECOVERABLE
     """
@@ -141,7 +141,7 @@ def classify_failure(result: ModelResult) -> FailureClass:
         return FailureClass.RETRYABLE
     if "malformed json" in err or "malformed structured payload" in err:
         return FailureClass.RECOVERABLE
-    if "timed out" in err or "timeout" in err:
+    if "stalled" in err or "timed out" in err or "timeout" in err:
         return FailureClass.RETRYABLE
     if "empty output" in err or "empty response" in err:
         return FailureClass.RETRYABLE
@@ -1053,7 +1053,7 @@ class AntigravitySession:
     # Request execution: send() / ask()
     # =========================================================================
 
-    def send(self, prompt: str, stall_stall_timeout_seconds: float | None = None) -> ModelResult:
+    def send(self, prompt: str, stall_timeout_seconds: float | None = None) -> ModelResult:
         """Send a prompt and receive the model's result using stall detection."""
         if self._is_closed:
             raise RuntimeError("Session is closed")
@@ -1092,10 +1092,10 @@ class AntigravitySession:
                     completed_at=datetime.now(timezone.utc).isoformat(),
                 )
 
-    def ask(self, prompt: str, stall_stall_timeout_seconds: float | None = None) -> ModelResult:
+    def ask(self, prompt: str, stall_timeout_seconds: float | None = None) -> ModelResult:
         return self.send(prompt, stall_timeout_seconds=stall_timeout_seconds)
 
-    async def send_async(self, prompt: str, stall_stall_timeout_seconds: float | None = None) -> ModelResult:
+    async def send_async(self, prompt: str, stall_timeout_seconds: float | None = None) -> ModelResult:
         if self._is_closed:
             raise RuntimeError("Session is closed")
         stall_timeout = (
@@ -1123,7 +1123,7 @@ class AntigravitySession:
                 completed_at=datetime.now(timezone.utc).isoformat(),
             )
 
-    async def ask_async(self, prompt: str, stall_stall_timeout_seconds: float | None = None) -> ModelResult:
+    async def ask_async(self, prompt: str, stall_timeout_seconds: float | None = None) -> ModelResult:
         return await self.send_async(prompt, stall_timeout_seconds=stall_timeout_seconds)
 
     async def _read_session_line_with_stall(
@@ -1693,7 +1693,7 @@ class FakeModelSession:
             return ModelResult(
                 invocation_id=inv_id,
                 status=InvocationStatus.FAILED,
-                error="Turn timed out",
+                error="STALLED: no stdout/stderr activity",
                 conversation_id=self._conversation_id,
                 started_at=started_at,
                 completed_at=completed_at,

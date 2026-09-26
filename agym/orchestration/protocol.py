@@ -80,6 +80,7 @@ __all__ = [
     "create_quota_exhausted_failure",
     "create_action_rejected_failure",
     "create_budget_rejected_failure",
+    "create_stall_failure",
     "create_timeout_failure",
     "failure_to_worker_result",
 ]
@@ -159,7 +160,7 @@ AUDIT_REQUEST_ALLOWED_FIELDS: frozenset[str] = frozenset({
     "target_worker_ids",
     "focus",
     "strategy",
-    "timeout_seconds",
+    "stall_timeout_seconds",
 })
 
 TASK_ASSESSMENT_ALLOWED_FIELDS: frozenset[str] = frozenset({
@@ -960,7 +961,8 @@ class InfrastructureFailureReason(str, Enum):
     QUOTA_EXHAUSTED = "quota_exhausted"
     ACTION_REJECTED = "action_rejected"
     BUDGET_REJECTED = "budget_rejected"
-    TIMEOUT = "timeout"
+    STALL = "stall"
+    TIMEOUT = "timeout"  # legacy persisted value
 
 
 @dataclass
@@ -1071,19 +1073,30 @@ def create_budget_rejected_failure(
     )
 
 
+def create_stall_failure(
+    worker_id: WorkerId | str,
+    stall_timeout_seconds: float,
+) -> InfrastructureFailure:
+    """Construct standardized failure when a worker produces no process output."""
+    return InfrastructureFailure(
+        reason=InfrastructureFailureReason.STALL,
+        message=(
+            f"Worker '{worker_id}' stalled after {stall_timeout_seconds} seconds "
+            "without stdout/stderr activity"
+        ),
+        worker_id=WorkerId(worker_id),
+        details={"stall_timeout_seconds": stall_timeout_seconds},
+        failure_class=FailureClass.RETRYABLE,
+        suggested_action="retry",
+    )
+
+
 def create_timeout_failure(
     worker_id: WorkerId | str,
     timeout_seconds: float,
 ) -> InfrastructureFailure:
-    """Construct standardized failure when a worker invocation times out."""
-    return InfrastructureFailure(
-        reason=InfrastructureFailureReason.TIMEOUT,
-        message=f"Worker '{worker_id}' timed out after {timeout_seconds} seconds",
-        worker_id=WorkerId(worker_id),
-        details={"timeout_seconds": timeout_seconds},
-        failure_class=FailureClass.RETRYABLE,
-        suggested_action="retry",
-    )
+    """Backward-compatible alias for older callers and persisted terminology."""
+    return create_stall_failure(worker_id, timeout_seconds)
 
 
 def failure_to_worker_result(

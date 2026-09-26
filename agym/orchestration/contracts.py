@@ -1735,7 +1735,7 @@ class ModelSession(Protocol):
         """The identifier of this ongoing conversation."""
         ...
 
-    def send(self, prompt: str, timeout_seconds: float | None = None) -> ModelResult:
+    def send(self, prompt: str, stall_timeout_seconds: float | None = None) -> ModelResult:
         """Send a prompt and receive the model's result."""
         ...
 

@@ -22,7 +22,6 @@ import os
 import sys
 import tempfile
 import threading
-import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -47,6 +46,7 @@ from agym.orchestration.contracts import (
     EventType,
     ExecutionStrategy,
     FailureClass,
+    FinalReviewDecision,
     FleetView,
     InvocationId,
     InvocationStatus,
@@ -61,6 +61,7 @@ from agym.orchestration.contracts import (
     QualityState,
     RunId,
     RunMode,
+    RunPlan,
     RunState,
     RunStatus,
     RunStore,
@@ -392,7 +393,6 @@ class OrchestrationEngine:
         # Per-run active registries (Do not use global process tracking)
         self._active_tasks: dict[RunId, dict[InvocationId, asyncio.Task[Any]]] = {}
         self._active_leases: dict[RunId, list[ProfileLease]] = {}
-        self._run_deadlines: dict[RunId, float] = {}
         self._coord_profiles: dict[RunId, str] = {}
 
     def _get_run_lock(self, run_id: RunId | str) -> FileLock:
@@ -476,44 +476,78 @@ class OrchestrationEngine:
             return "MEDIUM"
         return "HIGH"
 
-    def _check_finalization(self, state: RunState) -> list[str]:
-        """Return deterministic missing quality requirements for FINALIZE."""
+    def _usable_results(self, state: RunState) -> list[WorkerResult | AuditResult]:
+        """Return successful persisted results that contain recoverable deliverable material."""
+        usable: list[WorkerResult | AuditResult] = []
+        for result in self.store.get_results(state.run_id):
+            if result.status != InvocationStatus.SUCCEEDED:
+                continue
+            response = str(getattr(result, "response", "") or "").strip()
+            structured = getattr(result, "structured_data", None)
+            findings = getattr(result, "findings", None)
+            if response or structured or findings:
+                usable.append(result)
+        return usable
+
+    def _best_usable_text(self, state: RunState) -> str | None:
+        """Choose the best persisted partial/final text for limitation exits."""
+        if state.final_result and state.final_result.strip():
+            return state.final_result
+        usable = self._usable_results(state)
+        if not usable:
+            return None
+        synthesizers = [
+            r for r in usable
+            if isinstance(r, WorkerResult) and r.role == WorkerRole.SYNTHESIZER
+            and str(r.response or "").strip()
+        ]
+        candidates = synthesizers or [
+            r for r in usable if str(getattr(r, "response", "") or "").strip()
+        ]
+        if candidates:
+            return str(candidates[-1].response).strip()
+        return None
+
+    def _has_usable_result(self, state: RunState, candidate: str | None = None) -> bool:
+        if candidate and candidate.strip():
+            return True
+        return bool(self._usable_results(state))
+
+    def _update_runtime_telemetry(self, state: RunState) -> None:
+        """Update elapsed time for display/metrics only; never use it for control flow."""
+        if not state.created_at:
+            return
+        try:
+            created = datetime.fromisoformat(state.created_at)
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            state.budget_usage.runtime_seconds = max(
+                0.0, (datetime.now(timezone.utc) - created).total_seconds()
+            )
+        except Exception:
+            pass
+
+    def _check_finalization(
+        self,
+        state: RunState,
+        candidate_final_response: str | None = None,
+        *,
+        via_final_review: bool = False,
+    ) -> list[str]:
+        """Return substantive blockers for completing a run."""
         q = state.quality_state
         tier = self._quality_tier(state)
         missing: list[str] = []
 
-        results = list(self.store.get_results(state.run_id))
-        successful_workers = [
-            r for r in results
-            if isinstance(r, WorkerResult)
-            and r.status == InvocationStatus.SUCCEEDED
-            and r.role not in (WorkerRole.SYNTHESIZER, WorkerRole.EXECUTOR)
-        ]
-        attempted_workers = [r for r in results if isinstance(r, WorkerResult)]
+        if not self._has_usable_result(state, candidate_final_response):
+            missing.append("no usable result exists")
 
-        if attempted_workers and not any(r.status == InvocationStatus.SUCCEEDED for r in attempted_workers):
-            missing.append("No workers succeeded after delegation")
-
-        if tier == "LOW":
-            # Direct completion is allowed for genuinely self-contained low-complexity tasks.
-            if attempted_workers and not successful_workers and not q.executor_completed:
-                missing.append("at least one successful worker is required after delegation")
-        elif tier == "MEDIUM":
-            if q.independent_perspectives < 2:
-                missing.append("at least 2 independent worker perspectives are required")
-            if q.synthesis_completed < 1:
-                missing.append("a synthesis is required")
-        else:
-            if q.independent_perspectives < 3:
-                missing.append("at least 3 independent worker perspectives are required")
-            if q.audits_completed < 1:
-                missing.append("at least 1 independent audit is required")
-            if q.synthesis_completed < 1:
-                missing.append("at least 1 synthesis is required")
-            if q.final_critique_completed < 1:
-                missing.append("the synthesis has not been independently critiqued")
-            if q.disagreements:
-                missing.append(f"{len(q.disagreements)} high-priority disagreement(s) remain unresolved")
+        if (
+            not via_final_review
+            and tier in ("MEDIUM", "HIGH")
+            and q.synthesis_completed > 0
+        ):
+            missing.append("FINAL_REVIEW STOP is required after a usable synthesis")
 
         if q.open_critical_findings:
             missing.append(f"{len(q.open_critical_findings)} critical finding(s) remain unresolved")
@@ -522,11 +556,137 @@ class OrchestrationEngine:
             if not q.executor_completed:
                 missing.append("implementation has not been executed successfully")
             if tier in ("MEDIUM", "HIGH") and q.post_implementation_verifications < 1:
-                missing.append("independent post-implementation verification is required")
+                missing.append("required independent post-implementation verification is missing")
             if tier == "HIGH" and q.implementation_audits_completed < 1:
-                missing.append("a post-implementation audit is required")
+                missing.append("required post-implementation audit evidence is missing")
 
         return missing
+
+    @staticmethod
+    def _normalize_continuation_issue_id(value: str) -> str:
+        normalized = "".join(ch.lower() if ch.isalnum() else " " for ch in str(value))
+        return "-".join(normalized.split())
+
+    def _validate_final_review_continue(
+        self,
+        state: RunState,
+        action: CoordinatorAction,
+    ) -> str | None:
+        """Reject vague or repeated continuation requests that add no new value."""
+        issue = str(action.unresolved_issue or "").strip()
+        next_action = str(action.exact_next_action or "").strip()
+        normalized = self._normalize_continuation_issue_id(
+            str(action.continuation_issue_id or issue)
+        )
+        generic = {
+            "review", "another-review", "review-again", "more-review",
+            "another-critique", "critique-again", "double-check",
+        }
+        if not normalized or normalized in generic:
+            return "FINAL_REVIEW CONTINUE must identify a concrete unresolved issue"
+        if len(issue) < 12 or len(next_action) < 12:
+            return "FINAL_REVIEW CONTINUE must describe a specific issue and exact next action"
+
+        evidence_count = len(self.store.get_results(state.run_id))
+        fingerprint = json.dumps(
+            {
+                "required_evidence": str(action.required_evidence or "").strip().lower(),
+                "exact_next_action": next_action.lower(),
+                "expected_value": str(action.expected_value or "").strip().lower(),
+            },
+            sort_keys=True,
+        )
+        previous_raw = state.continuation_issue_history.get(normalized)
+        if previous_raw:
+            try:
+                previous = json.loads(previous_raw)
+            except Exception:
+                previous = {"fingerprint": previous_raw, "evidence_count": evidence_count}
+            if (
+                previous.get("fingerprint") == fingerprint
+                and int(previous.get("evidence_count", -1)) == evidence_count
+            ):
+                return (
+                    f"Continuation issue '{normalized}' was already requested without new evidence "
+                    "or a materially different action; choose STOP or different targeted work"
+                )
+
+        state.continuation_issue_history[normalized] = json.dumps(
+            {"fingerprint": fingerprint, "evidence_count": evidence_count},
+            sort_keys=True,
+        )
+        return None
+
+    def _finish_run(
+        self,
+        state: RunState,
+        status: RunStatus,
+        final_result: str | None,
+        *,
+        reason: str | None = None,
+    ) -> RunState:
+        """Persist a terminal status while preserving the best usable deliverable."""
+        state.status = status
+        if final_result is not None:
+            state.final_result = final_result
+        state.updated_at = datetime.now(timezone.utc).isoformat()
+        self._update_runtime_telemetry(state)
+
+        completed_statuses = {
+            RunStatus.COMPLETED,
+            RunStatus.COMPLETED_WITH_LIMITATIONS,
+        }
+        if status in completed_statuses and hasattr(self.store, "finalize_run") and callable(self.store.finalize_run):
+            state = self.store.finalize_run(
+                state.run_id, state.final_result or "", status=status
+            )
+        else:
+            if status in completed_statuses:
+                try:
+                    final_path = self.artifact_writer._write(
+                        state.run_id,
+                        Path("deliverables") / "final.md",
+                        (state.final_result or "").rstrip() + "\n",
+                    )
+                    state.final_artifact_path = str(final_path)
+                except Exception:
+                    pass
+            self.store.save_run(state)
+            if status == RunStatus.COMPLETED:
+                event_type = EventType.RUN_COMPLETED
+            elif status == RunStatus.COMPLETED_WITH_LIMITATIONS:
+                event_type = EventType.RUN_COMPLETED_WITH_LIMITATIONS
+            elif status == RunStatus.RESOURCE_EXHAUSTED:
+                event_type = EventType.RUN_RESOURCE_EXHAUSTED
+            else:
+                event_type = EventType.RUN_FAILED
+            self._emit_event(
+                event_type,
+                state.run_id,
+                {
+                    "summary": (state.final_result or "")[:200],
+                    "final_artifact_path": state.final_artifact_path,
+                    "reason": reason,
+                    "status": status.value,
+                },
+            )
+        return state
+
+    def _finish_safety_limit(self, state: RunState, reason: str) -> RunState:
+        usable = self._best_usable_text(state)
+        if usable:
+            return self._finish_run(
+                state,
+                RunStatus.COMPLETED_WITH_LIMITATIONS,
+                usable,
+                reason=reason,
+            )
+        return self._finish_run(
+            state,
+            RunStatus.RESOURCE_EXHAUSTED,
+            state.final_result,
+            reason=reason,
+        )
 
     def _check_executor_readiness(self, state: RunState) -> list[str]:
         """Require an independently reasoned plan before mutation begins."""
@@ -666,8 +826,8 @@ class OrchestrationEngine:
                 if readiness:
                     return False, "RUN_EXECUTOR rejected: " + "; ".join(readiness)
 
-        # 3. Finalize action does not require worker budget checks
-        if action.kind == ActionKind.FINALIZE:
+        # 3. Decision/finalization actions do not consume worker budget.
+        if action.kind in (ActionKind.FINALIZE, ActionKind.FINAL_REVIEW):
             return True, None
 
         total_requested = len(action.workers) + len(action.auditors)
@@ -711,27 +871,7 @@ class OrchestrationEngine:
                 f"(used: {state.budget_usage.boost_invocations})",
             )
 
-        # 8. Budget Enforcement: max_runtime_seconds
-        deadline = self._run_deadlines.get(state.run_id)
-        if deadline is not None and time.monotonic() >= deadline:
-            return (
-                False,
-                f"Max runtime limit of {state.budget.max_runtime_seconds:.1f}s exceeded",
-            )
-        if state.created_at:
-            try:
-                cdt = datetime.fromisoformat(state.created_at)
-                if cdt.tzinfo is None:
-                    cdt = cdt.replace(tzinfo=timezone.utc)
-                elapsed = (datetime.now(timezone.utc) - cdt).total_seconds()
-                if elapsed > state.budget.max_runtime_seconds:
-                    return (
-                        False,
-                        f"Max runtime limit of {state.budget.max_runtime_seconds:.1f}s exceeded "
-                        f"(elapsed: {elapsed:.1f}s)",
-                    )
-            except Exception:
-                pass
+        # 8. Runtime is telemetry only; no wall-clock action rejection.
 
         # 9. Fleet Capacity Pre-Check
         if fleet_view.available_profiles < total_requested:
@@ -1003,9 +1143,10 @@ class OrchestrationEngine:
         with capture_attempt(
             self.store, state.run_id, prompt=invocation.prompt, kind="worker",
             invocation_id=str(invocation.invocation_id), worker_id=str(invocation.worker_id),
-            role=invocation.role.value, profile_name=profile, round_number=state.round_number,
+            role=invocation.role.value, profile_name=profile, round_number=state.round_number + 1,
             attempt_number=attempt, strategy=invocation.strategy.value,
-            workspace_mode=invocation.workspace_mode.value, timeout_seconds=invocation.timeout_seconds,
+            workspace_mode=invocation.workspace_mode.value,
+            stall_timeout_seconds=invocation.stall_timeout_seconds,
             conversation_id=invocation.conversation_id,
         ) as capture:
             if hasattr(self.runner, "run_async") and asyncio.iscoroutinefunction(self.runner.run_async):
@@ -1061,12 +1202,6 @@ class OrchestrationEngine:
                 workspace_mode=worker_req.workspace_mode,
             )
 
-        deadline = self._run_deadlines.get(state.run_id)
-        effective_timeout = worker_req.timeout_seconds
-        if deadline is not None:
-            remaining = max(0.1, deadline - time.monotonic())
-            effective_timeout = min(effective_timeout, remaining)
-
         invocation = ModelInvocation(
             invocation_id=iid,
             run_id=state.run_id,
@@ -1075,7 +1210,7 @@ class OrchestrationEngine:
             strategy=worker_req.strategy,
             workspace_mode=worker_req.workspace_mode,
             prompt=prompt,
-            timeout_seconds=effective_timeout,
+            stall_timeout_seconds=worker_req.stall_timeout_seconds,
         )
 
         # Record invocation started before launch
@@ -1155,6 +1290,7 @@ class OrchestrationEngine:
                 can_retry = (
                     failure_class == FailureClass.RETRYABLE
                     and state.budget_usage.retries < state.budget.max_retries
+                    and state.budget_usage.invocations < state.budget.max_invocations
                 )
 
                 if can_retry and hasattr(self.scheduler, "allocate"):
@@ -1263,23 +1399,28 @@ class OrchestrationEngine:
         state: RunState,
         repository_scope: str = "",
     ) -> AuditResult:
-        """Execute a single auditor invocation with automatic lease release."""
+        """Execute an auditor with the same mechanical retry policy as workers."""
         iid = InvocationId(f"inv-{audit_req.worker_id}-{uuid.uuid4().hex[:6]}")
         current_lease = lease
 
-        # Resolve target worker outputs from prior store results
         all_results = self.store.get_results(state.run_id)
         target_results: list[WorkerResult] = []
         target_map: dict[str, WorkerResult] = {}
-        for r in all_results:
-            if isinstance(r, WorkerResult):
-                wid_str = str(r.worker_id)
-                if wid_str not in target_map or (r.status == InvocationStatus.SUCCEEDED and target_map[wid_str].status != InvocationStatus.SUCCEEDED):
-                    target_map[wid_str] = r
-
-        for tid in audit_req.target_worker_ids:
-            if str(tid) in target_map:
-                target_results.append(target_map[str(tid)])
+        for result in all_results:
+            if not isinstance(result, WorkerResult):
+                continue
+            wid = str(result.worker_id)
+            if (
+                wid not in target_map
+                or (
+                    result.status == InvocationStatus.SUCCEEDED
+                    and target_map[wid].status != InvocationStatus.SUCCEEDED
+                )
+            ):
+                target_map[wid] = result
+        for target_id in audit_req.target_worker_ids:
+            if str(target_id) in target_map:
+                target_results.append(target_map[str(target_id)])
 
         prompt = build_auditor_prompt(
             task=state.task,
@@ -1287,13 +1428,6 @@ class OrchestrationEngine:
             repository_scope=repository_scope,
             target_results=target_results,
         )
-
-        deadline = self._run_deadlines.get(state.run_id)
-        effective_timeout = audit_req.timeout_seconds
-        if deadline is not None:
-            remaining = max(0.1, deadline - time.monotonic())
-            effective_timeout = min(effective_timeout, remaining)
-
         invocation = ModelInvocation(
             invocation_id=iid,
             run_id=state.run_id,
@@ -1302,7 +1436,7 @@ class OrchestrationEngine:
             strategy=audit_req.strategy,
             workspace_mode=WorkspaceMode.READ_ONLY,
             prompt=prompt,
-            timeout_seconds=effective_timeout,
+            stall_timeout_seconds=audit_req.stall_timeout_seconds,
         )
 
         if hasattr(self.store, "record_invocation_started"):
@@ -1321,94 +1455,158 @@ class OrchestrationEngine:
                 },
             )
 
+        attempt = 0
+        excluded_profiles: set[str] = set()
         try:
-            started_at = datetime.now(timezone.utc).isoformat()
-            try:
-                model_res = await self._invoke_model(invocation, current_lease.profile_name, state)
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                raise
-            except Exception as exc:
-                model_res = ModelResult(
-                    invocation_id=iid,
-                    status=InvocationStatus.FAILED,
-                    error=str(exc),
-                    started_at=started_at,
-                    completed_at=datetime.now(timezone.utc).isoformat(),
+            while True:
+                attempt += 1
+                started_at = datetime.now(timezone.utc).isoformat()
+                try:
+                    model_res = await self._invoke_model(
+                        invocation, current_lease.profile_name, state, attempt
+                    )
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    raise
+                except Exception as exc:
+                    model_res = ModelResult(
+                        invocation_id=iid,
+                        status=InvocationStatus.FAILED,
+                        error=str(exc),
+                        started_at=started_at,
+                        completed_at=datetime.now(timezone.utc).isoformat(),
+                    )
+
+                state.budget_usage.invocations += 1
+                if audit_req.strategy == ExecutionStrategy.BOOST:
+                    state.budget_usage.boost_invocations += 1
+
+                if model_res.status == InvocationStatus.SUCCEEDED:
+                    if hasattr(self.scheduler, "record_success"):
+                        self.scheduler.record_success(current_lease.profile_name)
+                    findings: list[str] = []
+                    if (
+                        model_res.structured_data
+                        and isinstance(model_res.structured_data.get("findings"), list)
+                    ):
+                        findings = [str(v) for v in model_res.structured_data["findings"]]
+                    elif model_res.response:
+                        for line in model_res.response.splitlines():
+                            raw = line.strip()
+                            if raw.startswith(("-", "*")):
+                                clean = raw.lstrip("- *").strip()
+                                if clean.lower().startswith("finding:"):
+                                    clean = clean[len("finding:"):].strip()
+                                findings.append(clean)
+
+                    audit_res = AuditResult(
+                        worker_id=audit_req.worker_id,
+                        invocation_id=iid,
+                        findings=findings,
+                        response=model_res.response,
+                        status=InvocationStatus.SUCCEEDED,
+                        started_at=model_res.started_at,
+                        completed_at=model_res.completed_at,
+                    )
+                    if hasattr(self.store, "record_invocation_completed"):
+                        self.store.record_invocation_completed(state.run_id, iid, result=audit_res)
+                    else:
+                        self._emit_event(
+                            EventType.INVOCATION_COMPLETED,
+                            state.run_id,
+                            {"invocation_id": str(iid), "worker_id": str(audit_req.worker_id)},
+                        )
+                        self.store.save_result(state.run_id, audit_res)
+                    return audit_res
+
+                failure_class = classify_failure(model_res)
+                can_retry = (
+                    failure_class == FailureClass.RETRYABLE
+                    and state.budget_usage.retries < state.budget.max_retries
+                    and state.budget_usage.invocations < state.budget.max_invocations
                 )
+                if can_retry and hasattr(self.scheduler, "allocate"):
+                    state.budget_usage.retries += 1
+                    excluded_profiles.add(current_lease.profile_name)
+                    if hasattr(self.scheduler, "record_failure"):
+                        self.scheduler.record_failure(current_lease.profile_name)
 
-            state.budget_usage.invocations += 1
-            if audit_req.strategy == ExecutionStrategy.BOOST:
-                state.budget_usage.boost_invocations += 1
+                    self.lease_manager.release(current_lease.lease_id, run_id=state.run_id)
+                    if (
+                        state.run_id in self._active_leases
+                        and current_lease in self._active_leases[state.run_id]
+                    ):
+                        self._active_leases[state.run_id].remove(current_lease)
+                    self._emit_event(
+                        EventType.PROFILE_RELEASED,
+                        state.run_id,
+                        {
+                            "lease_id": str(current_lease.lease_id),
+                            "profile_name": current_lease.profile_name,
+                            "worker_id": str(current_lease.worker_id),
+                        },
+                    )
 
-            if model_res.status == InvocationStatus.SUCCEEDED:
-                findings: list[str] = []
-                if model_res.structured_data and isinstance(model_res.structured_data.get("findings"), list):
-                    findings = [str(f) for f in model_res.structured_data["findings"]]
-                elif model_res.response:
-                    findings = []
-                    for line in model_res.response.splitlines():
-                        raw_line = line.strip()
-                        if raw_line.startswith(("-", "*")):
-                            clean = raw_line.lstrip("- *").strip()
-                            if clean.lower().startswith("finding:"):
-                                clean = clean[len("finding:"):].strip()
-                            findings.append(clean)
+                    min_q = (
+                        state.budget.min_quota_remaining / 100.0
+                        if state.budget.min_quota_remaining > 1.0
+                        else state.budget.min_quota_remaining
+                    )
+                    alt_leases = self.scheduler.allocate(
+                        [audit_req],
+                        run_id=state.run_id,
+                        excluded_profiles=excluded_profiles,
+                        min_quota=min_q,
+                        raise_on_insufficient=False,
+                    )
+                    if alt_leases:
+                        current_lease = alt_leases[0]
+                        self._active_leases.setdefault(state.run_id, []).append(current_lease)
+                        self._emit_event(
+                            EventType.PROFILE_LEASED,
+                            state.run_id,
+                            {
+                                "lease_id": str(current_lease.lease_id),
+                                "profile_name": current_lease.profile_name,
+                                "worker_id": str(current_lease.worker_id),
+                                "run_id": str(state.run_id),
+                            },
+                        )
+                        continue
 
                 audit_res = AuditResult(
                     worker_id=audit_req.worker_id,
                     invocation_id=iid,
-                    findings=findings,
+                    findings=[],
                     response=model_res.response,
-                    status=InvocationStatus.SUCCEEDED,
+                    error=model_res.error or "Auditor invocation failed",
+                    status=InvocationStatus.FAILED,
+                    failure=failure_class,
                     started_at=model_res.started_at,
                     completed_at=model_res.completed_at,
                 )
-                if hasattr(self.store, "record_invocation_completed"):
-                    self.store.record_invocation_completed(state.run_id, iid, result=audit_res)
+                if hasattr(self.store, "record_invocation_failed"):
+                    self.store.record_invocation_failed(
+                        state.run_id,
+                        iid,
+                        error=model_res.error or "Auditor invocation failed",
+                        failure=failure_class,
+                        exit_code=getattr(model_res, "exit_code", None),
+                        output_text=model_res.response,
+                    )
                 else:
                     self._emit_event(
-                        EventType.INVOCATION_COMPLETED,
+                        EventType.INVOCATION_FAILED,
                         state.run_id,
                         {"invocation_id": str(iid), "worker_id": str(audit_req.worker_id)},
                     )
-                if not hasattr(self.store, "record_invocation_completed"):
                     self.store.save_result(state.run_id, audit_res)
                 return audit_res
-
-            # Failure path
-            failure_class = classify_failure(model_res)
-            audit_res = AuditResult(
-                worker_id=audit_req.worker_id,
-                invocation_id=iid,
-                findings=[],
-                response=model_res.response,
-                error=model_res.error or "Auditor invocation failed",
-                status=InvocationStatus.FAILED,
-                failure=failure_class,
-                started_at=model_res.started_at,
-                completed_at=model_res.completed_at,
-            )
-            if hasattr(self.store, "record_invocation_failed"):
-                self.store.record_invocation_failed(
-                    state.run_id,
-                    iid,
-                    error=model_res.error or "Auditor invocation failed",
-                    failure=failure_class,
-                    exit_code=getattr(model_res, "exit_code", None),
-                    output_text=model_res.response,
-                )
-            else:
-                self._emit_event(
-                    EventType.INVOCATION_FAILED,
-                    state.run_id,
-                    {"invocation_id": str(iid), "worker_id": str(audit_req.worker_id)},
-                )
-            if not hasattr(self.store, "record_invocation_failed"):
-                self.store.save_result(state.run_id, audit_res)
-            return audit_res
         finally:
             self.lease_manager.release(current_lease.lease_id, run_id=state.run_id)
-            if state.run_id in self._active_leases and current_lease in self._active_leases[state.run_id]:
+            if (
+                state.run_id in self._active_leases
+                and current_lease in self._active_leases[state.run_id]
+            ):
                 self._active_leases[state.run_id].remove(current_lease)
             self._emit_event(
                 EventType.PROFILE_RELEASED,

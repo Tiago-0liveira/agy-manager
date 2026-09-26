@@ -38,6 +38,7 @@ from agym.orchestration.contracts import (
     OrchestrationBudget,
     RunId,
     RunMode,
+    RunPlan,
     RunState,
     RunStatus,
     RunStore,
@@ -81,6 +82,7 @@ __all__ = [
     # Exceptions
     "CoordinatorError",
     "CoordinatorCrashError",
+    "CoordinatorStalledError",
     "CoordinatorTimeoutError",
     "CoordinatorClosedError",
 ]
@@ -126,8 +128,12 @@ class CoordinatorCrashError(CoordinatorError):
         )
 
 
-class CoordinatorTimeoutError(CoordinatorCrashError):
-    """Typed failure raised when a coordinator turn times out."""
+class CoordinatorStalledError(CoordinatorCrashError):
+    """Typed failure raised when a coordinator turn stalls."""
+
+
+class CoordinatorTimeoutError(CoordinatorStalledError):
+    """Backward-compatible alias for older timeout terminology."""
 
 
 class CoordinatorClosedError(CoordinatorError):
@@ -163,11 +169,12 @@ class CoordinatorStartResult:
     """Result of starting the coordinator runtime."""
 
     assessment: TaskAssessment
+    run_plan: RunPlan
     action: CoordinatorAction
     conversation_id: ConversationId
 
     def __iter__(self):
-        return iter((self.assessment, self.action, self.conversation_id))
+        return iter((self.assessment, self.run_plan, self.action, self.conversation_id))
 
 
 # ============================================================================
@@ -185,14 +192,14 @@ class _RunnerSessionAdapter:
         run_id: RunId,
         profile_name: str | None = None,
         strategy: ExecutionStrategy = ExecutionStrategy.HIGH_EFFORT,
-        timeout_seconds: float = 300.0,
+        stall_timeout_seconds: float = 180.0,
         conversation_id: ConversationId | str | None = None,
     ) -> None:
         self._runner = runner
         self._run_id = run_id
         self._profile_name = profile_name
         self._strategy = strategy
-        self._timeout = timeout_seconds
+        self._stall_timeout = float(stall_timeout_seconds)
         self._conversation_id = ConversationId(conversation_id or f"conv-{run_id}")
         self._turn_count = 0
         self._is_closed = False
@@ -201,7 +208,7 @@ class _RunnerSessionAdapter:
     def conversation_id(self) -> ConversationId:
         return self._conversation_id
 
-    def send(self, prompt: str, timeout_seconds: float | None = None) -> ModelResult:
+    def send(self, prompt: str, stall_timeout_seconds: float | None = None) -> ModelResult:
         if self._is_closed:
             raise RuntimeError("Session is closed")
         self._turn_count += 1
@@ -213,7 +220,11 @@ class _RunnerSessionAdapter:
             role=WorkerRole.GENERAL,
             strategy=self._strategy,
             prompt=prompt,
-            timeout_seconds=timeout_seconds if timeout_seconds is not None else self._timeout,
+            stall_timeout_seconds=(
+                stall_timeout_seconds
+                if stall_timeout_seconds is not None
+                else self._stall_timeout
+            ),
             conversation_id=self._conversation_id,
         )
         res = self._runner.run(invocation, profile_name=self._profile_name)
@@ -247,7 +258,7 @@ class CoordinatorClient:
         run_id: RunId | str | None = None,
         profile_name: str | None = None,
         strategy: ExecutionStrategy = ExecutionStrategy.HIGH_EFFORT,
-        timeout_seconds: float = 300.0,
+        stall_timeout_seconds: float = 180.0,
         max_correction_attempts: int = 2,
     ) -> None:
         if runner is None and session is None:
@@ -263,7 +274,7 @@ class CoordinatorClient:
             if isinstance(strategy, str)
             else strategy
         )
-        self.timeout_seconds = float(timeout_seconds)
+        self.stall_timeout_seconds = float(stall_timeout_seconds)
         self.max_correction_attempts = int(max_correction_attempts)
 
         self._conversation_id: ConversationId | None = None
@@ -275,6 +286,7 @@ class CoordinatorClient:
         self._is_resumed = False
         self._known_worker_ids: set[WorkerId] = set()
         self._task_assessment: TaskAssessment | None = None
+        self._run_plan: RunPlan | None = None
         self._initial_action: CoordinatorAction | None = None
 
     @property
@@ -322,8 +334,11 @@ class CoordinatorClient:
                 kwargs["profile_name"] = self.profile_name
             if "strategy" in sig.parameters:
                 kwargs["strategy"] = self.strategy
-            if "timeout_seconds" in sig.parameters:
-                kwargs["timeout_seconds"] = self.timeout_seconds
+            if "stall_timeout_seconds" in sig.parameters:
+                kwargs["stall_timeout_seconds"] = self.stall_timeout_seconds
+            elif "timeout_seconds" in sig.parameters:
+                # Compatibility with third-party runners that have not migrated yet.
+                kwargs["timeout_seconds"] = self.stall_timeout_seconds
             if "conversation_id" in sig.parameters:
                 kwargs["conversation_id"] = str(cid) if cid else None
             return self.runner.create_session(**kwargs)
@@ -333,7 +348,7 @@ class CoordinatorClient:
                 run_id=self.run_id,
                 profile_name=self.profile_name,
                 strategy=self.strategy,
-                timeout_seconds=self.timeout_seconds,
+                stall_timeout_seconds=self.stall_timeout_seconds,
                 conversation_id=cid,
             )
         raise CoordinatorError("Cannot create session: no ModelRunner available")
@@ -366,6 +381,7 @@ class CoordinatorClient:
         Returns:
             CoordinatorStartResult containing:
             - assessment: TaskAssessment
+            - run_plan: RunPlan
             - action: CoordinatorAction
             - conversation_id: ConversationId
         """
@@ -421,9 +437,11 @@ class CoordinatorClient:
         )
 
         assessment = initial_response.assessment
+        run_plan = initial_response.run_plan
         action = initial_response.action
 
         self._task_assessment = assessment
+        self._run_plan = run_plan
         self._initial_action = action
         self._round_number = 0
 
@@ -444,10 +462,19 @@ class CoordinatorClient:
                     self.run_store.save_assessment(self.run_id, assessment)
                 except Exception as exc:
                     logger.debug("Could not save assessment to run store: %s", exc)
+            if hasattr(self.run_store, "get_run") and hasattr(self.run_store, "save_run"):
+                try:
+                    state = self.run_store.get_run(self.run_id)
+                    if state is not None:
+                        state.run_plan = run_plan
+                        self.run_store.save_run(state)
+                except Exception as exc:
+                    logger.debug("Could not save run plan to run store: %s", exc)
             self._persist_coordinator_info(action=action)
 
         return CoordinatorStartResult(
             assessment=assessment,
+            run_plan=run_plan,
             action=action,
             conversation_id=cid or ConversationId("unknown"),
         )
@@ -651,6 +678,8 @@ class CoordinatorClient:
             self._round_number = run_state.round_number
             if run_state.assessment:
                 self._task_assessment = run_state.assessment
+            if run_state.run_plan:
+                self._run_plan = run_state.run_plan
         elif self.run_store and self.run_id and hasattr(self.run_store, "get_run"):
             try:
                 st = self.run_store.get_run(self.run_id)
@@ -658,6 +687,8 @@ class CoordinatorClient:
                     self._round_number = st.round_number
                     if st.assessment:
                         self._task_assessment = st.assessment
+                    if st.run_plan:
+                        self._run_plan = st.run_plan
             except Exception:
                 pass
 
@@ -671,7 +702,7 @@ class CoordinatorClient:
             "The following state provided by AGYM RunState is authoritative.",
             "Never assume model conversation memory is more authoritative than RunState.",
             f"- Run ID: {self.run_id}",
-            f"- Round Number: {observation.round_number}",
+            f"- Completed Rounds: {observation.round_number}",
         ]
         if self._task_assessment:
             lines.append(f"- Task Assessment Type: {self._task_assessment.task_type.value}")
@@ -775,11 +806,11 @@ class CoordinatorClient:
                 with capture_attempt(
                     self.run_store, self.run_id, prompt=current_prompt, kind="coordinator",
                     worker_id="coordinator", profile_name=self.profile_name,
-                    round_number=self._round_number, correction_attempt=attempt,
+                    round_number=self._round_number + 1, correction_attempt=attempt,
                     schema_name=schema_name, conversation_id=self.conversation_id,
-                    timeout_seconds=self.timeout_seconds, strategy=self.strategy.value,
+                    stall_timeout_seconds=self.stall_timeout_seconds, strategy=self.strategy.value,
                 ) as capture:
-                    res = session.send(current_prompt, timeout_seconds=self.timeout_seconds)
+                    res = session.send(current_prompt, stall_timeout_seconds=self.stall_timeout_seconds)
                     if capture is not None:
                         capture.finish(res)
             except Exception as exc:
@@ -804,9 +835,9 @@ class CoordinatorClient:
 
                 # Check if it is a recoverable malformed payload
                 if fail_class != FailureClass.RECOVERABLE:
-                    if "timed out" in err_text.lower() or "timeout" in err_text.lower():
-                        raise CoordinatorTimeoutError(
-                            f"Coordinator model turn timed out: {err_text}",
+                    if "stalled" in err_text.lower() or "timeout" in err_text.lower():
+                        raise CoordinatorStalledError(
+                            f"Coordinator model turn stalled: {err_text}",
                             run_id=self.run_id,
                             conversation_id=self.conversation_id,
                             round_number=self._round_number,
