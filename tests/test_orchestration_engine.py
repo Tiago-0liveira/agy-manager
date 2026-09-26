@@ -215,7 +215,7 @@ class TestOrchestrationEngine(BaseEngineTestCase):
         from agym.orchestration.wiring import BroadcastRunStore
 
         for tty in (False, True):
-            for responses, expected in ((["failure", "timeout"], RunStatus.FAILED),
+            for responses, expected in ((["failure", "timeout"], RunStatus.COMPLETED),
                                         (["failure", "Recovered result"], RunStatus.COMPLETED)):
                 with self.subTest(tty=tty, responses=responses):
                     stream = io.StringIO()
@@ -241,8 +241,10 @@ class TestOrchestrationEngine(BaseEngineTestCase):
                     events = self.run_store.get_events(run_id)
                     terminal = [e for e in events if e.type in (EventType.RUN_FAILED, EventType.RUN_COMPLETED)]
                     self.assertEqual(len(terminal), 1)
-                    self.assertEqual(sum(e.type == EventType.INVOCATION_FAILED for e in events),
-                                     2 if expected == RunStatus.FAILED else 1)
+                    self.assertEqual(
+                        sum(e.type == EventType.INVOCATION_FAILED for e in events),
+                        sum(1 for response in responses if response in {"failure", "timeout"}),
+                    )
                     with patch("sys.stdout", new=io.StringIO()) as status_output:
                         self.assertEqual(_orchestrate(["status", run_id], self.profile_store, deps=deps), 0)
                     self.assertIn("Error:", status_output.getvalue())

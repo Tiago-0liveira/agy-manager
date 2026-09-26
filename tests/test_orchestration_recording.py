@@ -188,7 +188,7 @@ sys.stderr.buffer.write(b"diagnostic\\n"); sys.stderr.flush()
             data = (cap.directory / (p["stream"] + ".log")).read_bytes()
             self.assertEqual(len(data[p["offset"]:p["offset"] + p["length"]]), p["length"])
 
-    async def test_timeout_keeps_partial_stdout_and_stderr(self):
+    async def test_stall_keeps_partial_stdout_and_stderr(self):
         script = self.script('''import sys,time
 print('{"event":"tool_call","name":"slow_tool"}', flush=True)
 print('waiting for backend', file=sys.stderr, flush=True)
@@ -199,7 +199,7 @@ time.sleep(30)
             result = await runner.run_async(self.invocation(timeout=0.3))
             cap.finish(result)
         self.assertEqual(result.status, InvocationStatus.FAILED)
-        self.assertIn("timed out", result.error)
+        self.assertIn("STALLED", result.error)
         self.assertIn("slow_tool", (cap.directory / "stdout.log").read_text())
         self.assertIn("waiting", (cap.directory / "stderr.log").read_text())
         self.assertEqual(runner.active_runs(), [])

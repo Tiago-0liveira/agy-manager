@@ -925,7 +925,7 @@ class TestFakeModelRunnerAndSession(unittest.TestCase):
         )
         res2 = fake_runner.run(inv2)
         self.assertEqual(res2.status, InvocationStatus.FAILED)
-        self.assertIn("timed out", res2.error or "")
+        self.assertIn("stalled", (res2.error or "").lower())
 
         inv3 = ModelInvocation(
             invocation_id=InvocationId("i-3"),
@@ -983,7 +983,7 @@ class TestFakeModelRunnerAndSession(unittest.TestCase):
 
         res3 = session.ask("Third question")
         self.assertEqual(res3.status, InvocationStatus.FAILED)
-        self.assertIn("timed out", res3.error or "")
+        self.assertIn("stalled", (res3.error or "").lower())
 
         self.assertEqual(session.sent_prompts, ["Hello", "Second question", "Third question"])
         session.close()

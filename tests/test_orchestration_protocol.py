@@ -372,9 +372,9 @@ class TestInfrastructureFailures(unittest.TestCase):
         self.assertEqual(fail.reason, InfrastructureFailureReason.BUDGET_REJECTED)
         self.assertEqual(fail.suggested_action, "finalize")
 
-    def test_create_timeout_failure(self) -> None:
+    def test_create_timeout_failure_compatibility_maps_to_stall(self) -> None:
         fail = create_timeout_failure("w-timeout", 180.0)
-        self.assertEqual(fail.reason, InfrastructureFailureReason.TIMEOUT)
+        self.assertEqual(fail.reason, InfrastructureFailureReason.STALL)
         self.assertEqual(fail.failure_class, FailureClass.RETRYABLE)
         self.assertEqual(fail.suggested_action, "retry")
 

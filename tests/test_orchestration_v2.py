@@ -124,7 +124,12 @@ class TestQualityGates(OrchestratorV2Base):
         state.quality_state.independent_worker_ids = ["w1", "w2"]
         state.quality_state.synthesis_completed = 1
         state.quality_state.synthesis_worker_ids = ["s1"]
-        self.assertEqual(self.engine._check_finalization(state), [])
+        self.assertEqual(
+            self.engine._check_finalization(
+                state, "usable final", via_final_review=True
+            ),
+            [],
+        )
 
     def test_critical_findings_block_and_resolution_allows_finalization(self) -> None:
         state = self.make_state(ComplexityLevel.LARGE)
@@ -376,7 +381,12 @@ class TestImplementModeGates(OrchestratorV2Base):
         )
         self.engine._record_quality_evidence(state, impl_audit, [impl_result])
         self.assertEqual(q.implementation_audits_completed, 1)
-        self.assertEqual(self.engine._check_finalization(state), [])
+        self.assertEqual(
+            self.engine._check_finalization(
+                state, "usable final", via_final_review=True
+            ),
+            [],
+        )
 
     def test_only_executor_can_mutate(self) -> None:
         mutating_analysis = WorkerRequest(
