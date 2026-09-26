@@ -93,28 +93,30 @@ class TestQualityGates(OrchestratorV2Base):
         q.final_critique_completed = 1
         q.synthesis_critique_worker_ids = ["c1"]
 
-    def test_high_cannot_finalize_without_audit(self) -> None:
+    def test_high_audit_is_not_a_hard_finalization_gate(self) -> None:
         state = self.make_state(ComplexityLevel.LARGE)
         self._ready_high(state)
         state.quality_state.audits_completed = 0
         state.quality_state.audit_worker_ids = []
-        missing = self.engine._check_finalization(state)
-        self.assertTrue(any("audit" in item.lower() for item in missing))
+        missing = self.engine._check_finalization(
+            state, "usable final", via_final_review=True
+        )
+        self.assertFalse(any("audit" in item.lower() for item in missing))
 
-    def test_high_cannot_finalize_without_synthesis_critique(self) -> None:
+    def test_high_synthesis_critique_is_optional(self) -> None:
         state = self.make_state(ComplexityLevel.VERY_LARGE)
         self._ready_high(state)
         state.quality_state.final_critique_completed = 0
         state.quality_state.synthesis_critique_worker_ids = []
-        missing = self.engine._check_finalization(state)
-        self.assertTrue(any("critiqued" in item.lower() for item in missing))
+        missing = self.engine._check_finalization(
+            state, "usable final", via_final_review=True
+        )
+        self.assertFalse(any("critiqued" in item.lower() for item in missing))
 
-    def test_medium_cannot_finalize_without_synthesis(self) -> None:
+    def test_medium_direct_usable_result_can_finalize_without_mandatory_synthesis(self) -> None:
         state = self.make_state(ComplexityLevel.MEDIUM)
-        state.quality_state.independent_perspectives = 2
-        state.quality_state.independent_worker_ids = ["w1", "w2"]
-        missing = self.engine._check_finalization(state)
-        self.assertTrue(any("synthesis" in item.lower() for item in missing))
+        missing = self.engine._check_finalization(state, "usable final")
+        self.assertEqual(missing, [])
 
     def test_medium_audit_is_advisory_not_a_hard_gate(self) -> None:
         state = self.make_state(ComplexityLevel.MEDIUM, value_of_auditing=0.9)
@@ -128,15 +130,28 @@ class TestQualityGates(OrchestratorV2Base):
         state = self.make_state(ComplexityLevel.LARGE)
         self._ready_high(state)
         state.quality_state.open_critical_findings = ["shutdown race"]
-        self.assertTrue(any("critical" in item.lower() for item in self.engine._check_finalization(state)))
+        self.assertTrue(any(
+            "critical" in item.lower()
+            for item in self.engine._check_finalization(
+                state, "usable final", via_final_review=True
+            )
+        ))
         state.quality_state.open_critical_findings = []
-        self.assertEqual(self.engine._check_finalization(state), [])
+        self.assertEqual(
+            self.engine._check_finalization(
+                state, "usable final", via_final_review=True
+            ),
+            [],
+        )
 
-    def test_high_priority_disagreement_blocks_high_finalization(self) -> None:
+    def test_noncritical_disagreement_does_not_mechanically_block_finalization(self) -> None:
         state = self.make_state(ComplexityLevel.LARGE)
         self._ready_high(state)
         state.quality_state.disagreements = ["ownership remains unresolved"]
-        self.assertTrue(any("disagreement" in item.lower() for item in self.engine._check_finalization(state)))
+        missing = self.engine._check_finalization(
+            state, "usable final", via_final_review=True
+        )
+        self.assertFalse(any("disagreement" in item.lower() for item in missing))
 
     def test_finalize_rejection_is_formatted_back_to_coordinator(self) -> None:
         observation = CoordinatorObservation(
@@ -294,7 +309,7 @@ class TestImplementModeGates(OrchestratorV2Base):
         q = state.quality_state
         q.executor_completed = True
         q.last_executor_worker_id = "exec"
-        missing = self.engine._check_finalization(state)
+        missing = self.engine._check_finalization(state, "usable final", via_final_review=True)
         self.assertTrue(any("verification" in item.lower() for item in missing))
         self.assertTrue(any("implementation audit" in item.lower() for item in missing))
 

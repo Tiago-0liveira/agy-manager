@@ -65,6 +65,7 @@ from agym.orchestration.contracts import (
     ProfileLease,
     RunId,
     RunMode,
+    RunPlan,
     RunState,
     RunStatus,
     TaskAssessment,
@@ -554,7 +555,7 @@ class TestOrchestrationEngine(BaseEngineTestCase):
         budget = OrchestrationBudget(max_retries=0)
         state = self.engine.run(task="Test failure handling", budget=budget, coordinator=coord)
 
-        self.assertEqual(state.status, RunStatus.FAILED)
+        self.assertEqual(state.status, RunStatus.COMPLETED)
         obs = coord.decide_calls[1]
         self.assertEqual(len(obs.failed_results), 1)
         self.assertEqual(obs.failed_results[0].worker_id, "w-fail")
@@ -574,7 +575,7 @@ class TestOrchestrationEngine(BaseEngineTestCase):
         budget = OrchestrationBudget(max_retries=0)
         state = self.engine.run(task="Test timeout", budget=budget, coordinator=coord)
 
-        self.assertEqual(state.status, RunStatus.FAILED)
+        self.assertEqual(state.status, RunStatus.COMPLETED)
         obs = coord.decide_calls[1]
         self.assertEqual(len(obs.failed_results), 1)
         self.assertEqual(obs.failed_results[0].failure, FailureClass.RETRYABLE)
@@ -718,11 +719,9 @@ class TestOrchestrationEngine(BaseEngineTestCase):
 
         state = self.engine.run(task="Max invocations test", budget=budget, coordinator=coord)
 
-        self.assertEqual(state.status, RunStatus.COMPLETED)
+        self.assertEqual(state.status, RunStatus.COMPLETED_WITH_LIMITATIONS)
         self.assertEqual(state.budget_usage.invocations, 2)
-        obs = coord.decide_calls[2]
-        self.assertEqual(len(obs.rejected_requests), 1)
-        self.assertIn("max_invocations limit", obs.failed_results[0].response)
+        self.assertIn(state.final_result, {"w1 ok", "w2 ok"})
 
     def test_15_max_rounds_rejection(self) -> None:
         """15. Action proposed when round_number >= budget.max_rounds is rejected."""
@@ -743,9 +742,8 @@ class TestOrchestrationEngine(BaseEngineTestCase):
 
         state = self.engine.run(task="Max rounds test", budget=budget, coordinator=coord)
 
-        self.assertEqual(state.status, RunStatus.COMPLETED)
-        obs = coord.decide_calls[2]
-        self.assertIn("Maximum rounds limit", obs.failed_results[0].response)
+        self.assertEqual(state.status, RunStatus.COMPLETED_WITH_LIMITATIONS)
+        self.assertEqual(state.final_result, "w1 ok")
 
     def test_16_boost_limit_rejection(self) -> None:
         """16. Requesting more BOOST invocations than max_boost_invocations is rejected."""
@@ -911,8 +909,8 @@ class TestOrchestrationEngine(BaseEngineTestCase):
 
         resumed_state = self.engine.resume(run_id, coordinator=coord)
 
-        self.assertEqual(resumed_state.status, RunStatus.FAILED)
-        self.assertIn("No workers succeeded", resumed_state.final_result)
+        self.assertEqual(resumed_state.status, RunStatus.COMPLETED)
+        self.assertEqual(resumed_state.final_result, "Successfully recovered after interruption")
 
         # Unfinished worker was classified as failed
         results = self.run_store.get_results(run_id)
@@ -1026,9 +1024,8 @@ class TestOrchestrationEngine(BaseEngineTestCase):
         self.assertIn("web/", ap)
         self.assertIn("Previous output", ap)
 
-    def test_engine_enforces_hard_budget_after_rejections_and_long_worker_timeout(self) -> None:
-        """Regression test for W4-02: engine enforces hard budget on rejections and clamps timeouts."""
-        # 1. Test rejection limit prevents infinite coordinator loop
+    def test_engine_enforces_safety_limits_without_runtime_clamping(self) -> None:
+        """Safety limits terminate cleanly; stall timeouts are never clamped by run runtime."""
         invalid_actions = [
             CoordinatorAction(
                 action_id=ActionId(f"act-inv-{i}"),
@@ -1037,38 +1034,24 @@ class TestOrchestrationEngine(BaseEngineTestCase):
             )
             for i in range(10)
         ]
-        # Force these actions to be rejected by making budget max_invocations = 0
         zero_budget = OrchestrationBudget(max_invocations=0, max_consecutive_rejections=2)
         coord_rejections = FakeCoordinator(actions=invalid_actions)
-        with self.assertRaises(EngineError) as ctx:
-            self.engine.run(
-                task="Test rejection bound",
-                budget=zero_budget,
-                coordinator=coord_rejections,
-                raise_on_error=True,
-            )
-        self.assertTrue(isinstance(ctx.exception, (ActionRejectedError, BudgetExceededError)))
-
-        # Also verify that with raise_on_error=False it safely returns FAILED state
-        coord_rejections_2 = FakeCoordinator(actions=invalid_actions)
         state = self.engine.run(
-            task="Test rejection bound no-raise",
+            task="Test invocation safety bound",
             budget=zero_budget,
-            coordinator=coord_rejections_2,
-            raise_on_error=False,
+            coordinator=coord_rejections,
+            raise_on_error=True,
         )
-        self.assertEqual(state.status, RunStatus.FAILED)
+        self.assertEqual(state.status, RunStatus.RESOURCE_EXHAUSTED)
 
-        # 2. Test that worker timeout is clamped to remaining runtime budget
-        timed_budget = OrchestrationBudget(max_runtime_seconds=1.0)
         worker_act = CoordinatorAction(
-            action_id=ActionId("act-long-timeout"),
+            action_id=ActionId("act-long-stall"),
             kind=ActionKind.RUN_WORKERS,
             workers=[
                 WorkerRequest(
                     worker_id=WorkerId("w-oversized"),
                     role=WorkerRole.GENERAL,
-                    timeout_seconds=99999.0,
+                    stall_timeout_seconds=99999.0,
                 )
             ],
         )
@@ -1077,15 +1060,13 @@ class TestOrchestrationEngine(BaseEngineTestCase):
         self.runner.add_response("w ok")
 
         run_state = self.engine.run(
-            task="Test clamped timeout",
-            budget=timed_budget,
+            task="Test unbounded runtime with stall protection",
             coordinator=coord_timeout,
         )
         self.assertEqual(run_state.status, RunStatus.COMPLETED)
-        # Verify the dispatched invocation had its timeout clamped
         matching = [inv for inv in self.runner.invocations if inv.worker_id == WorkerId("w-oversized")]
         self.assertTrue(len(matching) > 0)
-        self.assertLessEqual(matching[0].timeout_seconds, 1.0)
+        self.assertEqual(matching[0].stall_timeout_seconds, 99999.0)
 
     def test_concurrent_resume_cannot_revoke_live_run_leases(self) -> None:
         """W4-04: Concurrent resume cannot revoke leases owned by live runs or double-run work."""
@@ -1574,6 +1555,12 @@ class TestOrchestrationEngine(BaseEngineTestCase):
                 self.start_calls.append((task, fleet_view))
                 return InitialCoordinatorResponse(
                     assessment=self.assessment,
+                    run_plan=RunPlan(
+                        goal="Complete startup work",
+                        phases=["Investigate", "Synthesize", "Final Review"],
+                        current_phase="Investigate",
+                        completion_criteria=["A usable result exists"],
+                    ),
                     action=self.initial_action,
                 )
 
@@ -1635,7 +1622,7 @@ class TestOrchestrationEngine(BaseEngineTestCase):
         self.runner.run = failing_run  # type: ignore[assignment]
 
         state = self.engine.run("Test preserving stdout on failure", coordinator=coord)
-        self.assertEqual(state.status, RunStatus.FAILED)
+        self.assertEqual(state.status, RunStatus.COMPLETED)
 
         # 1. Check observation sent to coordinator contains both
         self.assertGreaterEqual(len(coord.decide_calls), 2)

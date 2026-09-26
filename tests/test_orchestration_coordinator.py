@@ -88,6 +88,12 @@ INITIAL_RESPONSE_DATA: dict = {
         "summary": "Initial architecture assessment of orchestration subsystem",
         "proposed_initial_work": ["Analyze code", "Synthesize findings"],
     },
+    "run_plan": {
+        "goal": "Produce a verified orchestration plan",
+        "phases": ["Investigate", "Reconcile", "Synthesize", "Final Review"],
+        "current_phase": "Investigate",
+        "completion_criteria": ["A usable result exists", "No critical findings remain unresolved"],
+    },
     "action": {
         "action_id": "act-round-0",
         "kind": "RUN_WORKERS",

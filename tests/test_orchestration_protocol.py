@@ -439,6 +439,12 @@ class TestValidFirstResponse(unittest.TestCase):
                 "summary": "Implement protocol subsystem",
                 "proposed_initial_work": ["draft protocol", "add tests"],
             },
+            "run_plan": {
+                "goal": "Implement the protocol subsystem",
+                "phases": ["Investigate", "Reconcile", "Synthesize", "Final Review"],
+                "current_phase": "Investigate",
+                "completion_criteria": ["Protocol is implemented and verified"],
+            },
             "action": {
                 "action_id": "act-0",
                 "kind": "RUN_WORKERS",
@@ -481,6 +487,12 @@ Plan assessment:
     "mutation_required": false,
     "repository_scope": "agym/cli.py"
   },
+  "run_plan": {
+    "goal": "Diagnose the bug",
+    "phases": ["Investigate", "Synthesize", "Final Review"],
+    "current_phase": "Investigate",
+    "completion_criteria": ["The diagnosis is sufficient"]
+  },
   "action": {
     "action_id": "act-init",
     "kind": "FINALIZE",
@@ -506,6 +518,25 @@ Plan assessment:
             parse_initial_response(json.dumps(payload))
         self.assertIn("assessment", str(cm.exception))
 
+    def test_first_response_missing_run_plan_raises(self) -> None:
+        payload = {
+            "assessment": {
+                "task_type": "GENERAL",
+                "complexity": "SMALL",
+                "confidence": 1.0,
+                "mutation_required": False,
+                "repository_scope": "",
+            },
+            "action": {
+                "action_id": "act-0",
+                "kind": "FINALIZE",
+                "final_response": "done",
+            },
+        }
+        with self.assertRaises(ProtocolSchemaError) as cm:
+            parse_initial_response(json.dumps(payload))
+        self.assertIn("run_plan", str(cm.exception))
+
     def test_first_response_missing_action_raises(self) -> None:
         payload = {
             "assessment": {
@@ -514,7 +545,13 @@ Plan assessment:
                 "confidence": 1.0,
                 "mutation_required": False,
                 "repository_scope": "",
-            }
+            },
+            "run_plan": {
+                "goal": "Answer the task",
+                "phases": ["Investigate", "Final Review"],
+                "current_phase": "Investigate",
+                "completion_criteria": ["A usable result exists"],
+            },
         }
         with self.assertRaises(ProtocolSchemaError) as cm:
             parse_initial_response(json.dumps(payload))
@@ -563,7 +600,7 @@ class TestValidActions(unittest.TestCase):
                     "target_worker_ids": ["w-1", "w-2"],
                     "focus": "Correctness and safety",
                     "strategy": "STANDARD",
-                    "timeout_seconds": 240.0,
+                    "stall_timeout_seconds": 240.0,
                 }
             ],
             "reason_summary": "Audit wave",

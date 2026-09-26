@@ -151,7 +151,7 @@ class SubprocessTraceTests(unittest.IsolatedAsyncioTestCase):
 
     def invocation(self, timeout=5):
         return ModelInvocation(invocation_id="inv", run_id="run", worker_id="worker",
-                               role="GENERAL", prompt="Do work", timeout_seconds=timeout)
+                               role="GENERAL", prompt="Do work", stall_timeout_seconds=timeout)
 
     async def wait_for_output(self, capture):
         async def wait():

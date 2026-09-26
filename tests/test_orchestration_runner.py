@@ -268,10 +268,9 @@ class TestOneShotInvocationExecution(unittest.IsolatedAsyncioTestCase):
     ) -> AsyncMock:
         proc = AsyncMock()
         proc.returncode = returncode
-        proc.communicate.return_value = (
-            stdout.encode("utf-8"),
-            stderr.encode("utf-8"),
-        )
+        proc.stdout.read.side_effect = [stdout.encode("utf-8"), b""]
+        proc.stderr.read.side_effect = [stderr.encode("utf-8"), b""]
+        proc.wait.return_value = returncode
         return proc
 
     @patch("asyncio.create_subprocess_exec")
@@ -567,26 +566,31 @@ class TestOneShotInvocationExecution(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.conversation_id, ConversationId("conv-abc-12345"))
 
     @patch("asyncio.create_subprocess_exec")
-    async def test_timeout_handling(self, mock_exec: AsyncMock) -> None:
+    async def test_stall_handling(self, mock_exec: AsyncMock) -> None:
         mock_proc = AsyncMock()
         mock_proc.returncode = None
-        mock_proc.stderr.read.return_value = b""
-        # communicate hangs forever
-        mock_proc.communicate.side_effect = asyncio.TimeoutError()
+
+        async def no_output(*_args) -> bytes:
+            await asyncio.sleep(5.0)
+            return b""
+
+        mock_proc.stdout.read.side_effect = no_output
+        mock_proc.stderr.read.side_effect = no_output
         mock_exec.return_value = mock_proc
 
         inv = ModelInvocation(
-            invocation_id=InvocationId("inv-timeout"),
+            invocation_id=InvocationId("inv-stall"),
             run_id=RunId("run-1"),
             worker_id=InvocationId("w-1"),
             role=WorkerRole.GENERAL,
             prompt="Sleep forever",
-            timeout_seconds=0.1,
+            stall_timeout_seconds=0.1,
         )
         result = await self.runner.run_async(inv)
 
         self.assertEqual(result.status, InvocationStatus.FAILED)
-        self.assertIn("timed out", result.error or "")
+        self.assertIn("STALLED", result.error or "")
+        self.assertTrue((result.structured_data or {}).get("stall"))
         mock_proc.terminate.assert_called()
 
     @patch("asyncio.create_subprocess_exec")
@@ -594,7 +598,7 @@ class TestOneShotInvocationExecution(unittest.IsolatedAsyncioTestCase):
         mock_proc = AsyncMock()
         mock_proc.returncode = None
         mock_proc.stderr.read.return_value = b""
-        mock_proc.communicate.side_effect = asyncio.CancelledError()
+        mock_proc.stdout.read.side_effect = asyncio.CancelledError()
         mock_exec.return_value = mock_proc
 
         inv = ModelInvocation(
@@ -812,9 +816,9 @@ class TestPersistentModelSession(unittest.TestCase):
         self.assertTrue(sess._is_closed)
 
     @patch("asyncio.create_subprocess_exec")
-    def test_session_timeout_or_crash_cannot_contaminate_next_turn(self, mock_exec: AsyncMock) -> None:
-        """W4-09: Timeout or process crash invalidates session so next turn cannot consume delayed/contaminated output."""
-        # Process 1: Turn 1 times out (hangs reading stdout)
+    def test_session_stall_or_crash_cannot_contaminate_next_turn(self, mock_exec: AsyncMock) -> None:
+        """W4-09: Stall or process crash invalidates session so next turn cannot consume delayed/contaminated output."""
+        # Process 1: Turn 1 stalls (hangs reading stdout)
         proc1 = AsyncMock()
         proc1.returncode = None
         proc1.stderr.read.return_value = b""
@@ -836,17 +840,17 @@ class TestPersistentModelSession(unittest.TestCase):
         session = AntigravitySession(
             agy_path="/mock/agy",
             profile_store=self.profile_store,
-            timeout_seconds=0.1,
+            stall_timeout_seconds=0.1,
         )
 
-        # Turn 1 should time out and fail
-        res1 = session.send("Turn 1 prompt", timeout_seconds=0.1)
+        # Turn 1 should stall and fail
+        res1 = session.send("Turn 1 prompt", stall_timeout_seconds=0.1)
         self.assertEqual(res1.status, InvocationStatus.FAILED)
-        self.assertIn("timed out", (res1.error or "").lower())
+        self.assertIn("stalled", (res1.error or "").lower())
         self.assertTrue(session._is_invalid)
 
         # Turn 2 must NOT receive Turn 1's delayed output; it restarts and gets Turn 2 output
-        res2 = session.send("Turn 2 prompt", timeout_seconds=2.0)
+        res2 = session.send("Turn 2 prompt", stall_timeout_seconds=2.0)
         self.assertEqual(res2.status, InvocationStatus.SUCCEEDED)
         self.assertEqual(res2.response, "Turn 2 fresh output")
         self.assertNotEqual(res2.response, "Delayed Turn 1 output")

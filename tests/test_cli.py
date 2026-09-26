@@ -803,7 +803,6 @@ class WiringTests(unittest.TestCase):
             DEFAULT_MAX_PARALLEL,
             DEFAULT_MAX_RETRIES,
             DEFAULT_MAX_ROUNDS,
-            DEFAULT_MAX_RUNTIME_SECONDS,
             DEFAULT_MIN_QUOTA_REMAINING_PERCENT,
             build_default_budget,
         )
@@ -814,7 +813,7 @@ class WiringTests(unittest.TestCase):
         self.assertEqual(b.max_rounds, DEFAULT_MAX_ROUNDS)
         self.assertEqual(b.max_boost_invocations, DEFAULT_MAX_BOOST_INVOCATIONS)
         self.assertEqual(b.max_retries, DEFAULT_MAX_RETRIES)
-        self.assertEqual(b.max_runtime_seconds, DEFAULT_MAX_RUNTIME_SECONDS)
+        self.assertFalse(hasattr(b, "max_runtime_seconds"))
         self.assertEqual(b.min_quota_remaining, DEFAULT_MIN_QUOTA_REMAINING_PERCENT)
 
     def test_build_orchestration_dependencies_defaults(self) -> None:

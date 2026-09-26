@@ -112,6 +112,8 @@ class TestEnums(unittest.TestCase):
         self.assertEqual(ExecutionStrategy.BOOST.value, "BOOST")
         self.assertEqual(WorkspaceMode.MUTATING.value, "MUTATING")
         self.assertEqual(RunStatus.COMPLETED.value, "COMPLETED")
+        self.assertEqual(RunStatus.COMPLETED_WITH_LIMITATIONS.value, "COMPLETED_WITH_LIMITATIONS")
+        self.assertEqual(RunStatus.RESOURCE_EXHAUSTED.value, "RESOURCE_EXHAUSTED")
         self.assertEqual(InvocationStatus.SUCCEEDED.value, "SUCCEEDED")
         self.assertEqual(ActionKind.RUN_WORKERS.value, "RUN_WORKERS")
         self.assertEqual(FailureClass.RETRYABLE.value, "RETRYABLE")
@@ -134,8 +136,13 @@ class TestEnums(unittest.TestCase):
         self.assertIs(RunStatus("FAILED"), RunStatus.FAILED)
         self.assertIs(InvocationStatus("CANCELLED"), InvocationStatus.CANCELLED)
         self.assertIs(ActionKind("FINALIZE"), ActionKind.FINALIZE)
+        self.assertIs(ActionKind("FINAL_REVIEW"), ActionKind.FINAL_REVIEW)
         self.assertIs(FailureClass("UNRECOVERABLE"), FailureClass.UNRECOVERABLE)
         self.assertIs(EventType("RUN_COMPLETED"), EventType.RUN_COMPLETED)
+        self.assertIs(
+            EventType("RUN_COMPLETED_WITH_LIMITATIONS"),
+            EventType.RUN_COMPLETED_WITH_LIMITATIONS,
+        )
 
     def test_enum_deserialization_case_insensitive(self) -> None:
         self.assertIs(TaskType("general"), TaskType.GENERAL)
@@ -336,7 +343,7 @@ class TestWorkerRequestAndResult(unittest.TestCase):
             workspace_mode=WorkspaceMode.READ_ONLY,
             objective="Design subsystem architecture",
             context_worker_ids=[WorkerId("w-0")],
-            timeout_seconds=600.0,
+            stall_timeout_seconds=600.0,
         )
 
         d = req.to_dict()
@@ -346,27 +353,27 @@ class TestWorkerRequestAndResult(unittest.TestCase):
         self.assertEqual(d["workspace_mode"], "READ_ONLY")
         self.assertEqual(d["objective"], "Design subsystem architecture")
         self.assertEqual(d["context_worker_ids"], ["w-0"])
-        self.assertEqual(d["timeout_seconds"], 600.0)
+        self.assertEqual(d["stall_timeout_seconds"], 600.0)
 
         restored = WorkerRequest.from_dict(d)
         self.assertEqual(restored.worker_id, WorkerId("w-1"))
         self.assertEqual(restored.role, WorkerRole.ARCHITECTURE)
         self.assertEqual(restored.strategy, ExecutionStrategy.HIGH_EFFORT)
-        self.assertEqual(restored.timeout_seconds, 600.0)
+        self.assertEqual(restored.stall_timeout_seconds, 600.0)
 
     def test_worker_request_positive_timeout(self) -> None:
         with self.assertRaises(ValueError):
             WorkerRequest(
                 worker_id=WorkerId("w-1"),
                 role=WorkerRole.GENERAL,
-                timeout_seconds=0.0,
+                stall_timeout_seconds=0.0,
             )
 
         with self.assertRaises(ValueError):
             WorkerRequest(
                 worker_id=WorkerId("w-1"),
                 role=WorkerRole.GENERAL,
-                timeout_seconds=-10.0,
+                stall_timeout_seconds=-10.0,
             )
 
     def test_worker_result_serialization_roundtrip(self) -> None:
@@ -434,7 +441,7 @@ class TestAuditContracts(unittest.TestCase):
             target_worker_ids=[WorkerId("w-1"), WorkerId("w-2")],
             focus="Check for race conditions",
             strategy=ExecutionStrategy.STANDARD,
-            timeout_seconds=120.0,
+            stall_timeout_seconds=120.0,
         )
         d = req.to_dict()
         self.assertEqual(d["worker_id"], "auditor-1")
@@ -446,7 +453,7 @@ class TestAuditContracts(unittest.TestCase):
 
     def test_audit_request_invalid_timeout(self) -> None:
         with self.assertRaises(ValueError):
-            AuditRequest(worker_id=WorkerId("auditor-1"), timeout_seconds=-5.0)
+            AuditRequest(worker_id=WorkerId("auditor-1"), stall_timeout_seconds=-5.0)
 
     def test_audit_result_serialization(self) -> None:
         res = AuditResult(
@@ -860,7 +867,7 @@ class TestBudgetContracts(unittest.TestCase):
         self.assertEqual(budget.max_rounds, 10)
         self.assertEqual(budget.max_boost_invocations, 2)
         self.assertEqual(budget.max_retries, 3)
-        self.assertEqual(budget.max_runtime_seconds, 1800.0)
+        self.assertFalse(hasattr(budget, "max_runtime_seconds"))
         self.assertEqual(budget.min_quota_remaining, 10.0)
         self.assertEqual(budget.max_consecutive_rejections, 3)
 
@@ -896,7 +903,7 @@ class TestModelInvocationContracts(unittest.TestCase):
             workspace_mode=WorkspaceMode.READ_ONLY,
             prompt="Analyze the requirements.",
             output_schema={"type": "object"},
-            timeout_seconds=180.0,
+            stall_timeout_seconds=180.0,
             conversation_id=ConversationId("conv-1"),
         )
         d = inv.to_dict()
@@ -1045,7 +1052,7 @@ class TestProtocols(unittest.TestCase):
             def conversation_id(self) -> ConversationId:
                 return ConversationId("c-1")
 
-            def send(self, prompt: str, timeout_seconds: float | None = None) -> ModelResult:
+            def send(self, prompt: str, stall_timeout_seconds: float | None = None) -> ModelResult:
                 return ModelResult(invocation_id=InvocationId("i-1"))
 
             def close(self) -> None:
