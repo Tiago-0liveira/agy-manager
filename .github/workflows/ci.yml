@@ -1,6 +1,8 @@
 name: CI Test Suite
 
 on:
+  push:
+    branches: [feat/coordination]
   pull_request:
     branches: [main, feat/coordination]
   workflow_dispatch:
