@@ -2440,11 +2440,6 @@ class OrchestrationEngine:
         observation = self._build_observation(state, completed=completed, failed=failed, rejected=[])
         action: CoordinatorAction | None = None
 
-        start_monotonic = time.monotonic()
-        remaining_budget = max(0.0, state.budget.max_runtime_seconds - state.budget_usage.runtime_seconds)
-        deadline = start_monotonic + remaining_budget
-        self._run_deadlines[state.run_id] = deadline
-
         consecutive_rejections = 0
         coordinator_turns = 0
         max_coordinator_turns = (state.budget.max_rounds + 1) * (state.budget.max_consecutive_rejections + 1)
@@ -2454,13 +2449,9 @@ class OrchestrationEngine:
             while True:
                 coordinator_turns += 1
                 if coordinator_turns > max_coordinator_turns:
-                    raise BudgetExceededError(
-                        f"Coordinator turn limit of {max_coordinator_turns} exceeded for run {state.run_id}"
-                    )
-
-                if time.monotonic() >= deadline:
-                    raise BudgetExceededError(
-                        f"Run {state.run_id} exceeded maximum runtime budget of {state.budget.max_runtime_seconds}s"
+                    return self._finish_safety_limit(
+                        state,
+                        f"Coordinator turn safety limit of {max_coordinator_turns} reached",
                     )
 
                 fleet_view = self.scheduler.get_fleet_view()
@@ -2470,7 +2461,7 @@ class OrchestrationEngine:
                         EventType.ROUND_STARTED,
                         state.run_id,
                         {
-                            "round_number": state.round_number,
+                            "round_number": state.round_number + 1,
                             "budget": state.budget.to_dict(),
                             "budget_usage": state.budget_usage.to_dict(),
                         },
@@ -2529,11 +2520,49 @@ class OrchestrationEngine:
                     {"action": action.to_dict()},
                 )
 
-                if action.kind == ActionKind.FINALIZE:
-                    missing = self._check_finalization(state)
+                if action.kind in (ActionKind.FINALIZE, ActionKind.FINAL_REVIEW):
+                    via_review = action.kind == ActionKind.FINAL_REVIEW
+                    if via_review and action.review_decision == FinalReviewDecision.CONTINUE:
+                        reject_reason = self._validate_final_review_continue(state, action)
+                        if reject_reason:
+                            consecutive_rejections += 1
+                            self._emit_event(
+                                EventType.ACTION_REJECTED,
+                                state.run_id,
+                                {"action_id": str(action.action_id), "reason": reject_reason},
+                            )
+                            if consecutive_rejections >= state.budget.max_consecutive_rejections:
+                                raise ActionRejectedError(reject_reason)
+                            observation = self._build_observation(
+                                state, completed=[], failed=[], rejected=[]
+                            )
+                            observation.finalization_rejection = [reject_reason]
+                            action = None
+                            continue
+
+                        consecutive_rejections = 0
+                        self._emit_event(
+                            EventType.ACTION_ACCEPTED,
+                            state.run_id,
+                            {"action_id": str(action.action_id)},
+                        )
+                        self.store.save_run(state)
+                        observation = self._build_observation(
+                            state, completed=[], failed=[], rejected=[]
+                        )
+                        action = None
+                        continue
+
+                    candidate = action.final_response
+                    missing = self._check_finalization(
+                        state,
+                        candidate,
+                        via_final_review=via_review,
+                    )
                     if missing:
                         consecutive_rejections += 1
-                        reason = "FINALIZE rejected:\n- " + "\n- ".join(missing)
+                        label = "FINAL_REVIEW STOP" if via_review else "FINALIZE"
+                        reason = label + " rejected:\n- " + "\n- ".join(missing)
                         self._emit_event(
                             EventType.ACTION_REJECTED,
                             state.run_id,
@@ -2552,39 +2581,28 @@ class OrchestrationEngine:
                         continue
 
                     consecutive_rejections = 0
-                    self._emit_event(EventType.ACTION_ACCEPTED, state.run_id, {"action_id": str(action.action_id)})
-                    state.status = RunStatus.COMPLETED
-                    state.final_result = action.final_response
-                    state.updated_at = datetime.now(timezone.utc).isoformat()
-                    if hasattr(self.store, "finalize_run") and callable(self.store.finalize_run):
-                        finalized = self.store.finalize_run(
-                            state.run_id, state.final_result or "", status=RunStatus.COMPLETED
-                        )
-                        state = finalized
-                    else:
-                        try:
-                            final_path = self.artifact_writer._write(
-                                state.run_id,
-                                Path("deliverables") / "final.md",
-                                (state.final_result or "").rstrip() + "\n",
-                            )
-                            state.final_artifact_path = str(final_path)
-                        except Exception:
-                            pass
-                        self.store.save_run(state)
-                        self._emit_event(
-                            EventType.RUN_COMPLETED,
-                            state.run_id,
-                            {
-                                "summary": (state.final_result or "")[:200],
-                                "final_artifact_path": state.final_artifact_path,
-                            },
-                        )
+                    self._emit_event(
+                        EventType.ACTION_ACCEPTED,
+                        state.run_id,
+                        {"action_id": str(action.action_id)},
+                    )
                     self._cleanup_leases(state.run_id)
-                    return state
+                    return self._finish_run(
+                        state,
+                        RunStatus.COMPLETED,
+                        candidate or self._best_usable_text(state),
+                    )
 
                 is_valid, reject_reason = self._validate_action(action, state, fleet_view, known_worker_ids)
                 if not is_valid:
+                    lowered_rejection = str(reject_reason or "").lower()
+                    if (
+                        "max_invocations" in lowered_rejection
+                        or "maximum rounds limit" in lowered_rejection
+                    ):
+                        return self._finish_safety_limit(
+                            state, reject_reason or "Orchestration safety limit reached"
+                        )
                     consecutive_rejections += 1
                     self._emit_event(
                         EventType.ACTION_REJECTED,
@@ -2592,10 +2610,6 @@ class OrchestrationEngine:
                         {"action_id": str(action.action_id), "reason": reject_reason},
                     )
                     if consecutive_rejections >= state.budget.max_consecutive_rejections:
-                        if any(kw in (reject_reason or "").lower() for kw in ("budget", "limit", "exceed", "quota", "runtime")):
-                            raise BudgetExceededError(
-                                f"Budget limit reached and coordinator exceeded rejection cap: {reject_reason}"
-                            )
                         raise ActionRejectedError(
                             f"Coordinator exceeded maximum consecutive rejected actions limit ({state.budget.max_consecutive_rejections}): {reject_reason}"
                         )
@@ -2622,8 +2636,8 @@ class OrchestrationEngine:
                         {"action_id": str(action.action_id), "reason": str(exc)},
                     )
                     if consecutive_rejections >= state.budget.max_consecutive_rejections:
-                        raise BudgetExceededError(
-                            f"Capacity budget exhausted and coordinator exceeded rejection cap: {exc}"
+                        return self._finish_safety_limit(
+                            state, f"Fleet capacity exhausted: {exc}"
                         )
                     all_reqs = list(action.workers) + list(action.auditors)
                     fail_res = [failure_to_worker_result(create_profile_unavailable_failure(r.worker_id)) for r in all_reqs]
@@ -2640,12 +2654,13 @@ class OrchestrationEngine:
                 self._record_quality_evidence(state, action, c_wave)
                 state.round_number += 1
                 state.budget_usage.rounds = state.round_number
+                self._update_runtime_telemetry(state)
                 self.store.save_run(state)
                 self._emit_event(
                     EventType.ROUND_COMPLETED,
                     state.run_id,
                     {
-                        "round_number": state.round_number - 1,
+                        "round_number": state.round_number,
                         "budget": state.budget.to_dict(),
                         "budget_usage": state.budget_usage.to_dict(),
                     },
@@ -2678,7 +2693,6 @@ class OrchestrationEngine:
                     pass
             self._cleanup_leases(rid)
             self._coord_profiles.pop(rid, None)
-            self._run_deadlines.pop(rid, None)
             try:
                 run_lock.release()
             except Exception:
@@ -2769,16 +2783,21 @@ class OrchestrationEngine:
 
         # 2. Run assessment
         assessment: TaskAssessment | None = None
+        run_plan: RunPlan | None = None
         action: CoordinatorAction | None = None
 
         initial_res = self._start_coordinator(coord, state, fleet_view, repository_scope, persist=False)
 
         if isinstance(initial_res, InitialCoordinatorResponse):
             assessment = initial_res.assessment
+            run_plan = initial_res.run_plan
             action = initial_res.action
         elif hasattr(initial_res, "assessment") and hasattr(initial_res, "action"):
             assessment = getattr(initial_res, "assessment")
+            run_plan = getattr(initial_res, "run_plan", None)
             action = getattr(initial_res, "action")
+        elif isinstance(initial_res, tuple) and len(initial_res) == 3:
+            assessment, run_plan, action = initial_res
         elif isinstance(initial_res, tuple) and len(initial_res) == 2:
             assessment, action = initial_res
         elif isinstance(initial_res, TaskAssessment):
@@ -2793,6 +2812,7 @@ class OrchestrationEngine:
             try:
                 parsed = parse_initial_response(initial_res, known_worker_ids=set())
                 assessment = parsed.assessment
+                run_plan = parsed.run_plan
                 action = parsed.action
             except Exception:
                 pass
@@ -2806,7 +2826,18 @@ class OrchestrationEngine:
                 repository_scope=repository_scope,
             )
 
+        if run_plan is None:
+            run_plan = RunPlan(
+                goal=assessment.summary or task,
+                phases=["Investigate", "Reconcile", "Synthesize", "Final Review"],
+                current_phase="Investigate",
+                completion_criteria=[
+                    "A usable result exists",
+                    "No critical findings remain unresolved",
+                ],
+            )
         state.assessment = assessment
+        state.run_plan = run_plan
 
         # 3. Obtain first action if not already returned
         if action is None:
