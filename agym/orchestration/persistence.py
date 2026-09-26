@@ -591,7 +591,7 @@ class FileRunStore:
                 atomic_write_json(assessment_file, state.assessment.to_dict())
 
         # Ensure final.json is persisted if completed
-        if state.status == RunStatus.COMPLETED and state.final_result is not None:
+        if state.status in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_LIMITATIONS) and state.final_result is not None:
             final_file = target_dir / "final.json"
             if not final_file.exists():
                 atomic_write_json(
@@ -894,6 +894,7 @@ class FileRunStore:
         invocation_id: InvocationId | str,
         result: WorkerResult | AuditResult | ModelResult | dict[str, Any] | None = None,
         output_text: str | None = None,
+        structured_data: dict[str, Any] | None = None,
     ) -> InvocationRecord:
         """Persist invocation output and completion metadata, and emit INVOCATION_COMPLETED."""
         rid = RunId(run_id)
@@ -1009,6 +1010,8 @@ class FileRunStore:
         record.error = error
         record.failure = FailureClass(failure) if failure else FailureClass.UNRECOVERABLE
         record.exit_code = exit_code
+        if structured_data is not None:
+            record.structured_data = dict(structured_data)
 
         if output_text is not None:
             self.write_output(rid, iid, output_text)
@@ -1419,17 +1422,24 @@ class FileRunStore:
         state.final_artifact_path = str(final_md)
         self.save_run(state)
 
-        # Emit RUN_COMPLETED event
+        # Emit the matching terminal event.
+        if status_enum == RunStatus.COMPLETED_WITH_LIMITATIONS:
+            event_type = EventType.RUN_COMPLETED_WITH_LIMITATIONS
+        elif status_enum == RunStatus.RESOURCE_EXHAUSTED:
+            event_type = EventType.RUN_RESOURCE_EXHAUSTED
+        else:
+            event_type = EventType.RUN_COMPLETED
         event = OrchestrationEvent(
             event_id=f"evt-{uuid.uuid4().hex[:8]}",
             run_id=rid,
-            type=EventType.RUN_COMPLETED,
+            type=event_type,
             timestamp=now,
             payload={
                 "completed_at": now,
                 "final_result": state.final_result,
                 "summary": str(final_result)[:200],
                 "final_artifact_path": str(final_md),
+                "status": status_enum.value,
             },
         )
         self.emit(event)

@@ -119,6 +119,18 @@ def format_duration(seconds: float | None) -> str:
     return f"{mins}m {rem_secs}s"
 
 
+def _payload_round_number(
+    payload: dict[str, Any],
+    fallback: int | None = None,
+) -> int | str | None:
+    """Read a zero-capable round/wave number without truthiness bugs."""
+    for key in ("round_number", "round", "wave"):
+        value = payload.get(key)
+        if value is not None:
+            return value
+    return fallback
+
+
 def _parse_timestamp(ts: str | None) -> datetime | None:
     """Parses an ISO timestamp string into a datetime object."""
     if not ts:
@@ -537,7 +549,7 @@ class TerminalEventSink(EventSink):
                 self.state.budget_max_rounds = int(budget.get("max_rounds", 0) or 0)
 
         elif etype == EventType.ROUND_STARTED:
-            round_num = payload.get("round_number") or payload.get("round") or payload.get("wave")
+            round_num = _payload_round_number(payload)
             if round_num is not None:
                 try:
                     self.state.current_wave = int(round_num)
@@ -555,7 +567,7 @@ class TerminalEventSink(EventSink):
                 self.state.budget_max_rounds = int(budget.get("max_rounds", 0) or 0)
 
         elif etype == EventType.ROUND_COMPLETED:
-            round_num = payload.get("round_number") or payload.get("round") or payload.get("wave")
+            round_num = _payload_round_number(payload)
             if round_num is not None:
                 try:
                     wn = int(round_num)
@@ -737,6 +749,16 @@ class TerminalEventSink(EventSink):
             self.state.final_result = payload.get("summary")
             self.state.final_artifact_path = payload.get("final_artifact_path")
 
+        elif etype == EventType.RUN_COMPLETED_WITH_LIMITATIONS:
+            self.state.run_status = RunStatus.COMPLETED_WITH_LIMITATIONS.value
+            self.state.final_result = payload.get("summary")
+            self.state.final_artifact_path = payload.get("final_artifact_path")
+            self.state.failure_reason = payload.get("reason")
+
+        elif etype == EventType.RUN_RESOURCE_EXHAUSTED:
+            self.state.run_status = RunStatus.RESOURCE_EXHAUSTED.value
+            self.state.failure_reason = payload.get("reason") or "Capacity exhausted"
+
         elif etype == EventType.RUN_FAILED:
             self.state.run_status = RunStatus.FAILED.value
             self.state.failure_reason = payload.get("error") or payload.get("reason")
@@ -896,6 +918,8 @@ class TerminalEventSink(EventSink):
 
         if self.state.run_status not in {
             RunStatus.COMPLETED.value,
+            RunStatus.COMPLETED_WITH_LIMITATIONS.value,
+            RunStatus.RESOURCE_EXHAUSTED.value,
             RunStatus.FAILED.value,
             RunStatus.INTERRUPTED.value,
         }:
@@ -934,6 +958,14 @@ class TerminalEventSink(EventSink):
                     "Inspect:",
                     f"  agym orchestrate inspect {self.state.run_id}",
                 ])
+        elif self.state.run_status == RunStatus.COMPLETED_WITH_LIMITATIONS.value:
+            reason = f": {self.state.failure_reason}" if self.state.failure_reason else ""
+            lines.append(colorize(f"✓ Orchestration completed with limitations{reason}", YELLOW + BOLD, use_color))
+            if self.state.final_artifact_path:
+                lines.append(f"Final: {self.state.final_artifact_path}")
+        elif self.state.run_status == RunStatus.RESOURCE_EXHAUSTED.value:
+            reason = f": {self.state.failure_reason}" if self.state.failure_reason else ""
+            lines.append(colorize(f"✗ Orchestration RESOURCE_EXHAUSTED{reason}", RED + BOLD, use_color))
         elif self.state.run_status == RunStatus.FAILED.value:
             reason = f": {self.state.failure_reason}" if self.state.failure_reason else ""
             lines.append(colorize(f"✗ Orchestration FAILED{reason}", RED + BOLD, use_color))
@@ -994,11 +1026,11 @@ class TerminalEventSink(EventSink):
             return f"[assessment] completed: {comp} ({tt})"
 
         if etype == EventType.ROUND_STARTED:
-            wn = payload.get("round_number") or payload.get("round") or payload.get("wave") or self.state.current_wave
+            wn = _payload_round_number(payload, self.state.current_wave)
             return f"[wave] Wave {wn} started"
 
         if etype == EventType.ROUND_COMPLETED:
-            wn = payload.get("round_number") or payload.get("round") or payload.get("wave") or self.state.current_wave
+            wn = _payload_round_number(payload, self.state.current_wave)
             return f"[wave] Wave {wn} completed"
 
         if etype == EventType.ACTION_REQUESTED:
@@ -1101,6 +1133,14 @@ class TerminalEventSink(EventSink):
                 return f"[run] completed - final: {final_path}"
             summary = payload.get("summary") or ""
             return f"[run] completed" + (f": {str(summary)[:80]}" if summary else "")
+
+        if etype == EventType.RUN_COMPLETED_WITH_LIMITATIONS:
+            reason = payload.get("reason") or ""
+            return f"[run] completed with limitations" + (f": {reason}" if reason else "")
+
+        if etype == EventType.RUN_RESOURCE_EXHAUSTED:
+            reason = payload.get("reason") or "Capacity exhausted"
+            return f"[run] RESOURCE_EXHAUSTED: {reason}"
 
         if etype == EventType.RUN_FAILED:
             err = payload.get("error") or payload.get("reason") or ""

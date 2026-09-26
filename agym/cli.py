@@ -462,6 +462,9 @@ Options:
   --mode {plan,implement}   Operating mode: plan (default) or implement
   --depth {quick,balanced,deep}
                             Maximum orchestration budget preset (default: balanced)
+  --stall-timeout SECONDS   No-output stall threshold for model turns (default: 180)
+  --emergency-watchdog SECONDS
+                            Pathological hang watchdog (default: 21600)
   -n, --dry-run             Preview execution plan without worker execution
   -h, --help                Show this help message and exit
 
@@ -1127,6 +1130,8 @@ def _format_run_status(state: RunState, results: Sequence[Any] | None = None) ->
         lines.append(f"Updated:       {state.updated_at}")
     if state.assessment:
         lines.append(f"Complexity:    {state.assessment.complexity.value}")
+    if state.run_plan:
+        lines.append(f"Current phase: {state.run_plan.current_phase}")
     if results:
         lines.append(f"Results ({len(results)}):")
         for r in results:
@@ -1198,7 +1203,7 @@ def _orchestrate(
         d = deps or build_orchestration_dependencies(profile_store=store)
         try:
             state = d.engine.resume(RunId(run_id))
-            if state.status == RunStatus.COMPLETED:
+            if state.status in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_LIMITATIONS):
                 return 0
             if state.status == RunStatus.INTERRUPTED:
                 _print_err("interrupted")
@@ -1261,6 +1266,18 @@ def _orchestrate(
     )
     parser.add_argument("-n", "--dry-run", dest="dry_run", action="store_true")
     parser.add_argument("--profile", dest="profile", default=None, help="Profile to use for the coordinator")
+    parser.add_argument(
+        "--stall-timeout",
+        dest="stall_timeout_seconds",
+        type=float,
+        default=180.0,
+    )
+    parser.add_argument(
+        "--emergency-watchdog",
+        dest="emergency_watchdog_seconds",
+        type=float,
+        default=21600.0,
+    )
 
     try:
         ns = parser.parse_args(args_to_parse)
@@ -1277,6 +1294,8 @@ def _orchestrate(
         profile_store=store,
         coordinator_profile=ns.profile,
         depth=ns.depth,
+        stall_timeout_seconds=ns.stall_timeout_seconds,
+        emergency_watchdog_seconds=ns.emergency_watchdog_seconds,
     )
 
     if ns.dry_run:
@@ -1293,7 +1312,7 @@ def _orchestrate(
 
     try:
         state = d.engine.run(task, mode=run_mode)
-        if state.status == RunStatus.COMPLETED:
+        if state.status in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_LIMITATIONS):
             return 0
         if state.status == RunStatus.INTERRUPTED:
             _print_err("interrupted")

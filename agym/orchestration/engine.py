@@ -144,6 +144,7 @@ class DryRunPlan:
     task: str
     mode: RunMode
     assessment: TaskAssessment | None = None
+    run_plan: RunPlan | None = None
     action: CoordinatorAction | None = None
     is_valid: bool = True
     validation_error: str | None = None
@@ -158,6 +159,7 @@ class DryRunPlan:
             "task": self.task,
             "mode": self.mode.value,
             "assessment": self.assessment.to_dict() if self.assessment else None,
+            "run_plan": self.run_plan.to_dict() if self.run_plan else None,
             "action": self.action.to_dict() if self.action else None,
             "is_valid": self.is_valid,
             "validation_error": self.validation_error,
@@ -189,6 +191,10 @@ class DryRunPlan:
             ])
             if self.assessment.summary:
                 lines.append(f"Assessment Summary: {self.assessment.summary}")
+        if self.run_plan:
+            lines.append(f"Run Goal: {self.run_plan.goal}")
+            lines.append("Run Phases: " + " -> ".join(self.run_plan.phases))
+            lines.append(f"Current Phase: {self.run_plan.current_phase}")
         if self.action:
             lines.append(f"Proposed Action: {self.action.kind.value} (ID: {self.action.action_id})")
             if self.planned_workers:
@@ -2866,6 +2872,7 @@ class OrchestrationEngine:
             task=task,
             mode=mode,
             assessment=assessment,
+            run_plan=run_plan,
             action=action,
             is_valid=is_valid,
             validation_error=error,

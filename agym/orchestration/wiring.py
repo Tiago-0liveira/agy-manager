@@ -42,7 +42,8 @@ __all__ = [
     "DEFAULT_MAX_ROUNDS",
     "DEFAULT_MAX_BOOST_INVOCATIONS",
     "DEFAULT_MAX_RETRIES",
-    "DEFAULT_MAX_RUNTIME_SECONDS",
+    "DEFAULT_STALL_TIMEOUT_SECONDS",
+    "DEFAULT_EMERGENCY_WATCHDOG_SECONDS",
     "DEFAULT_MIN_QUOTA_REMAINING_PERCENT",
     "DEFAULT_MIN_QUOTA_RESERVE_FRACTION",
     "DEPTH_PRESETS",
@@ -62,7 +63,8 @@ DEFAULT_MAX_INVOCATIONS: int = 20
 DEFAULT_MAX_ROUNDS: int = 8
 DEFAULT_MAX_BOOST_INVOCATIONS: int = 2
 DEFAULT_MAX_RETRIES: int = 3
-DEFAULT_MAX_RUNTIME_SECONDS: float = 1800.0  # 30 minutes
+DEFAULT_STALL_TIMEOUT_SECONDS: float = 180.0
+DEFAULT_EMERGENCY_WATCHDOG_SECONDS: float = 21600.0  # pathological engine hang guard
 DEFAULT_MIN_QUOTA_REMAINING_PERCENT: float = 10.0  # 10% min reserve for budget
 DEFAULT_MIN_QUOTA_RESERVE_FRACTION: float = 0.05  # 5% reserve for scheduler
 
@@ -88,7 +90,6 @@ def build_budget_for_depth(depth: str = "balanced") -> OrchestrationBudget:
         max_rounds=preset["max_rounds"],
         max_boost_invocations=DEFAULT_MAX_BOOST_INVOCATIONS,
         max_retries=DEFAULT_MAX_RETRIES,
-        max_runtime_seconds=DEFAULT_MAX_RUNTIME_SECONDS,
         min_quota_remaining=DEFAULT_MIN_QUOTA_REMAINING_PERCENT,
     )
 
@@ -206,6 +207,8 @@ def build_orchestration_dependencies(
     is_tty: bool | None = None,
     use_color: bool | None = None,
     min_reserve: float | None = None,
+    stall_timeout_seconds: float | None = None,
+    emergency_watchdog_seconds: float | None = None,
 ) -> OrchestrationDependencies:
     """Centralized factory for constructing orchestration subsystems.
 
@@ -224,7 +227,20 @@ def build_orchestration_dependencies(
     r_store = run_store or FileRunStore()
     e_sink = event_sink or TerminalEventSink(stream=stream, is_tty=is_tty, use_color=use_color)
     effective_store = BroadcastRunStore(r_store, e_sink)
-    mdl_runner = runner or AntigravityRunner(profile_store=p_store)
+    effective_stall_timeout = (
+        float(stall_timeout_seconds)
+        if stall_timeout_seconds is not None
+        else DEFAULT_STALL_TIMEOUT_SECONDS
+    )
+    effective_watchdog = (
+        float(emergency_watchdog_seconds)
+        if emergency_watchdog_seconds is not None
+        else DEFAULT_EMERGENCY_WATCHDOG_SECONDS
+    )
+    mdl_runner = runner or AntigravityRunner(
+        profile_store=p_store,
+        emergency_watchdog_seconds=effective_watchdog,
+    )
 
     coord_prof = coordinator_profile
     if coord_prof is None and coordinator is None:
@@ -252,6 +268,7 @@ def build_orchestration_dependencies(
         run_store=r_store,
         profile_name=coord_prof,
         strategy=ExecutionStrategy.HIGH_EFFORT,
+        stall_timeout_seconds=effective_stall_timeout,
     )
     bgt = budget or build_budget_for_depth(depth)
     eng = engine or OrchestrationEngine(
